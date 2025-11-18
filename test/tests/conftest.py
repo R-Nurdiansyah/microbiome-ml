@@ -8,7 +8,7 @@ from pathlib import Path
 from microbiome_ml.wrangle.metadata import SampleMetadata
 from microbiome_ml.wrangle.profiles import TaxonomicProfiles
 from microbiome_ml.wrangle.features import FeatureSet
-from microbiome_ml.wrangle.samples import Dataset
+from microbiome_ml.wrangle.dataset import Dataset
 
 
 # Data fixtures - small synthetic datasets

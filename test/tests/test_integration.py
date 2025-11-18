@@ -4,7 +4,7 @@ import pytest
 import polars as pl
 from pathlib import Path
 
-from microbiome_ml.wrangle.samples import Dataset
+from microbiome_ml.wrangle.dataset import Dataset
 from microbiome_ml.utils.taxonomy import TaxonomicRanks
 
 
