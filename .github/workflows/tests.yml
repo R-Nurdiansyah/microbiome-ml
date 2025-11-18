@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Pixi
+      uses: prefix-dev/setup-pixi@v0.8.1
+      with:
+        pixi-version: v0.40.0
+        cache: true
+    
+    - name: Install dependencies
+      run: pixi install
+    
+    - name: Run tests
+      run: PYTHONPATH=src pixi run pytest test/tests -v
+    
+    - name: Generate coverage report
+      run: PYTHONPATH=src pixi run pytest test/tests --cov=src/microbiome_ml --cov-report=xml --cov-report=term
+      continue-on-error: true
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false
+      continue-on-error: true
