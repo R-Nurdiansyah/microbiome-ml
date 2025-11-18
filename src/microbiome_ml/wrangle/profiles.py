@@ -54,7 +54,7 @@ class RootFields(Fields):
 
 class TaxonomicProfiles:
     """
-    Long-form taxonomic abundance data container.
+    Long-form taxonomic abundance data container with dual-mode support (eager/lazy).
     
     Stores taxonomic profiles in long format with exactly 3 columns:
     - sample: Sample identifier
@@ -62,81 +62,95 @@ class TaxonomicProfiles:
     - relabund or coverage: Relative abundance or coverage value
     
     Attributes:
-        profiles: Polars LazyFrame containing the taxonomic profiles
-        root: Optional Polars LazyFrame containing root coverage data
+        profiles: Polars DataFrame (eager) or None (lazy)
+        root: Optional DataFrame (eager) or None (lazy)
         is_filled: Boolean indicating if profiles are in filled format
+        _is_lazy: Boolean flag indicating lazy mode
+        _lf_profiles: LazyFrame (lazy) or None (eager)
+        _lf_root: LazyFrame (lazy) or None (eager)
     """
     
     def __init__(
         self, 
-        profiles: Union[Path, str, pl.LazyFrame], 
-        root: Optional[Union[Path, str, pl.LazyFrame]] = None,
+        profiles: Union[Path, str, pl.LazyFrame, pl.DataFrame], 
+        root: Optional[Union[Path, str, pl.LazyFrame, pl.DataFrame]] = None,
         check_filled: bool = True,
-        sample_size: int = 1000
+        sample_size: int = 1000,
+        _is_lazy: bool = False
     ):
         """
         Initialize TaxonomicProfiles with validation and standardization.
         Optionally checks if profiles are filled and sets is_filled attribute.
         
         Args:
-            profiles: Path to profiles file or LazyFrame with profiles data
-            root: Optional path to root file or LazyFrame with root coverage data  
+            profiles: Path to profiles file or LazyFrame/DataFrame with profiles data
+            root: Optional path to root file or LazyFrame/DataFrame with root coverage data  
             check_filled: Whether to check if profiles are in filled format
             sample_size: Sample size for filled format checking
+            _is_lazy: Internal flag indicating lazy mode
         """
-        self.root = None
+        self._is_lazy = _is_lazy
 
         # Load and standardize profiles
-        self.profiles = self._load_and_standardize(profiles, ProfilesFields)
-        self.profiles = self._standardize_tax_strings(self.profiles)
+        profiles_lf = self._load_and_standardize(profiles, ProfilesFields)
+        profiles_lf = self._standardize_tax_strings(profiles_lf)
 
         # Check if profiles are filled and store the result
-        self.is_filled = None
         if check_filled:
-            self.is_filled = self._is_filled(self.profiles, sample_size=sample_size)
+            self.is_filled = self._is_filled(profiles_lf, sample_size=sample_size)
             
             if not self.is_filled:
-                # warnings.warn(
-                #     "Taxonomic profiles are not in filled format. Parent taxa abundances "
-                #     "may not equal the sum of their children. This could affect downstream "
-                #     "analyses. Consider using fill_taxonomy() to correct this.",
-                #     UserWarning,
-                #     stacklevel=2
-                # )
-
-                self.profiles = self._fill_profiles_lf()
+                profiles_lf = self._fill_profiles_lf(profiles_lf)
                 self.is_filled = True  # Now filled after correction
-
+        else:
+            self.is_filled = True  # Assume filled if not checking
         
         # Load and standardize root if provided
+        root_lf = None
         if root is not None:
-            self.root = self._load_and_standardize(root, RootFields)
+            root_lf = self._load_and_standardize(root, RootFields)
         else:
             try:
-                self.root = self._create_root_lf()
+                root_lf = self._create_root_lf(profiles_lf)
             except ValueError:
-                self.root = None
+                root_lf = None
 
-        if 'coverage' in self.profiles.collect_schema().names():
-            if self.root is None:
+        if 'coverage' in profiles_lf.collect_schema().names():
+            if root_lf is None:
                 raise ValueError("Root coverage data is required when profiles contain coverage values.")
             else:
-                self.profiles = self._to_relabund_lf()
+                profiles_lf = self._to_relabund_lf(profiles_lf, root_lf)
+        
+        # Store in appropriate mode
+        if _is_lazy:
+            # Lazy mode: store LazyFrames
+            self._lf_profiles = profiles_lf
+            self._lf_root = root_lf
+            self.profiles = None
+            self.root = None
+        else:
+            # Eager mode: collect to DataFrames
+            self.profiles = profiles_lf.collect()
+            self.root = root_lf.collect() if root_lf is not None else None
+            self._lf_profiles = None
+            self._lf_root = None
 
 
 
-    def _load_data(self, data_source: Union[Path, str, pl.LazyFrame]) -> pl.LazyFrame:
+    def _load_data(self, data_source: Union[Path, str, pl.LazyFrame, pl.DataFrame]) -> pl.LazyFrame:
         """
         Load data from various sources.
         
         Args:
-            data_source: Path to file or existing LazyFrame
+            data_source: Path to file, existing LazyFrame, or DataFrame
             
         Returns:
             LazyFrame
         """
         if isinstance(data_source, pl.LazyFrame):
             return data_source
+        elif isinstance(data_source, pl.DataFrame):
+            return data_source.lazy()
         elif isinstance(data_source, (str, Path)):
             return load_data(data_source)
         else:
@@ -202,6 +216,120 @@ class TaxonomicProfiles:
         return lf.with_columns([
             pl.col('taxonomy').str.replace_all(r";\s+", ";").alias('taxonomy')
         ])
+    
+    @classmethod
+    def scan(
+        cls,
+        profiles: Union[Path, str],
+        root: Optional[Union[Path, str]] = None,
+        check_filled: bool = True,
+        sample_size: int = 1000
+    ) -> "TaxonomicProfiles":
+        """
+        Lazily load TaxonomicProfiles from files without pulling into memory.
+        
+        Args:
+            profiles: Path to profiles CSV file or directory containing profiles.csv
+            root: Optional path to root CSV file
+            check_filled: Whether to check if profiles are in filled format
+            sample_size: Sample size for filled format checking
+            
+        Returns:
+            TaxonomicProfiles instance in lazy mode
+        """
+        # Handle directory input (from save/load workflow)
+        profiles_path = Path(profiles)
+        if profiles_path.is_dir():
+            profiles_path = profiles_path / "profiles.csv"
+            root_path = Path(profiles) / "root.csv"
+            root = str(root_path) if root_path.exists() else root
+            profiles = str(profiles_path)
+        
+        return cls(
+            profiles=profiles,
+            root=root,
+            check_filled=check_filled,
+            sample_size=sample_size,
+            _is_lazy=True
+        )
+    
+    def materialize(self) -> None:
+        """
+        Convert lazy TaxonomicProfiles to eager (DataFrame) mode in-place.
+        
+        If already eager, does nothing. If lazy, collects LazyFrames and converts to DataFrames.
+        """
+        if self._is_lazy:
+            # Collect LazyFrames to DataFrames
+            self.profiles = self._lf_profiles.collect()
+            self.root = self._lf_root.collect() if self._lf_root is not None else None
+            
+            # Clear lazy attributes
+            self._lf_profiles = None
+            self._lf_root = None
+            
+            # Update flag
+            self._is_lazy = False
+    
+    def save(self, path: Union[Path, str]) -> None:
+        """
+        Save TaxonomicProfiles to CSV files in a directory.
+        
+        For lazy instances, this will materialize the data first.
+        
+        Args:
+            path: Directory path to save files (will be created if doesn't exist)
+        """
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        
+        if self._is_lazy:
+            # Lazy mode: collect before saving
+            self._lf_profiles.collect().write_csv(path / "profiles.csv")
+            if self._lf_root is not None:
+                self._lf_root.collect().write_csv(path / "root.csv")
+        else:
+            # Eager mode: save DataFrames directly
+            self.profiles.write_csv(path / "profiles.csv")
+            if self.root is not None:
+                self.root.write_csv(path / "root.csv")
+    
+    @classmethod
+    def load(cls, path: Union[Path, str], lazy: bool = True, check_filled: bool = True) -> "TaxonomicProfiles":
+        """
+        Load TaxonomicProfiles from directory containing CSV files.
+        
+        Args:
+            path: Directory path containing profiles.csv and optionally root.csv
+            lazy: If True (default), scan files lazily; if False, read into memory
+            check_filled: Whether to check if profiles are in filled format
+            
+        Returns:
+            TaxonomicProfiles instance in lazy or eager mode
+        """
+        path = Path(path)
+        
+        profiles_path = path / "profiles.csv"
+        root_path = path / "root.csv"
+        
+        if not profiles_path.exists():
+            raise FileNotFoundError(f"profiles.csv not found in {path}")
+        
+        root = root_path if root_path.exists() else None
+        
+        if lazy:
+            return cls.scan(
+                profiles=str(profiles_path),
+                root=str(root) if root else None,
+                check_filled=check_filled
+            )
+        else:
+            return cls(
+                profiles=str(profiles_path),
+                root=str(root) if root else None,
+                check_filled=check_filled,
+                _is_lazy=False
+            )
 
 
 
@@ -288,23 +416,41 @@ class TaxonomicProfiles:
         """
         Create new TaxonomicProfiles filtered by sample IDs.
         
+        Works in both lazy and eager modes. Preserves the mode of the original instance.
+        
         Args:
             samples: LazyFrame containing sample IDs to keep
             
         Returns:
-            New TaxonomicProfiles instance with filtered data
+            New TaxonomicProfiles instance with filtered data (same mode as original)
         """
-        filtered_profiles = self._filter_profiles_by_sample(samples)
+        if self._is_lazy:
+            # Lazy mode: filter LazyFrames
+            filtered_profiles = self._lf_profiles.join(samples, on='sample', how='semi')
+            filtered_root = self._lf_root.join(samples, on='sample', how='semi') if self._lf_root is not None else None
+            
+            # Create new instance in lazy mode
+            new_instance = TaxonomicProfiles.__new__(TaxonomicProfiles)
+            new_instance._is_lazy = True
+            new_instance._lf_profiles = filtered_profiles
+            new_instance._lf_root = filtered_root
+            new_instance.profiles = None
+            new_instance.root = None
+            new_instance.is_filled = self.is_filled
+        else:
+            # Eager mode: filter DataFrames
+            filtered_profiles = self.profiles.join(samples.collect(), on='sample', how='semi')
+            filtered_root = self.root.join(samples.collect(), on='sample', how='semi') if self.root is not None else None
+            
+            # Create new instance in eager mode
+            new_instance = TaxonomicProfiles.__new__(TaxonomicProfiles)
+            new_instance._is_lazy = False
+            new_instance.profiles = filtered_profiles
+            new_instance.root = filtered_root
+            new_instance._lf_profiles = None
+            new_instance._lf_root = None
+            new_instance.is_filled = self.is_filled
         
-        filtered_root = None
-        if self.root is not None:
-            filtered_root = self._filter_root_by_sample(samples)
-        
-        # Create new instance without running __init__ validation
-        new_instance = TaxonomicProfiles.__new__(TaxonomicProfiles)
-        new_instance.profiles = filtered_profiles
-        new_instance.root = filtered_root  
-        new_instance.is_filled = self.is_filled  # Inherit filled status
         return new_instance
 
     def _get_rank(self, lf: pl.LazyFrame, rank: Union[str, TaxonomicRanks]) -> pl.LazyFrame:
@@ -318,13 +464,28 @@ class TaxonomicProfiles:
     def get_rank(self, rank: Union[str, TaxonomicRanks]) -> pl.LazyFrame:
         """Get entries for a specific taxonomic rank.
         
+        Works in both lazy and eager modes.
+        
         Args:
             rank: Taxonomic rank to filter by
             
         Returns:
             LazyFrame with entries for the specified rank
         """
-        return self._get_rank(self.profiles, rank)
+        profiles_lf = self._lf_profiles if self._is_lazy else self.profiles.lazy()
+        return self._get_rank(profiles_lf, rank)
+    
+    def get_rank_lf(self, profiles_lf: pl.LazyFrame, rank: Union[str, TaxonomicRanks]) -> pl.LazyFrame:
+        """Helper: Get entries for a specific taxonomic rank from a LazyFrame.
+        
+        Args:
+            profiles_lf: LazyFrame with profiles data
+            rank: Taxonomic rank to filter by
+            
+        Returns:
+            LazyFrame with entries for the specified rank
+        """
+        return self._get_rank(profiles_lf, rank)
 
 
     def filter_by_coverage(self, cov_cutoff: float = 50.0) -> "TaxonomicProfiles":
@@ -404,13 +565,13 @@ class TaxonomicProfiles:
             .filter_dominated_samples(dominated_cutoff, rank)
             )
 
-    def _fill_profiles_lf(self) -> pl.LazyFrame:
+    def _fill_profiles_lf(self, profiles_lf: pl.LazyFrame) -> pl.LazyFrame:
         """Internal method: fill profiles and return LazyFrame."""
-        schema_names = self.profiles.collect_schema().names()
+        schema_names = profiles_lf.collect_schema().names()
         abundance_col = 'relabund' if 'relabund' in schema_names else 'coverage'
 
-        filled_profiles = self.profiles
-        species = self.get_rank(TaxonomicRanks.SPECIES)
+        filled_profiles = profiles_lf
+        species = self.get_rank_lf(profiles_lf, TaxonomicRanks.SPECIES)
 
         filled_ranks = [species]
 
@@ -437,15 +598,15 @@ class TaxonomicProfiles:
         # Combine all filled ranks
         return pl.concat(filled_ranks).unique()
 
-    def _create_root_lf(self) -> pl.LazyFrame:
+    def _create_root_lf(self, profiles_lf: pl.LazyFrame) -> pl.LazyFrame:
         """Internal method: create root and return LazyFrame."""
-        schema_names = self.profiles.collect_schema().names()
+        schema_names = profiles_lf.collect_schema().names()
         if 'relabund' in schema_names:
             raise ValueError("Cannot create root from relative abundance profiles.")
 
         # If filled, sum domain-level coverages per sample
         if self.is_filled:
-            domain_entries = self.get_rank(TaxonomicRanks.DOMAIN)
+            domain_entries = self.get_rank_lf(profiles_lf, TaxonomicRanks.DOMAIN)
             return (
                 domain_entries
                 .group_by('sample')
@@ -455,28 +616,28 @@ class TaxonomicProfiles:
         else:
             # If not filled, sum all coverages per sample
             return (
-                self.profiles
+                profiles_lf
                 .group_by('sample')
                 .agg(pl.col('coverage').sum().alias('root_coverage'))
                 .select(['sample', 'root_coverage'])
             )
 
-    def _to_relabund_lf(self) -> pl.LazyFrame:
+    def _to_relabund_lf(self, profiles_lf: pl.LazyFrame, root_lf: pl.LazyFrame) -> pl.LazyFrame:
         """
         Convert coverage profiles to relative abundance.
-        Returns a new TaxonomicProfiles instance with relabund column.
+        Returns LazyFrame with relabund column.
         """
-        if self.root is None:
-            raise ValueError("Root coverage is required to convert to relative abundance. Use create_root() first.")
+        if root_lf is None:
+            raise ValueError("Root coverage is required to convert to relative abundance.")
 
-        schema_names = self.profiles.collect_schema().names()
+        schema_names = profiles_lf.collect_schema().names()
         if 'relabund' in schema_names:
-            return self  # Already relative abundance
+            return profiles_lf  # Already relative abundance
 
         # Join root coverage to profiles
         relabund = (
-            self.profiles
-            .join(self.root.select(['sample', 'root_coverage']), on='sample')
+            profiles_lf
+            .join(root_lf.select(['sample', 'root_coverage']), on='sample')
             .with_columns([
                 (pl.col('coverage') / pl.col('root_coverage')).alias('relabund')
             ])
@@ -541,11 +702,16 @@ class TaxonomicProfiles:
         Returns:
             FeatureSet instance with features at the specified rank
         """
-        if self.profiles is None:
+        # Check both lazy and eager profiles
+        if self.profiles is None and self._lf_profiles is None:
             raise ValueError("No profiles available to create features.")
         if self.is_filled is False:
             raise ValueError("Profiles must be in filled format to create features. Use fill_profiles() first.")
-        if 'relabund' not in self.profiles.collect_schema().names():
+        
+        # Get profiles as LazyFrame
+        profiles_lf = self._lf_profiles if self._is_lazy else self.profiles.lazy()
+        
+        if 'relabund' not in profiles_lf.collect_schema().names():
             raise ValueError("Profiles must be in relative abundance format to create features. Use _to_relabund_lf() first.")
 
         if isinstance(rank, str):
@@ -553,7 +719,7 @@ class TaxonomicProfiles:
 
         # Extract features at the specified rank
         features = (
-            self.profiles
+            profiles_lf
             .filter(pl.col("taxonomy").str.contains(rank.prefix))
             .select(["sample", "taxonomy", "relabund"])
             .collect()
@@ -562,4 +728,4 @@ class TaxonomicProfiles:
 
         return FeatureSet.from_df(
             df=features,
-            label_column=None)
+            name=f"{rank.name.lower()}_features")
