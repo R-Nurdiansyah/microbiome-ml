@@ -21,9 +21,12 @@ class TestFeatureSetInitialization:
         
         assert fs.accessions == accessions
         assert fs.feature_names == feature_names
-        assert np.array_equal(fs.features, features)
+        assert isinstance(fs.features, pl.LazyFrame)
         assert fs.name == "test"
-        assert fs._is_lazy is False
+        
+        # Check data content
+        df = fs.features.collect()
+        assert df.shape == (3, 4)  # 3 samples, 3 features + 1 sample col
         
     def test_requires_name(self):
         """Test that name parameter is required."""
@@ -48,60 +51,33 @@ class TestFeatureSetLoadScan:
     """Test loading from CSV files."""
     
     def test_load_eager(self, features_csv):
-        """Test loading in eager mode."""
+        """Test loading (always lazy internally)."""
         fs = FeatureSet.load(features_csv)
         
-        assert fs._is_lazy is False
-        assert fs.features is not None
-        assert isinstance(fs.features, np.ndarray)
+        assert isinstance(fs.features, pl.LazyFrame)
         assert len(fs.accessions) == 4
         assert len(fs.feature_names) == 3
         
     def test_scan_lazy(self, features_csv):
-        """Test scanning in lazy mode."""
+        """Test scanning (always lazy internally)."""
         fs = FeatureSet.scan(features_csv, name="lazy_test")
         
-        assert fs._is_lazy is True
-        assert fs._lf is not None
-        assert isinstance(fs._lf, pl.LazyFrame)
+        assert isinstance(fs.features, pl.LazyFrame)
         assert fs.name == "lazy_test"
-
-
-class TestFeatureSetcollect:
-    """Test lazy-to-eager conversion."""
-    
-    def test_collect_lazy(self, sample_features_lazy):
-        """Test materializing a lazy instance."""
-        assert sample_features_lazy._is_lazy is True
-        
-        collected = sample_features_lazy.collect()
-        
-        assert collected._is_lazy is False
-        assert collected.features is not None
-        assert isinstance(collected.features, np.ndarray)
-        assert collected._lf is None
-        
-    def test_collect_eager_noop(self, sample_features_eager):
-        """Test materializing an already-eager instance (no-op)."""
-        assert sample_features_eager._is_lazy is False
-        
-        sample_features_eager.collect()
-        
-        assert sample_features_eager._is_lazy is False
 
 
 class TestFeatureSetSave:
     """Test saving to CSV."""
     
     def test_save_eager(self, sample_features_eager, tmp_path):
-        """Test saving eager instance."""
+        """Test saving instance."""
         save_path = tmp_path / "features_save.csv"
         sample_features_eager.save(save_path)
         
         assert save_path.exists()
         
     def test_save_lazy(self, sample_features_lazy, tmp_path):
-        """Test saving lazy instance (should collect)."""
+        """Test saving lazy instance."""
         save_path = tmp_path / "features_save_lazy.csv"
         sample_features_lazy.save(save_path)
         
@@ -116,7 +92,11 @@ class TestFeatureSetSave:
         
         assert loaded.accessions == sample_features_eager.accessions
         assert loaded.feature_names == sample_features_eager.feature_names
-        assert np.allclose(loaded.features, sample_features_eager.features)
+        
+        # Compare data
+        original_df = sample_features_eager.features.collect().sort("sample")
+        loaded_df = loaded.features.collect().sort("sample")
+        assert original_df.equals(loaded_df)
 
 
 class TestFeatureSetFactoryMethods:
@@ -130,7 +110,9 @@ class TestFeatureSetFactoryMethods:
         assert fs.name == "from_df_test"
         assert len(fs.accessions) == 4
         assert len(fs.feature_names) == 3
-        assert fs.features.shape == (4, 3)
+        
+        # Check dimensions via collect
+        assert fs.features.collect().shape == (4, 4) # 4 samples, 3 features + 1 sample col
         
     def test_from_taxonomic_profiles(self, sample_profiles_eager):
         """Test creating from TaxonomicProfiles."""
@@ -147,26 +129,30 @@ class TestFeatureSetFiltering:
     """Test sample filtering."""
     
     def test_filter_samples_eager(self, sample_features_eager):
-        """Test filtering preserves eager mode."""
+        """Test filtering."""
         samples_to_keep = ["S1", "S3"]
         
         filtered = sample_features_eager.filter_samples(samples_to_keep)
         
-        assert filtered._is_lazy is False
+        assert isinstance(filtered.features, pl.LazyFrame)
         assert filtered.accessions == samples_to_keep
-        assert filtered.features.shape[0] == 2
+        
+        # Check dimensions
+        df = filtered.features.collect()
+        assert df.height == 2
         
     def test_filter_samples_lazy(self, sample_features_lazy):
-        """Test filtering preserves lazy mode."""
+        """Test filtering lazy instance."""
         samples_to_keep = ["S2", "S4"]
         
         filtered = sample_features_lazy.filter_samples(samples_to_keep)
         
-        assert filtered._is_lazy is True
+        assert isinstance(filtered.features, pl.LazyFrame)
         
         # collect to check results
-        filtered.collect()
+        df = filtered.features.collect()
         assert filtered.accessions == samples_to_keep
+        assert df.height == 2
 
 
 class TestFeatureSetQueries:

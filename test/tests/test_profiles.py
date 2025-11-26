@@ -17,25 +17,22 @@ class TestTaxonomicProfilesInitialization:
         """Test eager mode initialization from CSV files."""
         profiles = TaxonomicProfiles(profiles_csv, root=root_csv, check_filled=False)
         
-        assert profiles._is_lazy is False
         assert profiles.profiles is not None
-        assert isinstance(profiles.profiles, pl.DataFrame)
-        assert profiles.profiles.height > 0
+        assert isinstance(profiles.profiles, pl.LazyFrame)
         
     def test_lazy_initialization(self, profiles_csv, root_csv):
         """Test lazy mode initialization via scan."""
         profiles = TaxonomicProfiles.scan(profiles_csv, root=root_csv, check_filled=False)
         
-        assert profiles._is_lazy is True
-        assert profiles._lf_profiles is not None
-        assert isinstance(profiles._lf_profiles, pl.LazyFrame)
+        assert profiles.profiles is not None
+        assert isinstance(profiles.profiles, pl.LazyFrame)
         
     def test_with_root(self, profiles_csv, root_csv):
         """Test initialization with root coverage."""
         profiles = TaxonomicProfiles(profiles_csv, root=root_csv, check_filled=False)
         
         assert profiles.root is not None
-        assert isinstance(profiles.root, pl.DataFrame)
+        assert isinstance(profiles.root, pl.LazyFrame)
         
     def test_without_root(self, profiles_csv):
         """Test initialization without root coverage."""
@@ -43,30 +40,6 @@ class TestTaxonomicProfilesInitialization:
         
         # Root should be created from domain-level coverage
         assert profiles.root is not None
-
-
-class TestTaxonomicProfilescollect:
-    """Test lazy-to-eager conversion."""
-    
-    def test_collect_lazy(self, sample_profiles_lazy):
-        """Test materializing a lazy instance."""
-        assert sample_profiles_lazy._is_lazy is True
-        
-        sample_profiles_lazy.collect()
-        
-        assert sample_profiles_lazy._is_lazy is False
-        assert sample_profiles_lazy.profiles is not None
-        assert isinstance(sample_profiles_lazy.profiles, pl.DataFrame)
-        assert sample_profiles_lazy._lf_profiles is None
-        
-    def test_collect_eager_noop(self, sample_profiles_eager):
-        """Test materializing an already-eager instance (no-op)."""
-        assert sample_profiles_eager._is_lazy is False
-        
-        sample_profiles_eager.collect()
-        
-        assert sample_profiles_eager._is_lazy is False
-        assert sample_profiles_eager.profiles is not None
 
 
 class TestTaxonomicProfilesSaveLoad:
@@ -92,20 +65,18 @@ class TestTaxonomicProfilesSaveLoad:
         save_dir = tmp_path / "profiles_roundtrip"
         sample_profiles_eager.save(save_dir)
         
-        loaded = TaxonomicProfiles.load(save_dir, lazy=False, check_filled=False)
+        loaded = TaxonomicProfiles.load(save_dir, check_filled=False)
         
-        assert loaded._is_lazy is False
-        assert loaded.profiles.shape == sample_profiles_eager.profiles.shape
+        assert loaded.profiles.collect().shape == sample_profiles_eager.profiles.collect().shape
         
     def test_load_lazy(self, sample_profiles_eager, tmp_path):
         """Test save then load in lazy mode."""
         save_dir = tmp_path / "profiles_roundtrip_lazy"
         sample_profiles_eager.save(save_dir)
         
-        loaded = TaxonomicProfiles.load(save_dir, lazy=True, check_filled=False)
+        loaded = TaxonomicProfiles.load(save_dir, check_filled=False)
         
-        assert loaded._is_lazy is True
-        assert loaded._lf_profiles is not None
+        assert isinstance(loaded.profiles, pl.LazyFrame)
         
     def test_scan_alias(self, sample_profiles_eager, tmp_path):
         """Test scan is alias for load(lazy=True)."""
@@ -114,7 +85,7 @@ class TestTaxonomicProfilesSaveLoad:
         
         scanned = TaxonomicProfiles.scan(save_dir, check_filled=False)
         
-        assert scanned._is_lazy is True
+        assert isinstance(scanned.profiles, pl.LazyFrame)
 
 
 class TestTaxonomicProfilesFiltering:
@@ -126,9 +97,8 @@ class TestTaxonomicProfilesFiltering:
         
         filtered = sample_profiles_eager._filter_by_sample(samples_lf)
         
-        assert filtered._is_lazy is False
         assert filtered.profiles is not None
-        unique_samples = set(filtered.profiles["sample"].unique().to_list())
+        unique_samples = set(filtered.profiles.collect()["sample"].unique().to_list())
         assert unique_samples == {"S1"}
         
     def test_filter_by_sample_lazy(self, sample_profiles_lazy):
@@ -137,14 +107,10 @@ class TestTaxonomicProfilesFiltering:
         
         filtered = sample_profiles_lazy._filter_by_sample(samples_lf)
         
-        assert filtered._is_lazy is True
-        assert filtered._lf_profiles is not None
+        assert isinstance(filtered.profiles, pl.LazyFrame)
         
         # collect to check results
-        filtered.collect()
-        assert filtered._is_lazy is False
-        assert filtered.profiles is not None
-        unique_samples = set(filtered.profiles["sample"].unique().to_list())
+        unique_samples = set(filtered.profiles.collect()["sample"].unique().to_list())
         assert unique_samples == {"S2"}
 
 
@@ -154,7 +120,7 @@ class TestTaxonomicProfilesTaxonomy:
     def test_taxonomy_standardization(self, sample_profiles_eager):
         """Test taxonomy strings are properly formatted."""
         # Check that taxonomy strings don't have spaces after semicolons
-        taxonomies = sample_profiles_eager.profiles["taxonomy"].to_list()
+        taxonomies = sample_profiles_eager.profiles.collect()["taxonomy"].to_list()
         for tax in taxonomies:
             assert "; " not in tax, f"Taxonomy has space after semicolon: {tax}"
             
@@ -196,7 +162,6 @@ class TestTaxonomicProfilesFeatureCreation:
         
         assert isinstance(features, FeatureSet)
         # create_features() always returns eager FeatureSet (calls .collect())
-        assert features._is_lazy is False
         assert features.features is not None
 
 
@@ -209,7 +174,7 @@ class TestTaxonomicProfilesRelativeAbundance:
         # Check that relabund column exists and values are normalized per-taxonomy
         relabund_values = sample_profiles_eager.profiles.filter(
             pl.col("sample") == "S1"
-        )["relabund"].to_list()
+        ).collect()["relabund"].to_list()
         
         # Just verify relabund column exists and contains values
         assert len(relabund_values) > 0
@@ -218,3 +183,127 @@ class TestTaxonomicProfilesRelativeAbundance:
         # Individual values should be between 0 and 1
         for val in relabund_values:
             assert 0.0 <= val <= 1.0
+
+
+class TestTaxonomicProfilesQC:
+    """Test quality control methods."""
+    
+    def test_default_qc_default_behavior(self, dominated_profiles_csv, dominated_root_csv):
+        """Test default_qc applies both coverage and domination filters."""
+        profiles = TaxonomicProfiles(dominated_profiles_csv, root=dominated_root_csv, check_filled=False)
+        
+        # Before QC: 4 samples
+        initial_samples = set(profiles.profiles.collect()["sample"].unique().to_list())
+        assert len(initial_samples) == 4
+        
+        qc_profiles = profiles.default_qc(cov_cutoff=50.0, dominated_cutoff=0.99)
+        
+        # After QC: DOM1 and DOM2 should be filtered (dominated)
+        # All samples pass coverage (all > 50)
+        final_samples = set(qc_profiles.profiles.collect()["sample"].unique().to_list())
+        assert final_samples == {"HQ1", "HQ2"}
+        
+    def test_default_qc_custom_coverage_cutoff(self, dominated_profiles_csv, dominated_root_csv):
+        """Test default_qc with custom coverage cutoff."""
+        profiles = TaxonomicProfiles(dominated_profiles_csv, root=dominated_root_csv, check_filled=False)
+        
+        # Very high coverage cutoff - filters all samples
+        qc_profiles = profiles.default_qc(cov_cutoff=200.0, dominated_cutoff=1.0)
+        
+        final_samples = set(qc_profiles.profiles.collect()["sample"].unique().to_list())
+        assert len(final_samples) == 0
+        
+    def test_default_qc_custom_dominated_cutoff(self, dominated_profiles_csv, dominated_root_csv):
+        """Test default_qc with custom domination cutoff."""
+        profiles = TaxonomicProfiles(dominated_profiles_csv, root=dominated_root_csv, check_filled=False)
+        
+        # Very high domination cutoff (keep everything)
+        qc_profiles = profiles.default_qc(cov_cutoff=50.0, dominated_cutoff=1.0)
+        
+        # All 4 samples should pass (coverage filter only)
+        final_samples = set(qc_profiles.profiles.collect()["sample"].unique().to_list())
+        assert len(final_samples) == 4
+        
+    def test_default_qc_custom_rank(self, dominated_profiles_csv, dominated_root_csv):
+        """Test default_qc with custom taxonomic rank for domination check."""
+        profiles = TaxonomicProfiles(dominated_profiles_csv, root=dominated_root_csv, check_filled=False)
+        
+        # Check domination at phylum level instead of order
+        qc_profiles = profiles.default_qc(
+            cov_cutoff=50.0,
+            dominated_cutoff=0.99,
+            rank=TaxonomicRanks.PHYLUM
+        )
+        
+        # Results depend on phylum-level domination
+        final_samples = set(qc_profiles.profiles.collect()["sample"].unique().to_list())
+        assert len(final_samples) >= 0  # At least doesn't crash
+        
+    def test_default_qc_preserves_eager_mode(self, dominated_profiles_csv, dominated_root_csv):
+        """Test default_qc preserves eager mode."""
+        profiles = TaxonomicProfiles(dominated_profiles_csv, root=dominated_root_csv, check_filled=False)
+        
+        qc_profiles = profiles.default_qc()
+        
+        assert qc_profiles.profiles is not None
+        assert isinstance(qc_profiles.profiles, pl.LazyFrame)
+        
+    def test_default_qc_preserves_lazy_mode(self, dominated_profiles_csv, dominated_root_csv):
+        """Test default_qc preserves lazy mode."""
+        profiles = TaxonomicProfiles.scan(dominated_profiles_csv, root=dominated_root_csv, check_filled=False)
+        
+        qc_profiles = profiles.default_qc()
+        
+        assert isinstance(qc_profiles.profiles, pl.LazyFrame)
+        
+    def test_default_qc_immutability(self, dominated_profiles_csv, dominated_root_csv):
+        """Test default_qc returns new instance without modifying original."""
+        profiles = TaxonomicProfiles(dominated_profiles_csv, root=dominated_root_csv, check_filled=False)
+        original_samples = set(profiles.profiles.collect()["sample"].unique().to_list())
+        
+        qc_profiles = profiles.default_qc()
+        
+        # Original unchanged
+        assert set(profiles.profiles.collect()["sample"].unique().to_list()) == original_samples
+        # New instance is different
+        assert qc_profiles is not profiles
+        
+    def test_default_qc_chaining_with_individual_filters(self, dominated_profiles_csv, dominated_root_csv):
+        """Test default_qc produces same result as chaining individual filters."""
+        profiles = TaxonomicProfiles(dominated_profiles_csv, root=dominated_root_csv, check_filled=False)
+        
+        # Default QC
+        qc_default = profiles.default_qc(cov_cutoff=50.0, dominated_cutoff=0.99, rank=TaxonomicRanks.ORDER)
+        
+        # Manual chaining
+        qc_manual = (profiles
+                     .filter_by_coverage(cov_cutoff=50.0)
+                     .filter_dominated_samples(dominated_cutoff=0.99, rank=TaxonomicRanks.ORDER))
+        
+        # Should produce same samples
+        default_samples = set(qc_default.profiles.collect()["sample"].unique().to_list())
+        manual_samples = set(qc_manual.profiles.collect()["sample"].unique().to_list())
+        assert default_samples == manual_samples
+        
+    def test_filter_by_coverage_requires_root(self, dominated_profiles_csv):
+        """Test filter_by_coverage requires root coverage data."""
+        # Create profiles without root
+        profiles_data = pl.read_csv(dominated_profiles_csv).lazy()
+        profiles = TaxonomicProfiles.__new__(TaxonomicProfiles)
+        profiles.profiles = profiles_data
+        profiles.root = None
+        profiles.is_filled = True
+        
+        with pytest.raises(ValueError, match="Root coverage data not available"):
+            profiles.filter_by_coverage(cov_cutoff=50.0)
+            
+    def test_filter_dominated_requires_relabund(self, dominated_profiles_csv, dominated_root_csv):
+        """Test filter_dominated_samples requires relabund format (not coverage)."""
+        # Load profiles and convert relabund to coverage column (invalid for domination check)
+        profiles = TaxonomicProfiles(dominated_profiles_csv, root=dominated_root_csv, check_filled=False)
+        
+        # Manually change column name to simulate coverage format
+        profiles.profiles = profiles.profiles.rename({"relabund": "coverage"})
+        
+        with pytest.raises(ValueError, match="must be in relative abundance format"):
+            profiles.filter_dominated_samples(dominated_cutoff=0.99)

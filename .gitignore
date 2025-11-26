@@ -142,8 +142,9 @@ Thumbs.db
 
 # Pixi
 .pixi/
-pixi.lock
 .pixi
+
+# misc
 plan.md
 sandbox.ipynb
 .github/chatmodes/

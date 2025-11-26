@@ -5,8 +5,11 @@ import polars as pl
 from typing import List, Any, Optional, Set, Union
 from pathlib import Path
 from enum import Enum
+import logging
 
 from microbiome_ml.utils._cache import load_data
+
+logger = logging.getLogger(__name__)
 
 
 class MetadataFields(Enum):
@@ -70,7 +73,7 @@ class StudyMetadataFields(MetadataFields):
 
 class SampleMetadata:
     """
-    Triple-structure sample metadata container with dual-mode support (eager/lazy).
+    Triple-structure sample metadata container (LazyFrame only).
     
     Maintains three data structures:
     - metadata: Wide-form core fields (sample, lat, lon, date, etc.)
@@ -78,21 +81,17 @@ class SampleMetadata:
     - study_titles: Study-level information (sample, study_title, abstract)
     
     Attributes:
-        metadata: Polars DataFrame (eager) or None (lazy)
-        attributes: Polars DataFrame (eager) or None (lazy)
-        study_titles: Optional DataFrame (eager) or None (lazy)
-        _is_lazy: Boolean flag indicating lazy mode
-        _lf_metadata: LazyFrame (lazy) or None (eager)
-        _lf_attributes: LazyFrame (lazy) or None (eager)
-        _lf_study_titles: LazyFrame (lazy) or None (eager)
+        metadata: Polars LazyFrame
+        attributes: Polars LazyFrame
+        study_titles: Optional Polars LazyFrame
     """
     
     def __init__(
         self, 
         metadata: Union[Path, str, pl.LazyFrame, pl.DataFrame], 
         attributes: Union[Path, str, pl.LazyFrame, pl.DataFrame], 
-        study_titles: Optional[Union[Path, str, pl.LazyFrame, pl.DataFrame]] = None,
-        _is_lazy: bool = False):
+        study_titles: Optional[Union[Path, str, pl.LazyFrame, pl.DataFrame]] = None
+    ):
         """
         Initialize SampleMetadata with validation and standardization.
         
@@ -100,36 +99,14 @@ class SampleMetadata:
             metadata: Path to metadata file or LazyFrame/DataFrame with core fields
             attributes: Path to attributes file or LazyFrame/DataFrame with sample, key, value columns
             study_titles: Optional path to study titles file or LazyFrame/DataFrame with study information
-            _is_lazy: Internal flag indicating lazy mode
             
         Raises:
             ValueError: If required columns are missing
         """
-        self._is_lazy = _is_lazy
-        
         # Load and standardize all data
-        metadata_lf = self._load_and_standardize(metadata, CoreMetadataFields)
-        attributes_lf = self._load_and_standardize(attributes, AttributesFields)
-        study_titles_lf = self._load_and_standardize(study_titles, StudyMetadataFields) if study_titles is not None else None
-        
-        if _is_lazy:
-            # Lazy mode: store LazyFrames
-            self._lf_metadata = metadata_lf
-            self._lf_attributes = attributes_lf
-            self._lf_study_titles = study_titles_lf
-            self.metadata = None
-            self.attributes = None
-            self.study_titles = None
-        else:
-            # Eager mode: collect to DataFrames
-            self.metadata = metadata_lf.collect()
-            self.attributes = attributes_lf.collect()
-            self.study_titles = study_titles_lf.collect() if study_titles_lf is not None else None
-            self._lf_metadata = None
-            self._lf_attributes = None
-            self._lf_study_titles = None
-
-
+        self.metadata = self._load_and_standardize(metadata, CoreMetadataFields)
+        self.attributes = self._load_and_standardize(attributes, AttributesFields)
+        self.study_titles = self._load_and_standardize(study_titles, StudyMetadataFields) if study_titles is not None else None
 
     def _load_data(self, data_source: Union[Path, str, pl.LazyFrame, pl.DataFrame]) -> pl.LazyFrame:
         """
@@ -146,7 +123,7 @@ class SampleMetadata:
         elif isinstance(data_source, pl.DataFrame):
             return data_source.lazy()
         elif isinstance(data_source, (str, Path)):
-            return load_data(data_source)
+            return pl.scan_csv(data_source)
         else:
             raise ValueError(f"Unsupported data source type: {type(data_source)}")
 
@@ -215,122 +192,66 @@ class SampleMetadata:
             study_titles: Optional path to study titles CSV file
             
         Returns:
-            SampleMetadata instance in lazy mode
+            SampleMetadata instance
         """
         return cls(
             metadata=metadata,
             attributes=attributes,
-            study_titles=study_titles,
-            _is_lazy=True
+            study_titles=study_titles
         )
     
-    def collect(self) -> "SampleMetadata":
-        """
-        Convert lazy SampleMetadata to eager (DataFrame) mode in-place.
-        
-        If already eager, returns self. If lazy, collects LazyFrames and converts to DataFrames.
-        
-        Returns:
-            Self after materialization
-        """
-        if self._is_lazy:
-            self.metadata = self._lf_metadata.collect()
-            self.attributes = self._lf_attributes.collect()
-            self.study_titles = self._lf_study_titles.collect() if self._lf_study_titles is not None else None
-            self._is_lazy = False
-            self._lf_metadata = None
-            self._lf_attributes = None
-            self._lf_study_titles = None
-        return self
-
     def _filter_by_sample(self, samples: pl.LazyFrame) -> "SampleMetadata":
         """
         Create new SampleMetadata filtered by sample IDs.
-        
-        Works in both lazy and eager modes. Preserves the mode of the original instance.
         
         Args:
             samples: LazyFrame containing sample IDs to keep
             
         Returns:
-            New SampleMetadata instance with filtered data (same mode as original)
+            New SampleMetadata instance with filtered data
         """
-        if self._is_lazy:
-            # Lazy mode: filter LazyFrames
-            filtered_metadata = self._lf_metadata.join(samples, on='sample', how='semi')
-            filtered_attributes = self._lf_attributes.join(samples, on='sample', how='semi')
-            filtered_study_titles = self._lf_study_titles.join(samples, on='sample', how='semi') if self._lf_study_titles is not None else None
-            
-            # Create new instance in lazy mode
-            new_instance = SampleMetadata.__new__(SampleMetadata)
-            new_instance._is_lazy = True
-            new_instance._lf_metadata = filtered_metadata
-            new_instance._lf_attributes = filtered_attributes
-            new_instance._lf_study_titles = filtered_study_titles
-            new_instance.metadata = None
-            new_instance.attributes = None
-            new_instance.study_titles = None
-        else:
-            # Eager mode: filter DataFrames
-            filtered_metadata = self.metadata.join(samples.collect(), on='sample', how='semi')
-            filtered_attributes = self.attributes.join(samples.collect(), on='sample', how='semi')
-            filtered_study_titles = self.study_titles.join(samples.collect(), on='sample', how='semi') if self.study_titles is not None else None
-            
-            # Create new instance in eager mode
-            new_instance = SampleMetadata.__new__(SampleMetadata)
-            new_instance._is_lazy = False
-            new_instance.metadata = filtered_metadata
-            new_instance.attributes = filtered_attributes
-            new_instance.study_titles = filtered_study_titles
-            new_instance._lf_metadata = None
-            new_instance._lf_attributes = None
-            new_instance._lf_study_titles = None
+        logger.debug(f"Filtering metadata")
+        
+        # Filter LazyFrames
+        filtered_metadata = self.metadata.join(samples, on='sample', how='semi')
+        filtered_attributes = self.attributes.join(samples, on='sample', how='semi')
+        filtered_study_titles = self.study_titles.join(samples, on='sample', how='semi') if self.study_titles is not None else None
+        
+        # Create new instance
+        new_instance = SampleMetadata.__new__(SampleMetadata)
+        new_instance.metadata = filtered_metadata
+        new_instance.attributes = filtered_attributes
+        new_instance.study_titles = filtered_study_titles
         
         return new_instance
 
+    def _get_sample_list(self) -> Set[str]:
+        """
+        Extract sample IDs from this metadata instance.
+        
+        Returns:
+            Set of sample IDs
+        """
+        return set(self.metadata.select("sample").collect().to_series().to_list())
+
     def _filter_metadata_by_depth(self, mbp_cutoff: int) -> pl.LazyFrame:
         """Internal method: filter metadata by depth and return LazyFrame."""
-        metadata_lf = self._lf_metadata if self._is_lazy else self.metadata.lazy()
-        return metadata_lf.filter(pl.col("mbases").cast(pl.UInt32) > mbp_cutoff)
+        return self.metadata.filter(pl.col("mbases").cast(pl.UInt32) > mbp_cutoff)
 
     def _add_domain_to_metadata(self, mapping_file: str) -> pl.LazyFrame:
         """Internal method: add domain column and return LazyFrame."""
-        metadata_lf = self._lf_metadata if self._is_lazy else self.metadata.lazy()
         biome_mapping = pl.scan_csv(mapping_file)
-        return metadata_lf.join(biome_mapping, left_on="biome", right_on="organism", how="left")
+        return self.metadata.join(biome_mapping, left_on="biome", right_on="organism", how="left")
 
     def filter_by_sequence_depth(self, mbp_cutoff: int = 1000) -> "SampleMetadata":
         """Filter samples based on quality metrics.
-        
-        Preserves the mode (lazy/eager) of the original instance.
         
         Args:
             mbp_cutoff: Minimum megabase pairs cutoff (default: 1000)
         """
         filtered_metadata = self._filter_metadata_by_depth(mbp_cutoff)
-        
-        if self._is_lazy:
-            # Create new instance in lazy mode
-            new_instance = self.__class__.__new__(self.__class__)
-            new_instance._is_lazy = True
-            new_instance._lf_metadata = filtered_metadata
-            new_instance._lf_attributes = self._lf_attributes
-            new_instance._lf_study_titles = self._lf_study_titles
-            new_instance.metadata = None
-            new_instance.attributes = None
-            new_instance.study_titles = None
-        else:
-            # Create new instance in eager mode
-            new_instance = self.__class__.__new__(self.__class__)
-            new_instance._is_lazy = False
-            new_instance.metadata = filtered_metadata.collect()
-            new_instance.attributes = self.attributes
-            new_instance.study_titles = self.study_titles
-            new_instance._lf_metadata = None
-            new_instance._lf_attributes = None
-            new_instance._lf_study_titles = None
-        
-        return new_instance
+        passing_samples = filtered_metadata.select("sample")
+        return self._filter_by_sample(passing_samples)
 
     def filter_by_biome(self, allowed_biomes: Optional[List[str]] = None,
                         excluded_biomes: Optional[List[str]] = None,
@@ -394,8 +315,6 @@ class SampleMetadata:
         """
         Add domain information based on biome classification.
         
-        Preserves the mode (lazy/eager) of the original instance.
-        
         Args:
             mapping_file: Path to CSV mapping biomes to domains
             
@@ -404,26 +323,11 @@ class SampleMetadata:
         """
         enhanced_metadata = self._add_domain_to_metadata(mapping_file)
         
-        if self._is_lazy:
-            # Create new instance in lazy mode
-            new_instance = SampleMetadata.__new__(SampleMetadata)
-            new_instance._is_lazy = True
-            new_instance._lf_metadata = enhanced_metadata
-            new_instance._lf_attributes = self._lf_attributes
-            new_instance._lf_study_titles = self._lf_study_titles
-            new_instance.metadata = None
-            new_instance.attributes = None
-            new_instance.study_titles = None
-        else:
-            # Create new instance in eager mode
-            new_instance = SampleMetadata.__new__(SampleMetadata)
-            new_instance._is_lazy = False
-            new_instance.metadata = enhanced_metadata.collect()
-            new_instance.attributes = self.attributes
-            new_instance.study_titles = self.study_titles
-            new_instance._lf_metadata = None
-            new_instance._lf_attributes = None
-            new_instance._lf_study_titles = None
+        # Create new instance
+        new_instance = SampleMetadata.__new__(SampleMetadata)
+        new_instance.metadata = enhanced_metadata
+        new_instance.attributes = self.attributes
+        new_instance.study_titles = self.study_titles
         
         return new_instance
 
@@ -437,7 +341,7 @@ class SampleMetadata:
         Returns:
             Filtered SampleMetadata instance
         """
-        metadata_lf = self._lf_metadata if self._is_lazy else self.metadata.lazy()
+        metadata_lf = self.metadata
         schema_names = metadata_lf.collect_schema().names()
         if "domain" not in schema_names:
             raise ValueError("Domain column not found. Use add_domain_from_biome() first.")
@@ -448,11 +352,21 @@ class SampleMetadata:
         
         return self._filter_by_sample(passing_samples)
     
+    def default_qc(self, mbp_cutoff: int = 1000) -> "SampleMetadata":
+        """
+        Apply default quality control: filter by sequencing depth.
+        
+        Args:
+            mbp_cutoff: Minimum megabase pairs cutoff (default: 1000)
+            
+        Returns:
+            New SampleMetadata instance with filtered samples
+        """
+        return self.filter_by_sequence_depth(mbp_cutoff=mbp_cutoff)
+    
     def save(self, path: Union[Path, str]) -> None:
         """
         Save SampleMetadata to CSV files in a directory.
-        
-        For lazy instances, this will collect the data first.
         
         Args:
             path: Directory path to save files (will be created if doesn't exist)
@@ -460,30 +374,21 @@ class SampleMetadata:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         
-        if self._is_lazy:
-            # Lazy mode: collect before saving
-            self._lf_metadata.collect().write_csv(path / "metadata.csv")
-            self._lf_attributes.collect().write_csv(path / "attributes.csv")
-            if self._lf_study_titles is not None:
-                self._lf_study_titles.collect().write_csv(path / "study_titles.csv")
-        else:
-            # Eager mode: save DataFrames directly
-            self.metadata.write_csv(path / "metadata.csv")
-            self.attributes.write_csv(path / "attributes.csv")
-            if self.study_titles is not None:
-                self.study_titles.write_csv(path / "study_titles.csv")
+        self.metadata.collect().write_csv(path / "metadata.csv")
+        self.attributes.collect().write_csv(path / "attributes.csv")
+        if self.study_titles is not None:
+            self.study_titles.collect().write_csv(path / "study_titles.csv")
     
     @classmethod
-    def load(cls, path: Union[Path, str], lazy: bool = True) -> "SampleMetadata":
+    def load(cls, path: Union[Path, str]) -> "SampleMetadata":
         """
         Load SampleMetadata from directory containing CSV files.
         
         Args:
             path: Directory path containing metadata.csv, attributes.csv, and optionally study_titles.csv
-            lazy: If True (default), scan files lazily; if False, read into memory
             
         Returns:
-            SampleMetadata instance in lazy or eager mode
+            SampleMetadata instance
         """
         path = Path(path)
         
@@ -496,16 +401,8 @@ class SampleMetadata:
         
         study_titles = study_titles_path if study_titles_path.exists() else None
         
-        if lazy:
-            return cls.scan(
-                metadata=str(metadata_path),
-                attributes=str(attributes_path),
-                study_titles=str(study_titles) if study_titles else None
-            )
-        else:
-            return cls(
-                metadata=str(metadata_path),
-                attributes=str(attributes_path),
-                study_titles=str(study_titles) if study_titles else None,
-                _is_lazy=False
-            )
+        return cls.scan(
+            metadata=str(metadata_path),
+            attributes=str(attributes_path),
+            study_titles=str(study_titles) if study_titles else None
+        )

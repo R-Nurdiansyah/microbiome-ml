@@ -55,8 +55,13 @@ dataset = (
         "oxygen": "path/to/oxygen_labels.csv",
         ...
         })
+    .define_groups({
+        "group1": "path/to/group1.csv",
+        "group2": "path/to/group2.csv",
+        ...
+        })
     .apply_preprocessing()
-    .add_taxonomic_features()
+    .create_taxonomic_features()
     )
 
 # save and load

@@ -8,11 +8,14 @@ import warnings
 import json
 import tarfile
 from datetime import datetime
+import logging
 
 from microbiome_ml.wrangle.metadata import SampleMetadata
 from microbiome_ml.wrangle.profiles import TaxonomicProfiles
 from microbiome_ml.wrangle.features import FeatureSet
 from microbiome_ml.utils.taxonomy import TaxonomicRanks
+
+logger = logging.getLogger(__name__)
 
 
 class Dataset:
@@ -60,6 +63,9 @@ class Dataset:
         self.feature_sets: Dict[str, FeatureSet] = {}
         self.labels: Dict[str, Any] = {}
         self._sample_ids: Optional[List[str]] = None
+
+        self.metadata_qc_done: bool = False
+        self.profiles_qc_done: bool = False
         
         # Process provided components if given
         if metadata is not None:
@@ -68,7 +74,8 @@ class Dataset:
             self.add_profiles(profiles)
         if features is not None:
             self.feature_sets.update(features)
-            self._update_sample_ids()
+        
+        self._sync_accessions()
     
     def add_metadata(
         self, 
@@ -120,7 +127,7 @@ class Dataset:
                     study_titles=study_source
                 )
         
-        self._update_sample_ids()
+        self._sync_accessions()
         return self
     
     def add_profiles(
@@ -157,7 +164,7 @@ class Dataset:
                 **kwargs
             )
         
-        self._update_sample_ids()
+        self._sync_accessions()
         return self
     
     def add_features(
@@ -256,160 +263,144 @@ class Dataset:
         """
         return self._sample_ids.copy() if self._sample_ids else []
     
-    def _get_accessions_from_metadata(self) -> Set[str]:
-        """
-        Extract sample accessions from metadata component (lazy-aware).
-        
-        Returns:
-            Set of sample IDs from metadata
-        """
-        if self.metadata is None:
-            return set()
-        
-        if self.metadata._is_lazy:
-            # Lazy mode: collect only sample column
-            return set(self.metadata._lf_metadata.select("sample").collect().to_series().to_list())
-        else:
-            # Eager mode: extract from DataFrame
-            return set(self.metadata.metadata.select("sample").to_series().to_list())
-    
-    def _get_accessions_from_profiles(self) -> Set[str]:
-        """
-        Extract sample accessions from profiles component (lazy-aware).
-        
-        Returns:
-            Set of sample IDs from profiles
-        """
-        if self.profiles is None:
-            return set()
-        
-        if self.profiles._is_lazy:
-            # Lazy mode: collect only sample column
-            return set(self.profiles._lf_profiles.select("sample").unique().collect().to_series().to_list())
-        else:
-            # Eager mode: extract from DataFrame
-            return set(self.profiles.profiles.select("sample").unique().to_series().to_list())
-    
-    def _get_accessions_from_features(self) -> Set[str]:
-        """
-        Extract sample accessions from all feature sets.
-        
-        Returns:
-            Set of sample IDs present in ALL feature sets (intersection)
-        """
-        if not self.feature_sets:
-            return set()
-        
-        # Get accessions from each feature set and find intersection
-        feature_accessions = [set(fs.accessions) for fs in self.feature_sets.values()]
-        return set.intersection(*feature_accessions) if feature_accessions else set()
-    
-    def _get_accessions_from_labels(self) -> Set[str]:
-        """
-        Extract sample accessions from all label sets.
-        
-        Returns:
-            Set of sample IDs present in ALL label sets (intersection)
-        """
-        if not self.labels:
-            return set()
-        
-        label_accessions = []
-        for label_data in self.labels.values():
-            if isinstance(label_data, pl.DataFrame):
-                # Assume labels have a 'sample' column
-                label_accessions.append(set(label_data.select("sample").to_series().to_list()))
-            elif isinstance(label_data, dict):
-                # If labels are dict, use keys as sample IDs
-                label_accessions.append(set(label_data.keys()))
-        
-        return set.intersection(*label_accessions) if label_accessions else set()
-    
     def _sync_accessions(self) -> None:
         """
-        Synchronize accessions across all components using strict intersection.
+        Synchronize accessions across all components using strict intersection via inner joins.
         
         This method:
-        1. Collects accessions from all non-None components
-        2. Computes strict intersection (samples present in ALL components)
-        3. Filters each component to the canonical sample set
+        1. Collects sample lists from all components
+        2. Computes strict intersection using Polars inner joins
+        3. Uses built-in filter methods to remove samples not in intersection
         4. Updates self._sample_ids with canonical ordering
-        5. Handles lazy mode efficiently (collects only accession columns)
         
         Warnings are issued if synchronization drops significant samples.
         """
-        # Collect accessions from all available components
-        all_accessions = []
+        logger.debug("Starting sample synchronization across components")
+        # Collect sample DataFrames from all available components
+        sample_dfs = []
         component_counts = {}
         
+        def get_samples_df(source_obj) -> pl.DataFrame:
+            """Helper to safely get samples DataFrame from component."""
+            if hasattr(source_obj, '_get_sample_list'):
+                samples = source_obj._get_sample_list()
+                if isinstance(samples, pl.LazyFrame):
+                    return samples.select("sample").unique().collect()
+                elif isinstance(samples, pl.DataFrame):
+                    return samples.select("sample").unique()
+                elif isinstance(samples, (set, list)):
+                    return pl.DataFrame({"sample": list(samples)})
+            return pl.DataFrame({"sample": []}, schema={"sample": pl.Utf8})
+
         if self.metadata is not None:
-            metadata_accs = self._get_accessions_from_metadata()
-            all_accessions.append(metadata_accs)
-            component_counts['metadata'] = len(metadata_accs)
+            metadata_samples = get_samples_df(self.metadata)
+            sample_dfs.append(("metadata", metadata_samples))
+            component_counts['metadata'] = metadata_samples.height
+            logger.debug(f"Metadata component has {metadata_samples.height} samples")
         
         if self.profiles is not None:
-            profiles_accs = self._get_accessions_from_profiles()
-            all_accessions.append(profiles_accs)
-            component_counts['profiles'] = len(profiles_accs)
+            profiles_samples = get_samples_df(self.profiles)
+            sample_dfs.append(("profiles", profiles_samples))
+            component_counts['profiles'] = profiles_samples.height
+            logger.debug(f"Profiles component has {profiles_samples.height} samples")
         
         if self.feature_sets:
-            features_accs = self._get_accessions_from_features()
-            all_accessions.append(features_accs)
-            component_counts['feature_sets'] = len(features_accs)
+            # Get intersection of all feature sets
+            feature_accs_list = [fs._get_sample_list() for fs in self.feature_sets.values()]
+            if feature_accs_list:
+                features_accs = set.intersection(*feature_accs_list)
+                features_samples = pl.DataFrame({"sample": list(features_accs)})
+                sample_dfs.append(("feature_sets", features_samples))
+                component_counts['feature_sets'] = features_samples.height
+                logger.debug(f"Feature sets (intersection) have {features_samples.height} samples")
         
         if self.labels:
-            labels_accs = self._get_accessions_from_labels()
-            all_accessions.append(labels_accs)
-            component_counts['labels'] = len(labels_accs)
+            # Get intersection of all label sets
+            label_accs_list = []
+            for label_data in self.labels.values():
+                if isinstance(label_data, pl.DataFrame):
+                    label_accs_list.append(set(label_data.select("sample").to_series().to_list()))
+                elif isinstance(label_data, pl.LazyFrame):
+                     label_accs_list.append(set(label_data.select("sample").collect().to_series().to_list()))
+                elif isinstance(label_data, dict):
+                    label_accs_list.append(set(label_data.keys()))
+            
+            if label_accs_list:
+                labels_accs = set.intersection(*label_accs_list)
+                labels_samples = pl.DataFrame({"sample": list(labels_accs)})
+                sample_dfs.append(("labels", labels_samples))
+                component_counts['labels'] = labels_samples.height
+                logger.debug(f"Labels (intersection) have {labels_samples.height} samples")
         
         # If no components, set to None and return
-        if not all_accessions:
+        if not sample_dfs:
+            logger.debug("No components found, setting sample_ids to None")
             self._sample_ids = None
             return
         
-        # Compute strict intersection
-        canonical_samples = set.intersection(*all_accessions)
+        logger.debug(f"Computing intersection across {len(sample_dfs)} component(s)")
         
-        # Warn if significant samples are dropped
-        for comp_name, comp_count in component_counts.items():
-            dropped = comp_count - len(canonical_samples)
-            if dropped > 0:
-                pct_dropped = (dropped / comp_count) * 100
-                if pct_dropped > 10:  # Warn if more than 10% dropped
-                    warnings.warn(
-                        f"Accession sync dropped {dropped} samples ({pct_dropped:.1f}%) from {comp_name}. "
-                        f"Canonical set: {len(canonical_samples)} samples.",
-                        UserWarning
-                    )
+        # Start with first component's samples
+        canonical_df = sample_dfs[0][1]
         
-        # Sort for deterministic ordering
-        canonical_list = sorted(list(canonical_samples))
-        self._sample_ids = canonical_list
+        # Inner join with each subsequent component to get strict intersection
+        for comp_name, comp_df in sample_dfs[1:]:
+            canonical_df = canonical_df.join(comp_df, on="sample", how="inner")
+            
+        # Sort for deterministic ordering and extract list
+        self._sample_ids = canonical_df.sort("sample").select("sample").to_series().to_list()
+        final_count = canonical_df.height
+        logger.debug(f"Final canonical sample set: {final_count} samples")
         
-        # Filter components to canonical set
+        # Check for significant drops relative to each component
+        for comp_name, comp_df in sample_dfs:
+            comp_count = comp_df.height
+            if comp_count == 0: continue
+            
+            dropped = comp_count - final_count
+            pct_dropped = (dropped / comp_count) * 100
+            
+            if pct_dropped > 10:
+                warnings.warn(
+                    f"Accession sync removed {dropped} samples ({pct_dropped:.1f}%) from {comp_name}. "
+                    f"Component has {comp_count}, but intersection has {final_count}.",
+                    UserWarning
+                )
+        
+        # Warn if no samples remain after intersection
+        if len(self._sample_ids) == 0:
+            warnings.warn(
+                "Accession synchronization resulted in empty sample set (no samples common to all components). "
+                "No filtering will be performed. Check that your components have overlapping sample IDs.",
+                UserWarning
+            )
+            logger.warning("No common samples found across components - synchronization aborted")
+            return
+        
+        # Filter components to canonical set using their built-in filter methods
         self._filter_components_to_canonical()
     
     def _filter_components_to_canonical(self) -> None:
         """
-        Filter all components to match the canonical sample set.
-        
-        Uses lazy-aware filtering to avoid materializing large datasets.
+        Filter all components to match the canonical sample set using built-in filter methods.
         """
         if self._sample_ids is None or not self._sample_ids:
+            logger.debug("No canonical sample IDs to filter to")
             return
         
+        logger.debug(f"Filtering components to canonical set of {len(self._sample_ids)} samples")
         # Create LazyFrame with canonical samples for filtering
         canonical_lf = pl.DataFrame({"sample": self._sample_ids}).lazy()
         
-        # Filter metadata
+        # Filter metadata using built-in method
         if self.metadata is not None:
             self.metadata = self.metadata._filter_by_sample(canonical_lf)
         
-        # Filter profiles
+        # Filter profiles using built-in method
         if self.profiles is not None:
             self.profiles = self.profiles._filter_by_sample(canonical_lf)
         
-        # Filter feature sets
+        # Filter feature sets using built-in method
         for name, feature_set in list(self.feature_sets.items()):
             self.feature_sets[name] = feature_set.filter_samples(self._sample_ids)
         
@@ -575,21 +566,24 @@ class Dataset:
         self,
         metadata_qc: bool = True,
         profiles_qc: bool = True,
-        sync_after: bool = True
+        sync_after: bool = True,
+        metadata_mbp_cutoff: int = 1000,
+        profiles_cov_cutoff: float = 50.0,
+        profiles_dominated_cutoff: float = 0.99,
+        profiles_rank: Union[str, TaxonomicRanks] = TaxonomicRanks.ORDER
     ) -> "Dataset":
         """
         Apply default QC methods from all internal classes.
         
         Steps:
         1. SampleMetadata QC (if metadata_qc=True):
-           - Validates required fields
-           - Checks date ranges and coordinates
-           - Removes invalid samples
+           - Filters samples by sequencing depth (mbp_cutoff)
         
         2. TaxonomicProfiles QC (if profiles_qc=True):
            - Ensures filled format (fills if needed)
-           - Validates taxonomy strings
-           - Filters low-coverage samples
+           - Converts to relative abundance (if needed)
+           - Filters by coverage (cov_cutoff)
+           - Filters dominated samples (dominated_cutoff at specified rank)
         
         3. Synchronize accessions across all components (if sync_after=True)
         
@@ -597,25 +591,42 @@ class Dataset:
             metadata_qc: Apply metadata quality control
             profiles_qc: Apply profiles quality control
             sync_after: Synchronize accessions after QC (recommended)
+            metadata_mbp_cutoff: Minimum megabase pairs for metadata QC (default: 1000)
+            profiles_cov_cutoff: Minimum coverage for profiles QC (default: 50.0)
+            profiles_dominated_cutoff: Maximum single-group abundance (default: 0.99)
+            profiles_rank: Taxonomic rank for domination check (default: ORDER)
             
         Returns:
             Self for chaining
         """
         # Apply metadata QC
-        if metadata_qc and self.metadata is not None:
-            # Basic validation already happens in __init__
-            # Additional QC can be added here as methods become available
-            # e.g., self.metadata.validate_dates()
-            # e.g., self.metadata.validate_coordinates()
-            # e.g., self.metadata.remove_invalid_samples()
-            pass
+        if metadata_qc and self.metadata is not None and not self.metadata_qc_done:
+            self.metadata = self.metadata.default_qc(mbp_cutoff=metadata_mbp_cutoff)
+            self.metadata_qc_done = True
         
         # Apply profiles QC
-        if profiles_qc and self.profiles is not None:
-            # Profiles are already filled during __init__ if check_filled=True
-            # Additional QC can be added here
-            # e.g., self.profiles = self.profiles.filter_by_coverage(cov_cutoff=50.0)
-            pass
+        if profiles_qc and self.profiles is not None and not self.profiles_qc_done:
+            # Ensure profiles have root coverage data (do this BEFORE fill to avoid double counting)
+            if self.profiles.root is None:
+                self.profiles = self.profiles.create_root()
+
+            # Ensure profiles are filled
+            if not self.profiles.is_filled:
+                self.profiles = self.profiles.fill_profiles()
+            
+            # Convert to relative abundance if needed
+            profiles_lf = self.profiles.profiles
+            if 'coverage' in profiles_lf.collect_schema().names():
+                # Need to convert from coverage to relabund
+                self.profiles.profiles = self.profiles._to_relabund_lf()
+            
+            # Apply default QC (coverage and domination filters)
+            self.profiles = self.profiles.default_qc(
+                cov_cutoff=profiles_cov_cutoff,
+                dominated_cutoff=profiles_dominated_cutoff,
+                rank=profiles_rank
+            )
+            self.profiles_qc_done = True
         
         # Synchronize accessions after QC
         if sync_after:
@@ -674,7 +685,7 @@ class Dataset:
         if self.metadata is not None:
             metadata_dir = work_dir / "metadata"
             self.metadata.save(metadata_dir)
-            metadata_lf = self.metadata._lf_metadata if self.metadata._is_lazy else self.metadata.metadata.lazy()
+            metadata_lf = self.metadata.metadata
             n_samples = metadata_lf.select("sample").collect().height
             manifest["components"]["metadata"] = {
                 "files": ["metadata.csv", "attributes.csv", "study_titles.csv"],
@@ -686,7 +697,7 @@ class Dataset:
             profiles_dir = work_dir / "profiles"
             self.profiles.save(profiles_dir)
             manifest["components"]["profiles"] = {
-                "files": ["profiles.csv", "root.csv"] if self.profiles.root is not None or self.profiles._lf_root is not None else ["profiles.csv"],
+                "files": ["profiles.csv", "root.csv"] if self.profiles.root is not None else ["profiles.csv"],
                 "is_filled": self.profiles.is_filled
             }
         
@@ -788,13 +799,13 @@ class Dataset:
         if "metadata" in manifest["components"]:
             metadata_dir = path / "metadata"
             if metadata_dir.exists():
-                dataset.metadata = SampleMetadata.load(metadata_dir, lazy=lazy)
+                dataset.metadata = SampleMetadata.load(metadata_dir)
         
         # Load profiles
         if "profiles" in manifest["components"]:
             profiles_dir = path / "profiles"
             if profiles_dir.exists():
-                dataset.profiles = TaxonomicProfiles.load(profiles_dir, lazy=lazy, check_filled=False)
+                dataset.profiles = TaxonomicProfiles.load(profiles_dir, check_filled=False)
         
         # Load feature sets
         if "features" in manifest["components"]:
@@ -838,3 +849,5 @@ class Dataset:
             Dataset instance with all components in lazy mode
         """
         return cls.load(path, lazy=True)
+
+

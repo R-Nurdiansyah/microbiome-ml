@@ -2,7 +2,7 @@
 
 import numpy as np
 import polars as pl
-from typing import List, Any, Optional, TYPE_CHECKING, Union
+from typing import List, Any, Optional, TYPE_CHECKING, Union, Set
 from pathlib import Path
 
 if TYPE_CHECKING:
@@ -28,17 +28,15 @@ class FeatureSet:
         accessions: List[str], 
         feature_names: List[str], 
         features: Any,
-        name: str,
-        _is_lazy: bool = False):
+        name: str):
         """
-        Initialize FeatureSet with validation. Supports both eager (numpy) and lazy (LazyFrame) modes.
+        Initialize FeatureSet with validation. Always stores as LazyFrame.
         
         Args:
             accessions: Ordered sample/species IDs
             feature_names: Ordered feature names
-            features: Either numpy array (eager) or LazyFrame (lazy)
+            features: LazyFrame, DataFrame, or numpy array
             name: Name for the FeatureSet
-            _is_lazy: Internal flag indicating lazy mode (LazyFrame)
             
         Raises:
             ValueError: If dimensions don't match or name is missing
@@ -49,20 +47,32 @@ class FeatureSet:
         self.accessions = accessions
         self.feature_names = feature_names
         self.name = name
-        self._is_lazy = _is_lazy
         
-        if _is_lazy:
-            # Lazy mode: features is a LazyFrame
-            self._lf = features
-            self.features = None
-        else:
-            # Eager mode: features is numpy array
+        if isinstance(features, pl.LazyFrame):
+            self.features = features
+        elif isinstance(features, pl.DataFrame):
+            self.features = features.lazy()
+        elif isinstance(features, np.ndarray):
+            # Convert numpy array to LazyFrame
             if features.shape[0] != len(accessions):
                 raise ValueError(f"Features array rows ({features.shape[0]}) must match accessions length ({len(accessions)})")
             if features.shape[1] != len(feature_names):
                 raise ValueError(f"Features array cols ({features.shape[1]}) must match feature_names length ({len(feature_names)})")
-            self.features = features
-            self._lf = None
+            
+            # Construct dictionary for DataFrame creation
+            # Note: This can be slow for very large arrays with many columns
+            data = {"sample": accessions}
+            # Use a more efficient way if possible, but for now:
+            # Create DataFrame from numpy array directly with schema
+            schema = ["sample"] + feature_names
+            # Prepend accessions column to features
+            # This is tricky with mixed types (str vs float). 
+            # Better to create DF from features and add sample column
+            df = pl.DataFrame(features, schema=feature_names)
+            df = df.with_columns(pl.Series("sample", accessions)).select(["sample"] + feature_names)
+            self.features = df.lazy()
+        else:
+            raise TypeError(f"Unsupported type for features: {type(features)}")
         
         # Cache indices for O(1) lookups (always built for fast queries)
         self._accession_idx = {acc: i for i, acc in enumerate(accessions)}
@@ -84,7 +94,7 @@ class FeatureSet:
             acc_column: Column name for accessions (auto-detects 'acc' or 'sample' if None)
             
         Returns:
-            LazyFeatureSet instance (lazy-loaded)
+            FeatureSet instance (lazy-loaded)
         """
         lf = pl.scan_csv(path)
         schema = lf.collect_schema()
@@ -106,8 +116,7 @@ class FeatureSet:
             accessions=accessions,
             feature_names=feature_names,
             features=lf,
-            name=name,
-            _is_lazy=True
+            name=name
         )
         
     @classmethod
@@ -150,12 +159,9 @@ class FeatureSet:
         feature_columns = [col for col in df.columns if col != acc_column]
         feature_names = feature_columns
         
-        # Convert features to numpy array
-        features = df.select(feature_columns).to_numpy()
-        
-        # All validation happens in __init__
+        # Pass DataFrame directly (will be converted to LazyFrame in __init__)
         return cls(accessions=accessions, feature_names=feature_names,
-                  features=features, name=name)
+                  features=df, name=name)
 
     
     @classmethod
@@ -199,19 +205,23 @@ class FeatureSet:
         
         return feature_set
 
-    def collect(self) -> "FeatureSet":
+    def _get_sample_list(self) -> Set[str]:
         """
-        Convert lazy FeatureSet to eager (numpy) mode.
-        
-        If already eager, returns self. If lazy, collects LazyFrame and converts to numpy.
+        Extract sample IDs from this feature set.
         
         Returns:
-            Eager FeatureSet with numpy array
+            Set of sample IDs (accessions)
         """
-        if self._is_lazy:
-            df = self._lf.collect()
-            return FeatureSet.from_df(df, name=self.name)
-        return self
+        return set(self.accessions)
+    
+    def collect(self) -> pl.DataFrame:
+        """
+        Collect the internal LazyFrame to a DataFrame.
+        
+        Returns:
+            DataFrame containing features and accessions
+        """
+        return self.features.collect()
 
     @classmethod
     def from_lf(cls, lf: pl.LazyFrame, name: str) -> "FeatureSet":
@@ -224,14 +234,25 @@ class FeatureSet:
         Returns:
             FeatureSet instance
         """
-        # Collect LazyFrame to DataFrame
-        df = lf.collect()
+        # We need accessions and feature names. 
+        # This requires collecting schema and accessions column.
+        schema = lf.collect_schema()
+        
+        acc_column = None
+        if 'acc' in schema.names():
+            acc_column = 'acc'
+        elif 'sample' in schema.names():
+            acc_column = 'sample'
+        else:
+            raise ValueError("No accession column found. Expected 'acc' or 'sample' column")
+            
+        accessions = lf.select(acc_column).collect().to_series().to_list()
+        feature_names = [col for col in schema.names() if col != acc_column]
         
         if name is None:
             raise ValueError(ERR_FEATURESET_NAME_UNDEFINED)
         
-        # Create FeatureSet from DataFrame
-        return cls.from_df(df, name=name)
+        return cls(accessions=accessions, feature_names=feature_names, features=lf, name=name)
 
     
     def to_df(
@@ -240,27 +261,15 @@ class FeatureSet:
         """
         Convert FeatureSet back to wide-form DataFrame.
         
-        For lazy FeatureSets, this will collect the LazyFrame first.
-            
         Returns:
             Wide-form DataFrame with accessions and features
         """
-        if self._is_lazy:
-            # Lazy mode: collect and return
-            return self._lf.collect()
-        else:
-            # Eager mode: construct from numpy array
-            df_dict = {"sample": self.accessions}
-            for i, feature_name in enumerate(self.feature_names):
-                df_dict[feature_name] = self.features[:, i]
-            return pl.DataFrame(df_dict)
+        return self.features.collect()
 
     
     def get_samples(self, sample_ids: List[str]) -> np.ndarray:
         """
         Get features for specific samples.
-        
-        Works in both lazy and eager modes. In lazy mode, collects only requested samples.
         
         Args:
             sample_ids: List of sample IDs to retrieve
@@ -271,24 +280,31 @@ class FeatureSet:
         Raises:
             ValueError: If any sample ID not found
         """
-        if self._is_lazy:
-            # Lazy mode: collect only requested samples
-            acc_col = 'acc' if 'acc' in self._lf.collect_schema().names() else 'sample'
-            df = self._lf.filter(pl.col(acc_col).is_in(sample_ids)).collect()
-            return df.drop(acc_col).to_numpy()
-        else:
-            # Eager mode: use cached index lookup (O(1))
-            try:
-                indices = [self._accession_idx[sample_id] for sample_id in sample_ids]
-            except KeyError as e:
-                raise ValueError(f"Sample ID {e} not found in FeatureSet")
-            return self.features[indices, :]
+        acc_col = 'acc' if 'acc' in self.features.collect_schema().names() else 'sample'
+        
+        # Filter and collect
+        df = self.features.filter(pl.col(acc_col).is_in(sample_ids)).collect()
+        
+        # Ensure order matches sample_ids
+        # This is important because filter doesn't guarantee order if not sorted
+        # But we can reindex in numpy or polars
+        
+        # Check if all samples found
+        found_samples = set(df[acc_col].to_list())
+        missing = set(sample_ids) - found_samples
+        if missing:
+             raise ValueError(f"Sample IDs {missing} not found in FeatureSet")
+             
+        # Reorder to match input sample_ids
+        # Create a mapping df
+        order_df = pl.DataFrame({acc_col: sample_ids, "order": range(len(sample_ids))})
+        df = df.join(order_df, on=acc_col).sort("order").drop("order")
+        
+        return df.drop(acc_col).to_numpy()
     
     def get_features(self, feature_names: List[str]) -> np.ndarray:
         """
         Get features for specific feature names.
-        
-        Works in both lazy and eager modes. In lazy mode, collects only requested features.
         
         Args:
             feature_names: List of feature names to retrieve
@@ -299,18 +315,16 @@ class FeatureSet:
         Raises:
             ValueError: If any feature name not found
         """
-        if self._is_lazy:
-            # Lazy mode: collect only requested features
-            acc_col = 'acc' if 'acc' in self._lf.collect_schema().names() else 'sample'
-            df = self._lf.select([acc_col] + feature_names).collect()
-            return df.drop(acc_col).to_numpy()
-        else:
-            # Eager mode: use cached index lookup (O(1))
-            try:
-                indices = [self._feature_idx[fname] for fname in feature_names]
-            except KeyError as e:
-                raise ValueError(f"Feature name {e} not found in FeatureSet")
-            return self.features[:, indices]
+        acc_col = 'acc' if 'acc' in self.features.collect_schema().names() else 'sample'
+        
+        # Check if features exist
+        schema_names = self.features.collect_schema().names()
+        missing = set(feature_names) - set(schema_names)
+        if missing:
+            raise ValueError(f"Feature names {missing} not found in FeatureSet")
+            
+        df = self.features.select([acc_col] + feature_names).collect()
+        return df.drop(acc_col).to_numpy()
     
     def get_sample_accs(self) -> List[str]:
         """Get list of all sample/accession IDs."""
@@ -324,13 +338,11 @@ class FeatureSet:
         """
         Filter FeatureSet to specific samples.
         
-        Works in both lazy and eager modes. Preserves the mode of the original FeatureSet.
-        
         Args:
             sample_ids: List of sample IDs to keep
             
         Returns:
-            New FeatureSet with filtered samples (same mode as original)
+            New FeatureSet with filtered samples
         """
         # Find indices of samples to keep
         keep_indices = [i for i, acc in enumerate(self.accessions) if acc in sample_ids]
@@ -341,45 +353,25 @@ class FeatureSet:
         # Filter accessions list
         filtered_accessions = [self.accessions[i] for i in keep_indices]
         
-        if self._is_lazy:
-            # Lazy mode: filter LazyFrame
-            acc_col = 'acc' if 'acc' in self._lf.collect_schema().names() else 'sample'
-            filtered_lf = self._lf.filter(pl.col(acc_col).is_in(sample_ids))
-            return FeatureSet(
-                accessions=filtered_accessions,
-                feature_names=self.feature_names.copy(),
-                features=filtered_lf,
-                name=self.name,
-                _is_lazy=True
-            )
-        else:
-            # Eager mode: filter numpy array
-            filtered_features = self.features[keep_indices, :]
-            return FeatureSet(
-                accessions=filtered_accessions,
-                feature_names=self.feature_names.copy(),
-                features=filtered_features,
-                name=self.name,
-                _is_lazy=False
-            )
+        acc_col = 'acc' if 'acc' in self.features.collect_schema().names() else 'sample'
+        filtered_lf = self.features.filter(pl.col(acc_col).is_in(sample_ids))
+        
+        return FeatureSet(
+            accessions=filtered_accessions,
+            feature_names=self.feature_names.copy(),
+            features=filtered_lf,
+            name=self.name
+        )
 
     def save(self, path: Union[Path, str]) -> None:
         """
         Save FeatureSet to disk as a .csv file.
         
-        For lazy FeatureSets, this will collect the data first.
-        
         Args:
             path: Path to save the .csv file
         """
         path = Path(path)
-        
-        if self._is_lazy:
-            # collect lazy data before saving
-            self._lf.collect().write_csv(path)
-        else:
-            # Eager mode: use to_df()
-            self.to_df().write_csv(path)
+        self.features.collect().write_csv(path)
 
     @classmethod
     def load(cls, path: Union[Path, str]) -> "FeatureSet":
@@ -393,9 +385,6 @@ class FeatureSet:
         """
         path = Path(path)
         
-        # Read CSV into DataFrame
-        df = pl.read_csv(path)
-        
-        # Create FeatureSet from DataFrame
-        return cls.from_df(df, name=path.stem)
+        # Use scan instead of read_csv to be lazy
+        return cls.scan(path, name=path.stem)
         

@@ -11,33 +11,29 @@ class TestSampleMetadataInitialization:
     """Test SampleMetadata initialization and modes."""
     
     def test_eager_initialization(self, metadata_csv, attributes_csv):
-        """Test eager mode initialization from CSV files."""
+        """Test initialization from CSV files."""
         meta = SampleMetadata(metadata_csv, attributes_csv)
         
-        assert meta._is_lazy is False
         assert meta.metadata is not None
         assert meta.attributes is not None
-        assert isinstance(meta.metadata, pl.DataFrame)
-        assert isinstance(meta.attributes, pl.DataFrame)
-        assert meta.metadata.height == 4
+        assert isinstance(meta.metadata, pl.LazyFrame)
+        assert isinstance(meta.attributes, pl.LazyFrame)
+        assert meta.metadata.collect().height == 4
         
     def test_lazy_initialization(self, metadata_csv, attributes_csv):
         """Test lazy mode initialization via scan."""
         meta = SampleMetadata.scan(metadata_csv, attributes_csv)
         
-        assert meta._is_lazy is True
-        assert meta._lf_metadata is not None
-        assert meta._lf_attributes is not None
-        assert isinstance(meta._lf_metadata, pl.LazyFrame)
-        assert isinstance(meta._lf_attributes, pl.LazyFrame)
+        assert isinstance(meta.metadata, pl.LazyFrame)
+        assert isinstance(meta.attributes, pl.LazyFrame)
         
     def test_with_study_titles(self, metadata_csv, attributes_csv, study_titles_csv):
         """Test initialization with optional study titles."""
         meta = SampleMetadata(metadata_csv, attributes_csv, study_titles_csv)
         
         assert meta.study_titles is not None
-        assert isinstance(meta.study_titles, pl.DataFrame)
-        assert meta.study_titles.height == 2
+        assert isinstance(meta.study_titles, pl.LazyFrame)
+        assert meta.study_titles.collect().height == 2
         
     def test_without_study_titles(self, metadata_csv, attributes_csv):
         """Test initialization without study titles."""
@@ -46,35 +42,11 @@ class TestSampleMetadataInitialization:
         assert meta.study_titles is None
 
 
-class TestSampleMetadatacollect:
-    """Test lazy-to-eager conversion."""
-    
-    def test_collect_lazy(self, sample_metadata_lazy):
-        """Test materializing a lazy instance."""
-        assert sample_metadata_lazy._is_lazy is True
-        
-        sample_metadata_lazy.collect()
-        
-        assert sample_metadata_lazy._is_lazy is False
-        assert sample_metadata_lazy.metadata is not None
-        assert isinstance(sample_metadata_lazy.metadata, pl.DataFrame)
-        assert sample_metadata_lazy._lf_metadata is None
-        
-    def test_collect_eager_noop(self, sample_metadata_eager):
-        """Test materializing an already-eager instance (no-op)."""
-        assert sample_metadata_eager._is_lazy is False
-        
-        sample_metadata_eager.collect()
-        
-        assert sample_metadata_eager._is_lazy is False
-        assert sample_metadata_eager.metadata is not None
-
-
 class TestSampleMetadataSaveLoad:
     """Test save/load round-trips."""
     
     def test_save_eager(self, sample_metadata_eager, tmp_path):
-        """Test saving eager instance."""
+        """Test saving instance."""
         save_dir = tmp_path / "metadata_save"
         sample_metadata_eager.save(save_dir)
         
@@ -91,62 +63,56 @@ class TestSampleMetadataSaveLoad:
         assert (save_dir / "attributes.csv").exists()
         
     def test_load_eager(self, sample_metadata_eager, tmp_path):
-        """Test save then load in eager mode."""
+        """Test save then load."""
         save_dir = tmp_path / "metadata_roundtrip"
         sample_metadata_eager.save(save_dir)
         
-        loaded = SampleMetadata.load(save_dir, lazy=False)
+        loaded = SampleMetadata.load(save_dir)
         
-        assert loaded._is_lazy is False
-        assert loaded.metadata.shape == sample_metadata_eager.metadata.shape
-        assert loaded.attributes.shape == sample_metadata_eager.attributes.shape
+        assert loaded.metadata.collect().shape == sample_metadata_eager.metadata.collect().shape
+        assert loaded.attributes.collect().shape == sample_metadata_eager.attributes.collect().shape
         
     def test_load_lazy(self, sample_metadata_eager, tmp_path):
-        """Test save then load in lazy mode."""
+        """Test save then load."""
         save_dir = tmp_path / "metadata_roundtrip_lazy"
         sample_metadata_eager.save(save_dir)
         
-        loaded = SampleMetadata.load(save_dir, lazy=True)
+        loaded = SampleMetadata.load(save_dir)
         
-        assert loaded._is_lazy is True
-        assert loaded._lf_metadata is not None
-        assert isinstance(loaded._lf_metadata, pl.LazyFrame)
+        assert isinstance(loaded.metadata, pl.LazyFrame)
         
     def test_scan_alias(self, sample_metadata_eager, metadata_csv, attributes_csv):
         """Test scan loads lazily from separate CSV files."""
         scanned = SampleMetadata.scan(metadata_csv, attributes_csv)
         
-        assert scanned._is_lazy is True
-        assert scanned._lf_metadata is not None
-        assert scanned.metadata is None
+        assert isinstance(scanned.metadata, pl.LazyFrame)
 
 
 class TestSampleMetadataFiltering:
     """Test filtering methods preserve mode."""
     
     def test_filter_by_sample_eager(self, sample_metadata_eager):
-        """Test filtering preserves eager mode."""
+        """Test filtering."""
         samples_lf = pl.DataFrame({"sample": ["S1", "S3"]}).lazy()
         
         filtered = sample_metadata_eager._filter_by_sample(samples_lf)
         
-        assert filtered._is_lazy is False
-        assert filtered.metadata.height == 2
-        assert set(filtered.metadata["sample"].to_list()) == {"S1", "S3"}
+        assert isinstance(filtered.metadata, pl.LazyFrame)
+        assert filtered.metadata.collect().height == 2
+        assert set(filtered.metadata.collect()["sample"].to_list()) == {"S1", "S3"}
         
     def test_filter_by_sample_lazy(self, sample_metadata_lazy):
-        """Test filtering preserves lazy mode."""
+        """Test filtering lazy instance."""
         samples_lf = pl.DataFrame({"sample": ["S2", "S4"]}).lazy()
         
         filtered = sample_metadata_lazy._filter_by_sample(samples_lf)
         
-        assert filtered._is_lazy is True
-        assert filtered._lf_metadata is not None
+        assert isinstance(filtered.metadata, pl.LazyFrame)
         
         # collect to check results
-        filtered.collect()
-        assert filtered.metadata.height == 2
-        assert set(filtered.metadata["sample"].to_list()) == {"S2", "S4"}
+        df = filtered.metadata.collect()
+        assert df.height == 2
+        assert set(df["sample"].to_list()) == {"S2", "S4"}
 
 
 class TestSampleMetadataFieldValidation:
@@ -157,11 +123,91 @@ class TestSampleMetadataFieldValidation:
         required = {"sample", "biosample", "bioproject", "lat", "lon", 
                    "collection_date", "biome", "mbases"}
         
-        columns = set(sample_metadata_eager.metadata.columns)
+        columns = set(sample_metadata_eager.metadata.collect_schema().names())
         assert required.issubset(columns)
         
     def test_attributes_structure(self, sample_metadata_eager):
         """Test attributes has correct long-format structure."""
-        assert "sample" in sample_metadata_eager.attributes.columns
-        assert "key" in sample_metadata_eager.attributes.columns
-        assert "value" in sample_metadata_eager.attributes.columns
+        columns = sample_metadata_eager.attributes.collect_schema().names()
+        assert "sample" in columns
+        assert "key" in columns
+        assert "value" in columns
+
+
+class TestSampleMetadataQC:
+    """Test quality control methods."""
+    
+    def test_default_qc_default_behavior(self, low_quality_metadata_csv, low_quality_attributes_csv):
+        """Test default_qc filters samples with mbases < 1000."""
+        meta = SampleMetadata(low_quality_metadata_csv, low_quality_attributes_csv)
+        
+        # Before QC: 7 samples (3 low quality, 4 high quality)
+        assert meta.metadata.collect().height == 7
+        
+        qc_meta = meta.default_qc()
+        
+        # After QC: only 2 high quality samples remain
+        assert qc_meta.metadata.collect().height == 4
+        assert set(qc_meta.metadata.collect()["sample"].to_list()) == {"DOM1", "DOM2", "HQ1", "HQ2"}
+        
+    def test_default_qc_custom_cutoff(self, low_quality_metadata_csv, low_quality_attributes_csv):
+        """Test default_qc with custom mbp_cutoff."""
+        meta = SampleMetadata(low_quality_metadata_csv, low_quality_attributes_csv)
+        
+        # Custom cutoff of 900 - should keep LQ3 (950 mbases)
+        qc_meta = meta.default_qc(mbp_cutoff=900)
+        
+        assert qc_meta.metadata.collect().height == 5
+        assert set(qc_meta.metadata.collect()["sample"].to_list()) == {"DOM1", "DOM2", "LQ3", "HQ1", "HQ2"}
+        
+    def test_default_qc_preserves_eager_mode(self, low_quality_metadata_csv, low_quality_attributes_csv):
+        """Test default_qc preserves eager mode."""
+        meta = SampleMetadata(low_quality_metadata_csv, low_quality_attributes_csv)
+        
+        qc_meta = meta.default_qc()
+        
+        assert isinstance(qc_meta.metadata, pl.LazyFrame)
+        
+    def test_default_qc_preserves_lazy_mode(self, low_quality_metadata_csv, low_quality_attributes_csv):
+        """Test default_qc preserves lazy mode."""
+        meta = SampleMetadata.scan(low_quality_metadata_csv, low_quality_attributes_csv)
+        
+        qc_meta = meta.default_qc()
+        
+        assert isinstance(qc_meta.metadata, pl.LazyFrame)
+        
+    def test_default_qc_immutability(self, low_quality_metadata_csv, low_quality_attributes_csv):
+        """Test default_qc returns new instance without modifying original."""
+        meta = SampleMetadata(low_quality_metadata_csv, low_quality_attributes_csv)
+        original_height = meta.metadata.collect().height
+        
+        qc_meta = meta.default_qc()
+        
+        # Original unchanged
+        assert meta.metadata.collect().height == original_height
+        # New instance is different
+        assert qc_meta.metadata.collect().height != original_height
+        assert qc_meta is not meta
+        
+    def test_default_qc_all_samples_filtered(self, low_quality_metadata_csv, low_quality_attributes_csv):
+        """Test default_qc when all samples are below threshold."""
+        meta = SampleMetadata(low_quality_metadata_csv, low_quality_attributes_csv)
+        
+        # Very high cutoff - filters all samples
+        qc_meta = meta.default_qc(mbp_cutoff=10000)
+        
+        # TODO: add syncing + checks for removal of all samples
+        assert qc_meta.metadata.collect().height == 0
+        assert qc_meta.attributes.collect().height == 0
+        
+    def test_default_qc_filters_all_components(self, low_quality_metadata_csv, low_quality_attributes_csv):
+        """Test default_qc filters metadata, attributes, and study_titles consistently."""
+        meta = SampleMetadata(low_quality_metadata_csv, low_quality_attributes_csv)
+        
+        qc_meta = meta.default_qc()
+        
+        # Check all components have same samples
+        meta_samples = set(qc_meta.metadata.collect()["sample"].to_list())
+        attr_samples = set(qc_meta.attributes.collect()["sample"].unique().to_list())
+        
+        assert meta_samples == attr_samples

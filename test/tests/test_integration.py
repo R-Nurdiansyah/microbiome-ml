@@ -20,7 +20,7 @@ class TestLazyWorkflow:
                   .add_profiles(profiles_csv, check_filled=False))
         
         # Verify lazy mode
-        assert dataset.metadata._is_lazy is False  # Default is eager for builder
+        assert isinstance(dataset.metadata.metadata, pl.LazyFrame)
         
         # Save
         save_dir = tmp_path / "lazy_workflow"
@@ -28,8 +28,8 @@ class TestLazyWorkflow:
         
         # Reload lazily
         loaded = Dataset.scan(save_dir)
-        assert loaded.metadata._is_lazy is True
-        assert loaded.profiles._is_lazy is True
+        assert isinstance(loaded.metadata.metadata, pl.LazyFrame)
+        assert isinstance(loaded.profiles.profiles, pl.LazyFrame)
         
     def test_lazy_to_eager_workflow(self, metadata_csv, attributes_csv, profiles_csv, tmp_path):
         """Test lazy → process → collect → save workflow."""
@@ -44,12 +44,12 @@ class TestLazyWorkflow:
         # Reload lazily
         lazy_dataset = Dataset.scan(save_dir)
         
-        # collect
-        lazy_dataset.metadata.collect()
-        lazy_dataset.profiles.collect()
+        # collect manually
+        meta_df = lazy_dataset.metadata.metadata.collect()
+        prof_df = lazy_dataset.profiles.profiles.collect()
         
-        assert lazy_dataset.metadata._is_lazy is False
-        assert lazy_dataset.profiles._is_lazy is False
+        assert isinstance(meta_df, pl.DataFrame)
+        assert isinstance(prof_df, pl.DataFrame)
 
 
 @pytest.mark.integration
@@ -88,8 +88,8 @@ class TestTarGzWorkflow:
         
         loaded = Dataset.scan(archive_path)
         
-        assert loaded.metadata._is_lazy is True
-        assert loaded.profiles._is_lazy is True
+        assert isinstance(loaded.metadata.metadata, pl.LazyFrame)
+        assert isinstance(loaded.profiles.profiles, pl.LazyFrame)
 
 
 @pytest.mark.integration
@@ -158,8 +158,7 @@ class TestMultiComponentSync:
         assert set(dataset._sample_ids) == {"S1", "S2"}
         
         # Verify all components filtered
-        dataset.metadata.collect()
-        assert set(dataset.metadata.metadata["sample"].to_list()) == {"S1", "S2"}
+        assert set(dataset.metadata.metadata.collect()["sample"].to_list()) == {"S1", "S2"}
 
 
 @pytest.mark.integration

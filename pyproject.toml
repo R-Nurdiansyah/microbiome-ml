@@ -28,7 +28,7 @@ dependencies = [
     "polars>=0.20.0",
     "requests>=2.25.0",
     "tqdm>=4.64.0",
-    "yaml>=6.0.0",
+    "pyyaml>=0.2.5",
 ]
 
 [project.optional-dependencies]
@@ -93,6 +93,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["test/tests"]
+pythonpath = ["src"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
