@@ -370,9 +370,7 @@ class TaxonomicProfiles:
         unique_samples = cached_profiles.select("sample").unique()
         if unique_samples.collect().height > sample_size:
             subset_samples = (
-                unique_samples.collect()
-                .sample(n=sample_size, seed=42)
-                .lazy()
+                unique_samples.collect().sample(n=sample_size, seed=42).lazy()
             )
             df = cached_profiles.join(subset_samples, on="sample", how="semi")
         else:

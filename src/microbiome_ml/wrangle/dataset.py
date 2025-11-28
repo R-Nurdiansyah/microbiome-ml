@@ -86,7 +86,9 @@ class Dataset:
         data: Optional[
             Union[SampleMetadata, Dict[str, Union[str, Path, pl.LazyFrame]]]
         ] = None,
-        metadata: Optional[Union[str, Path, pl.LazyFrame, pl.DataFrame]] = None,
+        metadata: Optional[
+            Union[str, Path, pl.LazyFrame, pl.DataFrame]
+        ] = None,
         attributes: Optional[
             Union[str, Path, pl.LazyFrame, pl.DataFrame]
         ] = None,

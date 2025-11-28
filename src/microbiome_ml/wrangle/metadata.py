@@ -256,7 +256,9 @@ class SampleMetadata:
             raise ValueError("Metadata cannot be None")
         self.metadata = metadata_lf
 
-        attributes_lf = self._load_and_standardize(attributes, AttributesFields)
+        attributes_lf = self._load_and_standardize(
+            attributes, AttributesFields
+        )
         if attributes_lf is None:
             raise ValueError("Attributes cannot be None")
         self.attributes = attributes_lf
@@ -383,7 +385,7 @@ class SampleMetadata:
         filtered_attributes = self.attributes.join(
             samples, on="sample", how="semi"
         )
-        
+
         filtered_study_titles: Optional[pl.LazyFrame] = None
         if self.study_titles is not None:
             filtered_study_titles = self.study_titles.join(
