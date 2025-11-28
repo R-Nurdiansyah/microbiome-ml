@@ -36,10 +36,3 @@ jobs:
     - name: Run type checking
       run: pixi run type-check
     
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4 # Updated to v4
-      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10' # Only upload once
-      with:
-        file: ./coverage.xml
-        fail_ci_if_error: false
-        token: ${{ secrets.CODECOV_TOKEN }} # Good practice to add token for v4

@@ -1,5 +1,5 @@
 from enum import IntEnum
-from typing import Optional
+from typing import Dict, Iterator, Optional
 
 
 class TaxonomicRanks(IntEnum):
@@ -12,6 +12,8 @@ class TaxonomicRanks(IntEnum):
     FAMILY = 4
     GENUS = 5
     SPECIES = 6
+
+    _prefix_to_rank: Dict[str, "TaxonomicRanks"]
 
     @property
     def name(self) -> str:
@@ -42,7 +44,7 @@ class TaxonomicRanks(IntEnum):
         """Get enum member from rank name."""
         rank = rank.upper()
         try:
-            return cls[rank]
+            return cls[rank]  # type: ignore
         except KeyError:
             raise ValueError(f"Invalid taxonomic rank: {rank}")
 
@@ -50,39 +52,41 @@ class TaxonomicRanks(IntEnum):
     def from_prefix(cls, prefix: str) -> "TaxonomicRanks":
         """Get enum member from taxonomic prefix."""
         if not hasattr(cls, "_prefix_to_rank"):
-            cls._prefix_to_rank = {rank.prefix: rank for rank in cls}
+            cls._prefix_to_rank = {rank.prefix: rank for rank in cls}  # type: ignore
 
-        if prefix not in cls._prefix_to_rank:
+        mapping: Dict[str, TaxonomicRanks] = getattr(cls, "_prefix_to_rank")  # type: ignore
+
+        if prefix not in mapping:
             raise ValueError(f"Invalid taxonomic prefix: {prefix}")
 
-        return cls._prefix_to_rank[prefix]
+        return mapping[prefix]
 
     @classmethod
-    def iter_from_domain(cls):
+    def iter_from_domain(cls) -> Iterator["TaxonomicRanks"]:
         """Yield ranks from DOMAIN (broadest) to SPECIES (most specific)."""
-        rank = cls.DOMAIN
+        rank: Optional[TaxonomicRanks] = cls.DOMAIN
         while rank is not None:
             yield rank
             rank = rank.child
 
     @classmethod
-    def iter_from_species(cls):
+    def iter_from_species(cls) -> Iterator["TaxonomicRanks"]:
         """Yield ranks from SPECIES (most specific) to DOMAIN (broadest)."""
-        rank = cls.SPECIES
+        rank: Optional[TaxonomicRanks] = cls.SPECIES
         while rank is not None:
             yield rank
             rank = rank.parent
 
-    def iter_up(self):
+    def iter_up(self) -> Iterator["TaxonomicRanks"]:
         """Yield ranks from the current rank up to DOMAIN (inclusive)."""
-        rank = self
+        rank: Optional[TaxonomicRanks] = self
         while rank is not None:
             yield rank
             rank = rank.parent
 
-    def iter_down(self):
+    def iter_down(self) -> Iterator["TaxonomicRanks"]:
         """Yield ranks from the current rank down to SPECIES (inclusive)."""
-        rank = self
+        rank: Optional[TaxonomicRanks] = self
         while rank is not None:
             yield rank
             rank = rank.child

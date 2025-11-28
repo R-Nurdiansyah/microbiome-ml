@@ -6,7 +6,7 @@ import tarfile
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import polars as pl
@@ -86,10 +86,14 @@ class Dataset:
         data: Optional[
             Union[SampleMetadata, Dict[str, Union[str, Path, pl.LazyFrame]]]
         ] = None,
-        metadata: Optional[Union[str, Path, pl.LazyFrame]] = None,
-        attributes: Optional[Union[str, Path, pl.LazyFrame]] = None,
-        study_titles: Optional[Union[str, Path, pl.LazyFrame]] = None,
-        **kwargs,
+        metadata: Optional[Union[str, Path, pl.LazyFrame, pl.DataFrame]] = None,
+        attributes: Optional[
+            Union[str, Path, pl.LazyFrame, pl.DataFrame]
+        ] = None,
+        study_titles: Optional[
+            Union[str, Path, pl.LazyFrame, pl.DataFrame]
+        ] = None,
+        **kwargs: Any,
     ) -> "Dataset":
         """Add metadata component with flexible input handling.
 
@@ -114,9 +118,9 @@ class Dataset:
         # Handle dict with named metadata sources
         elif isinstance(data, dict):
             self.metadata = SampleMetadata(
-                metadata=data.get("metadata"),
-                attributes=data.get("attributes"),
-                study_titles=data.get("study_titles", None),
+                metadata=data.get("metadata"),  # type: ignore
+                attributes=data.get("attributes"),  # type: ignore
+                study_titles=data.get("study_titles", None),  # type: ignore
             )
         # Handle direct keyword arguments
         else:
@@ -137,11 +141,13 @@ class Dataset:
 
     def add_profiles(
         self,
-        profiles: Union[TaxonomicProfiles, str, Path, pl.LazyFrame],
-        root: Optional[Union[str, Path, pl.LazyFrame]] = None,
+        profiles: Union[
+            TaxonomicProfiles, str, Path, pl.LazyFrame, pl.DataFrame
+        ],
+        root: Optional[Union[str, Path, pl.LazyFrame, pl.DataFrame]] = None,
         check_filled: bool = True,
         sample_size: int = 1000,
-        **kwargs,
+        **kwargs: Any,
     ) -> "Dataset":
         """Add profiles component with flexible input handling.
 
@@ -179,7 +185,7 @@ class Dataset:
         accessions: Optional[List[str]] = None,
         feature_names: Optional[List[str]] = None,
         feature_array: Optional[np.ndarray] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> "Dataset":
         """Add feature set with flexible input handling.
 
@@ -233,7 +239,9 @@ class Dataset:
 
         return self
 
-    def iter_feature_sets(self, names: Optional[List[str]] = None):
+    def iter_feature_sets(
+        self, names: Optional[List[str]] = None
+    ) -> Any:  # Returns generator
         """Iterate over feature sets.
 
         Args:
@@ -247,7 +255,9 @@ class Dataset:
         for name in names:
             yield name, self.feature_sets[name]
 
-    def iter_labels(self, names: Optional[List[str]] = None):
+    def iter_labels(
+        self, names: Optional[List[str]] = None
+    ) -> Any:  # Returns generator
         """Iterate over label sets.
 
         Args:
@@ -283,10 +293,10 @@ class Dataset:
         """
         logger.debug("Starting sample synchronization across components")
         # Collect sample DataFrames from all available components
-        sample_dfs = []
+        sample_dfs: List[Tuple[str, pl.DataFrame]] = []
         component_counts = {}
 
-        def get_samples_df(source_obj) -> pl.DataFrame:
+        def get_samples_df(source_obj: Any) -> pl.DataFrame:
             """Helper to safely get samples DataFrame from component."""
             if hasattr(source_obj, "_get_sample_list"):
                 samples = source_obj._get_sample_list()
@@ -429,7 +439,7 @@ class Dataset:
 
         # Filter metadata using built-in method
         if self.metadata is not None:
-            self.metadata = self.metadata._filter_by_sample(canonical_lf)
+            self.metadata = self.metadata._filter_by_sample(canonical_lf)  # type: ignore
 
         # Filter profiles using built-in method
         if self.profiles is not None:
@@ -438,7 +448,7 @@ class Dataset:
         # Filter feature sets using built-in method
         for name, feature_set in list(self.feature_sets.items()):
             self.feature_sets[name] = feature_set.filter_samples(
-                self._sample_ids
+                self._sample_ids  # type: ignore
             )
 
         # Filter labels
@@ -448,7 +458,7 @@ class Dataset:
                     canonical_lf.collect(), on="sample", how="semi"
                 )
 
-    def _update_sample_ids(self):
+    def _update_sample_ids(self) -> None:
         """Recalculate canonical sample list when components change.
 
         Calls _sync_accessions() to perform strict intersection-based
@@ -462,7 +472,7 @@ class Dataset:
             Dict[str, Union[str, Path, FeatureSet]], str, Path, FeatureSet
         ],
         name: Optional[str] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> "Dataset":
         """Add one or multiple feature sets.
 
@@ -734,7 +744,7 @@ class Dataset:
         work_dir.mkdir(parents=True, exist_ok=True)
 
         # Save components
-        manifest = {
+        manifest: Dict[str, Any] = {
             "version": "1.0",
             "created": datetime.now().isoformat(),
             "components": {},

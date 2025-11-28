@@ -3,7 +3,7 @@
 import logging
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Set, Union
+from typing import Any, List, Optional, Set, Type, Union
 
 import polars as pl
 
@@ -19,10 +19,10 @@ class Fields(Enum):
     def __init__(
         self,
         column_name: str,
-        dtype,
+        dtype: Any,
         required: bool,
         description: str,
-        alternatives: List[str] = None,
+        alternatives: Optional[List[str]] = None,
     ):
         self.column_name = column_name
         self.dtype = dtype
@@ -194,7 +194,7 @@ class TaxonomicProfiles:
             )
 
     def _validate_and_standardize_fields(
-        self, lf: pl.LazyFrame, field_enum: Enum
+        self, lf: pl.LazyFrame, field_enum: Type[Enum]
     ) -> pl.LazyFrame:
         """Validate required fields and standardize column names.
 
@@ -209,15 +209,15 @@ class TaxonomicProfiles:
         rename_mapping = {}
 
         # Find actual columns and build rename mapping
-        for field in field_enum:
-            actual_column = field.find_column_name(lf)
+        for field in field_enum:  # type: ignore
+            actual_column = field.find_column_name(lf)  # type: ignore
             if actual_column:
                 # Only rename if the actual column name is different from standard
-                if actual_column != field.column_name:
-                    rename_mapping[actual_column] = field.column_name
-            elif field.required:
+                if actual_column != field.column_name:  # type: ignore
+                    rename_mapping[actual_column] = field.column_name  # type: ignore
+            elif field.required:  # type: ignore
                 missing_required.append(
-                    f"{field.column_name} (tried: {field.all_names})"
+                    f"{field.column_name} (tried: {field.all_names})"  # type: ignore
                 )
 
         if missing_required:
@@ -230,7 +230,9 @@ class TaxonomicProfiles:
         return lf
 
     def _load_and_standardize(
-        self, data_source: Union[Path, str, pl.LazyFrame], field_enum: Enum
+        self,
+        data_source: Union[Path, str, pl.LazyFrame, pl.DataFrame],
+        field_enum: Type[Enum],
     ) -> pl.LazyFrame:
         """Load data and standardize column names.
 
@@ -340,7 +342,7 @@ class TaxonomicProfiles:
 
     def _is_filled_for_rank(
         self,
-        parent_rank: TaxonomicRanks,
+        parent_rank: Optional[TaxonomicRanks],
         child_rank: TaxonomicRanks,
         sample_size: int = 1000,
     ) -> bool:
@@ -354,6 +356,9 @@ class TaxonomicProfiles:
         Returns:
             True if profiles are filled for this rank pair
         """
+        if parent_rank is None:
+            return True  # Cannot check if no parent
+
         cached_profiles = self.profiles
 
         schema_names = cached_profiles.collect_schema().names()
@@ -364,7 +369,11 @@ class TaxonomicProfiles:
         # Subset for efficiency
         unique_samples = cached_profiles.select("sample").unique()
         if unique_samples.collect().height > sample_size:
-            subset_samples = unique_samples.sample(n=sample_size, seed=42)
+            subset_samples = (
+                unique_samples.collect()
+                .sample(n=sample_size, seed=42)
+                .lazy()
+            )
             df = cached_profiles.join(subset_samples, on="sample", how="semi")
         else:
             df = cached_profiles
@@ -735,7 +744,7 @@ class TaxonomicProfiles:
         return new_instance
 
     def create_features(
-        self, rank: [Union[str, TaxonomicRanks]]
+        self, rank: Union[str, TaxonomicRanks]
     ) -> "FeatureSet":
         """Create a FeatureSet from the taxonomic profiles at a specified rank.
 
@@ -770,7 +779,7 @@ class TaxonomicProfiles:
             .pivot(
                 values="relabund",
                 index="sample",
-                columns="taxonomy",
+                on="taxonomy",
                 aggregate_function="first",
             )
         )

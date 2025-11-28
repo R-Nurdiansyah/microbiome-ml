@@ -3,7 +3,7 @@
 import logging
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Set, Union
+from typing import Any, List, Optional, Set, Tuple, Union
 
 import polars as pl
 
@@ -16,10 +16,10 @@ class MetadataFields(Enum):
     def __init__(
         self,
         column_name: str,
-        dtype,
+        dtype: Any,
         required: bool,
         description: str,
-        alternatives: List[str] = None,
+        alternatives: Optional[List[str]] = None,
     ):
         self.column_name = column_name
         self.dtype = dtype
@@ -42,63 +42,63 @@ class CoreMetadataFields(MetadataFields):
     """Enumeration of core metadata fields with validation properties."""
 
     # Format: (column_name, polars_dtype, is_required, description, alternative_names)
-    RUN_ACC = (
+    RUN_ACC: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "sample",
         pl.Utf8,
         True,
         "Unique sample identifier",
         ["acc", "accession", "run_acc", "sample_id", "sample"],
     )
-    BIOSAMPLE_ACC = (
+    BIOSAMPLE_ACC: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "biosample",
         pl.Utf8,
         True,
         "NCBI BioSample accession ID",
         ["biosample_acc", "bio_sample"],
     )
-    BIOPROJECT_ACC = (
+    BIOPROJECT_ACC: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "bioproject",
         pl.Utf8,
         True,
         "NCBI BioProject accession ID",
         ["bioproject_acc", "bio_project"],
     )
-    LATITUDE = (
+    LATITUDE: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "lat",
         pl.Float64,
         True,
         "Sample latitude coordinate in decimal degrees",
         ["latitude"],
     )
-    LONGITUDE = (
+    LONGITUDE: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "lon",
         pl.Float64,
         True,
         "Sample longitude coordinate in decimal degrees",
         ["longitude"],
     )
-    DEPTH = (
+    DEPTH: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "depth",
         pl.Float64,
         False,
         "Sample depth in meters",
         ["depth_m", "sample_depth"],
     )
-    DATE = (
+    DATE: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "collection_date",
         pl.Date,
         True,
         "Sample collection date",
         ["date", "sample_date", "collection_timestamp"],
     )
-    BIOME = (
+    BIOME: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "biome",
         pl.Utf8,
         True,
         "Environmental biome classification (e.g., 'soil', 'marine')",
         [],
     )
-    SEQUENCE_DEPTH = (
+    SEQUENCE_DEPTH: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "mbases",
         pl.UInt32,
         True,
@@ -111,25 +111,49 @@ class DerivedMetadataFields(MetadataFields):
     """Enumeration of derived metadata fields to be created from core fields
     with validation properties."""
 
-    DOMAIN = ("domain", pl.Utf8, False, "Terrestrial, Marine, or Both", [])
-    ECOREGION = (
+    DOMAIN: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
+        "domain",
+        pl.Utf8,
+        False,
+        "Terrestrial, Marine, or Both",
+        [],
+    )
+    ECOREGION: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "ecoregion",
         pl.Utf8,
         False,
         "WWF ecoregion classification",
         [],
     )
-    YEAR = ("year", pl.Int32, False, "Year of sample collection", [])
-    MONTH = ("month", pl.Int32, False, "Month of sample collection", [])
-    DAY = ("day", pl.Int32, False, "Day of sample collection", [])
-    SEASON_CLASS = (
+    YEAR: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
+        "year",
+        pl.Int32,
+        False,
+        "Year of sample collection",
+        [],
+    )
+    MONTH: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
+        "month",
+        pl.Int32,
+        False,
+        "Month of sample collection",
+        [],
+    )
+    DAY: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
+        "day",
+        pl.Int32,
+        False,
+        "Day of sample collection",
+        [],
+    )
+    SEASON_CLASS: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "season_class",
         pl.Utf8,
         False,
         "Season classification based on Koppen classification",
         [],
     )
-    SEASON = (
+    SEASON: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "season",
         pl.Utf8,
         False,
@@ -141,35 +165,47 @@ class DerivedMetadataFields(MetadataFields):
 class AttributesFields(MetadataFields):
     """Enumeration of attributes AutoFrame fields."""
 
-    RUN_ACC = (
+    RUN_ACC: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "sample",
         pl.Utf8,
         True,
         "Unique sample identifier",
         ["acc", "accession", "run_acc", "sample_id", "sample"],
     )
-    KEY = ("key", pl.Utf8, True, "Attribute key name", [])
-    VALUE = ("value", pl.Utf8, True, "Attribute value", [])
+    KEY: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
+        "key",
+        pl.Utf8,
+        True,
+        "Attribute key name",
+        [],
+    )
+    VALUE: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
+        "value",
+        pl.Utf8,
+        True,
+        "Attribute value",
+        [],
+    )
 
 
 class StudyMetadataFields(MetadataFields):
     """Enumeration of study metadata fields."""
 
-    RUN_ACC = (
+    RUN_ACC: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "sample",
         pl.Utf8,
         True,
         "Unique sample identifier",
         ["acc", "accession", "run_acc", "sample_id", "sample"],
     )
-    STUDY_TITLE = (
+    STUDY_TITLE: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "study_title",
         pl.Utf8,
         True,
         "Title of the research study",
         ["title", "study_name"],
     )
-    ABSTRACT = (
+    ABSTRACT: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "abstract",
         pl.Utf8,
         True,
@@ -192,6 +228,10 @@ class SampleMetadata:
         study_titles: Optional Polars LazyFrame
     """
 
+    metadata: pl.LazyFrame
+    attributes: pl.LazyFrame
+    study_titles: Optional[pl.LazyFrame]
+
     def __init__(
         self,
         metadata: Union[Path, str, pl.LazyFrame, pl.DataFrame],
@@ -211,12 +251,16 @@ class SampleMetadata:
             ValueError: If required columns are missing
         """
         # Load and standardize all data
-        self.metadata = self._load_and_standardize(
-            metadata, CoreMetadataFields
-        )
-        self.attributes = self._load_and_standardize(
-            attributes, AttributesFields
-        )
+        metadata_lf = self._load_and_standardize(metadata, CoreMetadataFields)
+        if metadata_lf is None:
+            raise ValueError("Metadata cannot be None")
+        self.metadata = metadata_lf
+
+        attributes_lf = self._load_and_standardize(attributes, AttributesFields)
+        if attributes_lf is None:
+            raise ValueError("Attributes cannot be None")
+        self.attributes = attributes_lf
+
         self.study_titles = (
             self._load_and_standardize(study_titles, StudyMetadataFields)
             if study_titles is not None
@@ -246,7 +290,7 @@ class SampleMetadata:
             )
 
     def _validate_and_standardize(
-        self, lf: pl.LazyFrame, field_enum
+        self, lf: pl.LazyFrame, field_enum: Any
     ) -> pl.LazyFrame:
         """Validate required fields and standardize column names.
 
@@ -283,9 +327,9 @@ class SampleMetadata:
 
     def _load_and_standardize(
         self,
-        data_source: Union[Path, str, pl.LazyFrame, pl.DataFrame],
-        field_enum,
-    ) -> pl.LazyFrame:
+        data_source: Optional[Union[Path, str, pl.LazyFrame, pl.DataFrame]],
+        field_enum: Any,
+    ) -> Optional[pl.LazyFrame]:
         """Load data and standardize column names.
 
         Args:
@@ -339,11 +383,12 @@ class SampleMetadata:
         filtered_attributes = self.attributes.join(
             samples, on="sample", how="semi"
         )
-        filtered_study_titles = (
-            self.study_titles.join(samples, on="sample", how="semi")
-            if self.study_titles is not None
-            else None
-        )
+        
+        filtered_study_titles: Optional[pl.LazyFrame] = None
+        if self.study_titles is not None:
+            filtered_study_titles = self.study_titles.join(
+                samples, on="sample", how="semi"
+            )
 
         # Create new instance
         new_instance = SampleMetadata.__new__(SampleMetadata)

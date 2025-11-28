@@ -8,7 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Union
 
-import yaml
+import yaml  # type: ignore
 
 
 class AggregationMethod(Enum):
@@ -56,7 +56,7 @@ class Config:
         # Convert nested dictionaries to Config objects for dot notation
         self._convert_dicts()
 
-    def _convert_dicts(self):
+    def _convert_dicts(self) -> None:
         """Convert nested dictionaries to Config objects recursively."""
         for key, value in self._data.items():
             if isinstance(value, dict):
@@ -83,7 +83,9 @@ class Config:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config back to dictionary."""
-        return self._data.copy()
+        if isinstance(self._data, dict):
+            return self._data.copy()
+        return {}
 
     def __getitem__(self, key: str) -> Any:
         """Allow dictionary-style access."""
