@@ -22,24 +22,23 @@ class TestDatasetInitialization:
         assert dataset.metadata is None
         assert dataset.profiles is None
         assert dataset.feature_sets == {}
-        assert dataset.labels == {}
+        assert dataset.labels is None
+        assert dataset.groupings is None
         assert dataset._sample_ids is None
 
-    def test_initialization_with_metadata(self, sample_metadata_eager):
-        """Test initialization with metadata."""
-        dataset = Dataset(metadata=sample_metadata_eager)
+    def test_initialization_with_metadata(self, sample_metadata):
+        """Test initialization with metadata (eager and lazy)."""
+        dataset = Dataset(metadata=sample_metadata)
 
         assert dataset.metadata is not None
         assert dataset._sample_ids is not None
         assert len(dataset._sample_ids) == 4
 
     def test_initialization_with_all_components(
-        self, sample_metadata_eager, sample_profiles_eager
+        self, sample_metadata, sample_profiles
     ):
-        """Test initialization with multiple components."""
-        dataset = Dataset(
-            metadata=sample_metadata_eager, profiles=sample_profiles_eager
-        )
+        """Test initialization with multiple components (eager and lazy)."""
+        dataset = Dataset(metadata=sample_metadata, profiles=sample_profiles)
 
         assert dataset.metadata is not None
         assert dataset.profiles is not None
@@ -69,21 +68,21 @@ class TestDatasetBuilderPattern:
         assert result is sample_dataset_empty
         assert sample_dataset_empty.profiles is not None
 
-    def test_add_features_from_rank(self, sample_dataset_eager):
+    def test_add_features_from_rank(self, sample_dataset):
         """Test adding features from taxonomic rank."""
-        result = sample_dataset_eager.add_features(
+        result = sample_dataset.add_features(
             "genus_features", rank=TaxonomicRanks.GENUS
         )
 
-        assert result is sample_dataset_eager
-        assert "genus_features" in sample_dataset_eager.feature_sets
+        assert result is sample_dataset
+        assert "genus_features" in sample_dataset.feature_sets
 
     def test_add_features_from_instance(
-        self, sample_dataset_empty, sample_features_eager
+        self, sample_dataset_empty, sample_features
     ):
         """Test adding existing FeatureSet instance."""
         result = sample_dataset_empty.add_features(
-            "my_features", features=sample_features_eager
+            "my_features", features=sample_features
         )
 
         assert result is sample_dataset_empty
@@ -133,65 +132,76 @@ class TestDatasetBatchOperations:
         with pytest.raises(ValueError, match="name"):
             sample_dataset_empty.add_feature_set(features_csv)
 
-    def test_add_labels_dict(self, sample_dataset_empty, labels_csv, tmp_path):
+    def test_add_labels_dict(self, sample_dataset_empty, tmp_path):
         """Test adding multiple label sets at once."""
+        labels_csv1 = tmp_path / "labels1.csv"
+        pl.DataFrame(
+            {"sample": ["S1", "S2", "S3"], "val1": [1, 0, 1]}
+        ).write_csv(labels_csv1)
+
         labels_csv2 = tmp_path / "labels2.csv"
         pl.DataFrame(
-            {"sample": ["S1", "S2", "S3"], "outcome": [1, 0, 1]}
+            {"sample": ["S1", "S2", "S3"], "val2": [1, 0, 1]}
         ).write_csv(labels_csv2)
 
         result = sample_dataset_empty.add_labels(
-            {"labels1": labels_csv, "labels2": labels_csv2}
+            {"labels1": labels_csv1, "labels2": labels_csv2}
         )
 
         assert result is sample_dataset_empty
-        assert "labels1" in sample_dataset_empty.labels
-        assert "labels2" in sample_dataset_empty.labels
+        assert "labels1" in sample_dataset_empty.labels.columns
+        assert "labels2" in sample_dataset_empty.labels.columns
 
-    def test_add_labels_single_requires_name(
-        self, sample_dataset_empty, labels_csv
-    ):
-        """Test single label addition requires name."""
-        with pytest.raises(ValueError, match="name"):
-            sample_dataset_empty.add_labels(labels_csv)
+    def test_add_labels_single_no_name(self, sample_dataset_empty, labels_csv):
+        """Test single label addition without name."""
+        sample_dataset_empty.add_labels(labels_csv)
+        assert "target" in sample_dataset_empty.labels.columns
+        assert "category" in sample_dataset_empty.labels.columns
 
 
 class TestDatasetTaxonomicFeatures:
     """Test taxonomic feature generation."""
 
-    def test_add_taxonomic_features_all_ranks(self, sample_dataset_eager):
+    def test_add_taxonomic_features_all_ranks(self, sample_dataset):
         """Test generating features for all standard ranks."""
-        result = sample_dataset_eager.add_taxonomic_features()
+        result = sample_dataset.add_taxonomic_features()
 
-        assert result is sample_dataset_eager
-        # Should have 7 standard ranks
+        assert result is sample_dataset
+        # Should have 6 standard ranks (phyla to species)
         assert (
             len(
                 [
                     k
-                    for k in sample_dataset_eager.feature_sets.keys()
+                    for k in sample_dataset.feature_sets.keys()
                     if k.startswith("tax_")
                 ]
             )
-            == 7
+            == 6
         )
 
-    def test_add_taxonomic_features_specific_ranks(self, sample_dataset_eager):
+    @pytest.mark.parametrize(
+        "ranks",
+        [
+            [TaxonomicRanks.GENUS, TaxonomicRanks.PHYLUM],
+            [TaxonomicRanks.SPECIES],
+        ],
+    )
+    def test_add_taxonomic_features_specific_ranks(
+        self, sample_dataset, ranks
+    ):
         """Test generating features for specific ranks."""
-        sample_dataset_eager.add_taxonomic_features(
-            ranks=[TaxonomicRanks.GENUS, TaxonomicRanks.PHYLUM]
-        )
+        sample_dataset.add_taxonomic_features(ranks=ranks)
 
-        assert "tax_genus" in sample_dataset_eager.feature_sets
-        assert "tax_phylum" in sample_dataset_eager.feature_sets
+        for rank in ranks:
+            assert f"tax_{rank.name}" in sample_dataset.feature_sets
 
-    def test_add_taxonomic_features_custom_prefix(self, sample_dataset_eager):
+    def test_add_taxonomic_features_custom_prefix(self, sample_dataset):
         """Test custom prefix for taxonomic features."""
-        sample_dataset_eager.add_taxonomic_features(
+        sample_dataset.add_taxonomic_features(
             ranks=[TaxonomicRanks.GENUS], prefix="custom"
         )
 
-        assert "custom_genus" in sample_dataset_eager.feature_sets
+        assert "custom_genus" in sample_dataset.feature_sets
 
     def test_add_taxonomic_features_requires_profiles(
         self, sample_dataset_empty
@@ -257,9 +267,9 @@ class TestDatasetAccessionSync:
                 "removed" in str(warning.message).lower() for warning in w
             )
 
-    def test_get_sample_ids(self, sample_dataset_eager):
+    def test_get_sample_ids(self, sample_dataset):
         """Test getting canonical sample IDs."""
-        sample_ids = sample_dataset_eager.get_sample_ids()
+        sample_ids = sample_dataset.get_sample_ids()
 
         assert isinstance(sample_ids, list)
         assert len(sample_ids) > 0
@@ -270,25 +280,25 @@ class TestDatasetAccessionSync:
 class TestDatasetPreprocessing:
     """Test preprocessing pipeline."""
 
-    def test_apply_preprocessing_default(self, sample_dataset_eager):
-        """Test default preprocessing."""
-        result = sample_dataset_eager.apply_preprocessing()
+    def test_apply_preprocessing_default(self, sample_dataset):
+        """Test default preprocessing (eager and lazy)."""
+        result = sample_dataset.apply_preprocessing()
 
-        assert result is sample_dataset_eager
+        assert result is sample_dataset
 
-    def test_apply_preprocessing_no_sync(self, sample_dataset_eager):
+    def test_apply_preprocessing_no_sync(self, sample_dataset):
         """Test preprocessing without sync."""
-        result = sample_dataset_eager.apply_preprocessing(sync_after=False)
+        result = sample_dataset.apply_preprocessing(sync_after=False)
 
-        assert result is sample_dataset_eager
+        assert result is sample_dataset
 
-    def test_apply_preprocessing_selective(self, sample_dataset_eager):
+    def test_apply_preprocessing_selective(self, sample_dataset):
         """Test selective preprocessing."""
-        result = sample_dataset_eager.apply_preprocessing(
+        result = sample_dataset.apply_preprocessing(
             metadata_qc=True, profiles_qc=False, sync_after=True
         )
 
-        assert result is sample_dataset_eager
+        assert result is sample_dataset
 
     def test_apply_preprocessing_metadata_qc_flag(
         self, low_quality_metadata_csv, low_quality_attributes_csv
@@ -333,7 +343,7 @@ class TestDatasetPreprocessing:
         )
         dataset = Dataset(metadata=meta)
 
-        # Before: 5 samples
+        # Before: 7 samples
         assert dataset.metadata.metadata.collect().height == 7
 
         # Apply with custom cutoff of 900
@@ -388,20 +398,16 @@ class TestDatasetPreprocessing:
         )
         assert final_samples == 4
 
-    def test_apply_preprocessing_skips_when_flag_set(
-        self, sample_dataset_eager
-    ):
+    def test_apply_preprocessing_skips_when_flag_set(self, sample_dataset):
         """Test QC is skipped when flag is already True."""
         # Manually set flags
-        sample_dataset_eager.metadata_qc_done = True
-        sample_dataset_eager.profiles_qc_done = True
+        sample_dataset.metadata_qc_done = True
+        sample_dataset.profiles_qc_done = True
 
-        initial_meta_height = (
-            sample_dataset_eager.metadata.metadata.collect().height
-        )
+        initial_meta_height = sample_dataset.metadata.metadata.collect().height
         initial_profiles_samples = len(
             set(
-                sample_dataset_eager.profiles.profiles.select("sample")
+                sample_dataset.profiles.profiles.select("sample")
                 .unique()
                 .collect()
                 .to_series()
@@ -410,17 +416,17 @@ class TestDatasetPreprocessing:
         )
 
         # Apply preprocessing - should be skipped
-        sample_dataset_eager.apply_preprocessing()
+        sample_dataset.apply_preprocessing()
 
         # Verify no changes
         assert (
-            sample_dataset_eager.metadata.metadata.collect().height
+            sample_dataset.metadata.metadata.collect().height
             == initial_meta_height
         )
         assert (
             len(
                 set(
-                    sample_dataset_eager.profiles.profiles.select("sample")
+                    sample_dataset.profiles.profiles.select("sample")
                     .unique()
                     .collect()
                     .to_series()
@@ -963,8 +969,10 @@ class TestDatasetIteration:
 
         labels = list(sample_dataset_empty.iter_labels())
 
-        assert len(labels) == 1
-        assert labels[0][0] == "test_labels"
+        # labels_csv has 'target' and 'category' columns
+        assert len(labels) == 2
+        names = sorted([label[0] for label in labels])
+        assert names == ["category", "target"]
 
 
 class TestDatasetPersistence:
@@ -1079,4 +1087,194 @@ class TestDatasetPersistence:
         # Load and verify
         loaded = Dataset.load(save_dir, lazy=False)
         assert "test_features" in loaded.feature_sets
-        assert "test_labels" in loaded.labels
+        # labels_csv has 'target' and 'category' columns
+        assert "target" in loaded.labels.columns
+        assert "category" in loaded.labels.columns
+
+    def test_save_load_labels_groupings(self, sample_dataset_eager, tmp_path):
+        """Test saving and loading labels and groupings."""
+        # Add labels and groupings
+        labels_df = pl.DataFrame({"sample": ["S1", "S2"], "target": [0, 1]})
+        groupings_df = pl.DataFrame(
+            {"sample": ["S1", "S2"], "group": ["A", "B"]}
+        )
+
+        sample_dataset_eager.add_labels(labels_df)
+        sample_dataset_eager.add_groupings(groupings_df)
+
+        save_dir = tmp_path / "dataset_full"
+        sample_dataset_eager.save(save_dir)
+
+        # Check files
+        assert (save_dir / "labels" / "labels.csv").exists()
+        assert (save_dir / "groupings" / "groupings.csv").exists()
+
+        # Load
+        loaded = Dataset.load(save_dir, lazy=False)
+
+        assert loaded.labels is not None
+        assert "target" in loaded.labels.columns
+        assert loaded.groupings is not None
+        assert "group" in loaded.groupings.columns
+
+
+class TestDatasetDefaultGroupings:
+    """Test create_default_groupings method."""
+
+    def test_create_default_groupings_basic(self, sample_metadata):
+        """Test creating default groupings from metadata."""
+        dataset = Dataset(metadata=sample_metadata)
+
+        # Create default groupings
+        dataset.create_default_groupings()
+
+        assert dataset.groupings is not None
+        assert "sample" in dataset.groupings.columns
+        assert "bioproject" in dataset.groupings.columns
+        assert "biome" in dataset.groupings.columns
+
+        # Check that data is extracted correctly
+        groupings_collected = (
+            dataset.groupings.collect()
+            if hasattr(dataset.groupings, "collect")
+            else dataset.groupings
+        )
+        assert groupings_collected.height == 4  # Should have all samples
+
+    def test_create_default_groupings_specific_fields(self, sample_metadata):
+        """Test creating only specific groupings."""
+        dataset = Dataset(metadata=sample_metadata)
+
+        dataset.create_default_groupings(groupings=["bioproject", "biome"])
+
+        assert dataset.groupings is not None
+        assert "bioproject" in dataset.groupings.columns
+        assert "biome" in dataset.groupings.columns
+        # Should not have other fields
+        assert (
+            "domain" not in dataset.groupings.columns
+            or dataset.groupings.select("domain").null_count().item() > 0
+        )
+
+    def test_create_default_groupings_missing_fields(self, sample_metadata):
+        """Test that missing fields are skipped gracefully."""
+        dataset = Dataset(metadata=sample_metadata)
+
+        # Request fields that don't exist in our test metadata
+        dataset.create_default_groupings(
+            groupings=["bioproject", "biome", "ecoregion", "climate"]
+        )
+
+        assert dataset.groupings is not None
+        # Should have the fields that exist
+        assert "bioproject" in dataset.groupings.columns
+        assert "biome" in dataset.groupings.columns
+
+    def test_create_default_groupings_no_metadata(self):
+        """Test that it fails gracefully without metadata."""
+        dataset = Dataset()
+
+        with pytest.raises(ValueError, match="Metadata must be added"):
+            dataset.create_default_groupings()
+
+    def test_create_default_groupings_merge_with_existing(
+        self, sample_metadata
+    ):
+        """Test merging with existing groupings."""
+        dataset = Dataset(metadata=sample_metadata)
+
+        # Add custom groupings first
+        custom_groupings = pl.DataFrame(
+            {
+                "sample": ["S1", "S2", "S3", "S4"],
+                "custom_group": ["A", "A", "B", "B"],
+            }
+        )
+        dataset.add_groupings(custom_groupings)
+
+        # Now create default groupings (should merge)
+        dataset.create_default_groupings(groupings=["bioproject"])
+
+        assert dataset.groupings is not None
+        # Should have both custom and default groupings
+        assert "custom_group" in dataset.groupings.columns
+        assert "bioproject" in dataset.groupings.columns
+
+    def test_create_default_groupings_force_overwrite(self, sample_metadata):
+        """Test force overwrite of existing groupings."""
+        dataset = Dataset(metadata=sample_metadata)
+
+        # Add custom groupings first
+        custom_groupings = pl.DataFrame(
+            {
+                "sample": ["S1", "S2", "S3", "S4"],
+                "custom_group": ["A", "A", "B", "B"],
+            }
+        )
+        dataset.add_groupings(custom_groupings)
+
+        # Create default groupings with force=True (should replace)
+        dataset.create_default_groupings(groupings=["bioproject"], force=True)
+
+        assert dataset.groupings is not None
+        assert "bioproject" in dataset.groupings.columns
+        # Custom groupings should be gone
+        assert "custom_group" not in dataset.groupings.columns
+
+    def test_create_default_groupings_preserves_nulls(self, tmp_path):
+        """Test that null values are preserved in groupings."""
+        # Create metadata with some null values
+        metadata_df = pl.DataFrame(
+            {
+                "sample": ["S1", "S2", "S3", "S4"],
+                "biosample": ["BS1", "BS2", "BS3", "BS4"],
+                "bioproject": ["BP1", None, "BP2", "BP2"],  # Null in S2
+                "lat": [10.0, 20.0, 30.0, 40.0],
+                "lon": [40.0, 50.0, 60.0, 70.0],
+                "collection_date": [
+                    "2020-01-01",
+                    "2020-02-01",
+                    "2020-03-01",
+                    "2020-04-01",
+                ],
+                "biome": ["soil", "marine", None, "freshwater"],  # Null in S3
+                "mbases": [1500, 2000, 1200, 1800],
+            }
+        )
+        attributes_df = pl.DataFrame(
+            {
+                "sample": ["S1", "S2"],
+                "key": ["pH", "pH"],
+                "value": ["6.5", "7.0"],
+            }
+        )
+
+        metadata_csv = tmp_path / "metadata.csv"
+        attributes_csv = tmp_path / "attributes.csv"
+        metadata_df.write_csv(metadata_csv)
+        attributes_df.write_csv(attributes_csv)
+
+        metadata = SampleMetadata(
+            metadata=str(metadata_csv), attributes=str(attributes_csv)
+        )
+        dataset = Dataset(metadata=metadata)
+
+        dataset.create_default_groupings(groupings=["bioproject", "biome"])
+
+        assert dataset.groupings is not None
+        groupings_collected = (
+            dataset.groupings.collect()
+            if hasattr(dataset.groupings, "collect")
+            else dataset.groupings
+        )
+
+        # Check that nulls are preserved
+        bioproject_nulls = groupings_collected.select(
+            pl.col("bioproject").is_null().sum()
+        ).item()
+        biome_nulls = groupings_collected.select(
+            pl.col("biome").is_null().sum()
+        ).item()
+
+        assert bioproject_nulls == 1  # S2 has null bioproject
+        assert biome_nulls == 1  # S3 has null biome

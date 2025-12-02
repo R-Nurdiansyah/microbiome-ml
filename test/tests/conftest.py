@@ -172,62 +172,68 @@ def sample_labels_data():
 
 
 @pytest.fixture
-def metadata_csv(tmp_path, sample_metadata_data):
+def csv_factory(tmp_path):
+    """Factory fixture to create CSV files from data."""
+
+    def _create_csv(data, filename):
+        path = tmp_path / filename
+        pl.DataFrame(data).write_csv(path)
+        return path
+
+    return _create_csv
+
+
+@pytest.fixture
+def metadata_csv(csv_factory, sample_metadata_data):
     """Write metadata to CSV and return path."""
-    path = tmp_path / "metadata.csv"
-    pl.DataFrame(sample_metadata_data).write_csv(path)
-    return path
+    return csv_factory(sample_metadata_data, "metadata.csv")
 
 
 @pytest.fixture
-def attributes_csv(tmp_path, sample_attributes_data):
+def attributes_csv(csv_factory, sample_attributes_data):
     """Write attributes to CSV and return path."""
-    path = tmp_path / "attributes.csv"
-    pl.DataFrame(sample_attributes_data).write_csv(path)
-    return path
+    return csv_factory(sample_attributes_data, "attributes.csv")
 
 
 @pytest.fixture
-def study_titles_csv(tmp_path, sample_study_titles_data):
+def study_titles_csv(csv_factory, sample_study_titles_data):
     """Write study titles to CSV and return path."""
-    path = tmp_path / "study_titles.csv"
-    pl.DataFrame(sample_study_titles_data).write_csv(path)
-    return path
+    return csv_factory(sample_study_titles_data, "study_titles.csv")
 
 
 @pytest.fixture
-def profiles_csv(tmp_path, sample_profiles_data):
+def profiles_csv(csv_factory, sample_profiles_data):
     """Write profiles to CSV and return path."""
-    path = tmp_path / "profiles.csv"
-    pl.DataFrame(sample_profiles_data).write_csv(path)
-    return path
+    return csv_factory(sample_profiles_data, "profiles.csv")
 
 
 @pytest.fixture
-def root_csv(tmp_path, sample_root_data):
+def root_csv(csv_factory, sample_root_data):
     """Write root coverage to CSV and return path."""
-    path = tmp_path / "root.csv"
-    pl.DataFrame(sample_root_data).write_csv(path)
-    return path
+    return csv_factory(sample_root_data, "root.csv")
 
 
 @pytest.fixture
-def features_csv(tmp_path, sample_feature_data):
+def features_csv(csv_factory, sample_feature_data):
     """Write features to CSV and return path."""
-    path = tmp_path / "features.csv"
-    pl.DataFrame(sample_feature_data).write_csv(path)
-    return path
+    return csv_factory(sample_feature_data, "features.csv")
 
 
 @pytest.fixture
-def labels_csv(tmp_path, sample_labels_data):
+def labels_csv(csv_factory, sample_labels_data):
     """Write labels to CSV and return path."""
-    path = tmp_path / "labels.csv"
-    pl.DataFrame(sample_labels_data).write_csv(path)
-    return path
+    return csv_factory(sample_labels_data, "labels.csv")
 
 
 # Instance fixtures - SampleMetadata
+
+
+@pytest.fixture(params=["eager", "lazy"])
+def sample_metadata(request, metadata_csv, attributes_csv, study_titles_csv):
+    """SampleMetadata instance in both eager and lazy modes."""
+    if request.param == "eager":
+        return SampleMetadata(metadata_csv, attributes_csv, study_titles_csv)
+    return SampleMetadata.scan(metadata_csv, attributes_csv, study_titles_csv)
 
 
 @pytest.fixture
@@ -243,6 +249,18 @@ def sample_metadata_lazy(metadata_csv, attributes_csv, study_titles_csv):
 
 
 # Instance fixtures - TaxonomicProfiles
+
+
+@pytest.fixture(params=["eager", "lazy"])
+def sample_profiles(request, profiles_csv, root_csv):
+    """TaxonomicProfiles instance in both eager and lazy modes."""
+    if request.param == "eager":
+        return TaxonomicProfiles(
+            profiles_csv, root=root_csv, check_filled=False
+        )
+    return TaxonomicProfiles.scan(
+        profiles_csv, root=root_csv, check_filled=False
+    )
 
 
 @pytest.fixture
@@ -262,6 +280,14 @@ def sample_profiles_lazy(profiles_csv, root_csv):
 # Instance fixtures - FeatureSet
 
 
+@pytest.fixture(params=["eager", "lazy"])
+def sample_features(request, features_csv):
+    """FeatureSet instance in both eager and lazy modes."""
+    if request.param == "eager":
+        return FeatureSet.load(features_csv)
+    return FeatureSet.scan(features_csv, name="test_features")
+
+
 @pytest.fixture
 def sample_features_eager(features_csv):
     """FeatureSet instance in eager mode."""
@@ -275,6 +301,34 @@ def sample_features_lazy(features_csv):
 
 
 # Instance fixtures - Dataset
+
+
+@pytest.fixture(params=["eager", "lazy"])
+def sample_dataset(
+    request,
+    metadata_csv,
+    attributes_csv,
+    study_titles_csv,
+    profiles_csv,
+    root_csv,
+):
+    """Dataset instance with metadata and profiles in both eager and lazy
+    modes."""
+    mode = request.param
+    if mode == "eager":
+        meta = SampleMetadata(metadata_csv, attributes_csv, study_titles_csv)
+        prof = TaxonomicProfiles(
+            profiles_csv, root=root_csv, check_filled=False
+        )
+        return Dataset(metadata=meta, profiles=prof)
+    else:
+        meta = SampleMetadata.scan(
+            metadata_csv, attributes_csv, study_titles_csv
+        )
+        prof = TaxonomicProfiles.scan(
+            profiles_csv, root=root_csv, check_filled=False
+        )
+        return Dataset(metadata=meta, profiles=prof)
 
 
 @pytest.fixture
@@ -297,6 +351,58 @@ def sample_dataset_lazy(sample_metadata_lazy, sample_profiles_lazy):
 def sample_dataset_empty():
     """Empty Dataset instance for builder pattern testing."""
     return Dataset()
+
+
+@pytest.fixture
+def sync_data_files(csv_factory):
+    """Create data files for synchronization tests."""
+    # Metadata: S1, S2, S3, S4
+    metadata_data = {
+        "sample": ["S1", "S2", "S3", "S4"],
+        "biosample": ["BS1", "BS2", "BS3", "BS4"],
+        "bioproject": ["BP1", "BP1", "BP1", "BP1"],
+        "lat": [0.0, 0.0, 0.0, 0.0],
+        "lon": [0.0, 0.0, 0.0, 0.0],
+        "collection_date": ["2020-01-01"] * 4,
+        "biome": ["soil"] * 4,
+        "mbases": [1000] * 4,
+    }
+    metadata_csv = csv_factory(metadata_data, "metadata_sync.csv")
+
+    attributes_data = {
+        "sample": ["S1", "S2", "S3", "S4"],
+        "key": ["pH"] * 4,
+        "value": ["7.0"] * 4,
+    }
+    attributes_csv = csv_factory(attributes_data, "attributes_sync.csv")
+
+    # Profiles: S1, S2, S3 (missing S4)
+    profiles_data = {
+        "sample": ["S1", "S1", "S2", "S2", "S3", "S3"],
+        "taxonomy": ["d__Bacteria", "d__Bacteria;p__Proteobacteria"] * 3,
+        "coverage": [100.0, 50.0] * 3,
+    }
+    profiles_csv = csv_factory(profiles_data, "profiles_sync.csv")
+
+    # Features: S1, S2 (missing S3, S4)
+    features_data = {
+        "sample": ["S1", "S2"],
+        "feat1": [0.5, 0.3],
+        "feat2": [0.2, 0.4],
+    }
+    features_csv = csv_factory(features_data, "features_sync.csv")
+
+    # Labels: S1, S2, S3 (missing S4)
+    labels_data = {"sample": ["S1", "S2", "S3"], "target": [0, 1, 0]}
+    labels_csv = csv_factory(labels_data, "labels_sync.csv")
+
+    return {
+        "metadata": metadata_csv,
+        "attributes": attributes_csv,
+        "profiles": profiles_csv,
+        "features": features_csv,
+        "labels": labels_csv,
+    }
 
 
 # QC test fixtures - low quality samples

@@ -33,7 +33,7 @@ from microbiome_ml import CrossValidator, Visualiser
 
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 
-# input
+# Build dataset with flexible builder pattern
 dataset = (
     Dataset()
     .add_metadata(
@@ -47,38 +47,49 @@ dataset = (
     .add_feature_set({
         "kmer_features": "path/to/kmer_features.csv",
         "protein_features": "path/to/protein_features.csv",
-        ...
         })
     .add_labels({
         "temperature": "path/to/temperature_labels.csv",
         "ph": "path/to/ph_labels.csv",
         "oxygen": "path/to/oxygen_labels.csv",
-        ...
         })
-    .define_groups({
-        "group1": "path/to/group1.csv",
-        "group2": "path/to/group2.csv",
-        ...
-        })
+    .add_groupings(
+        custom_groupings="path/to/custom_groupings.csv"
+    )
     .apply_preprocessing()
-    .create_taxonomic_features()
+    .add_taxonomic_features()  # Creates features from profiles
+    .create_default_groupings()  # Extracts bioproject, biome, etc.
     )
 
-# save and load
-# saves to a human readable directory structure with .csv files
-dataset.save("path/to/save/dataset")
-dataset = Dataset.load("path/to/save/dataset", compression=False)
+# Create holdout train/test splits (supports multiple labels)
+dataset.create_holdout_split(
+    label="temperature",  # Or None to split all labels
+    grouping="bioproject",  # Prevent group leakage
+    test_size=0.2
+)
 
-# machine learning
-# by default they always iterate over all feature sets, models and labels
+# Create k-fold cross-validation folds (multiple schemes per label)
+dataset.create_all_cv_schemes(
+    n_folds=5
+)
+
+# Iterate over all CV folds
+for label, scheme, cv_df in dataset.iter_cv_folds():
+    print(f"Label: {label}, Scheme: {scheme}, Samples: {cv_df.height}")
+
+# Save and load (human-readable directory structure)
+dataset.save("path/to/save/dataset", compress=True)  # .tar.gz
+dataset = Dataset.load("path/to/save/dataset.tar.gz")
+
+# Machine learning - iterates over all feature sets, models, and labels
 cv = CrossValidator(
     dataset, 
-    model=[RandomForestRegressor(), GradientBoostingRegressor()]
+    models=[RandomForestRegressor(), GradientBoostingRegressor()]
     )
 
 results = cv.run()
 
-# visualisation
+# Visualization
 visualiser = Visualiser(results)
 visualiser.plot_performance_metrics()
 visualiser.plot_feature_importances()

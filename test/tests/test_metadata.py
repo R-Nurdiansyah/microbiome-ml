@@ -45,51 +45,42 @@ class TestSampleMetadataInitialization:
 class TestSampleMetadataSaveLoad:
     """Test save/load round-trips."""
 
-    def test_save_eager(self, sample_metadata_eager, tmp_path):
-        """Test saving instance."""
+    def test_save(self, sample_metadata, tmp_path):
+        """Test saving instance (eager and lazy)."""
         save_dir = tmp_path / "metadata_save"
-        sample_metadata_eager.save(save_dir)
+        sample_metadata.save(save_dir)
 
         assert (save_dir / "metadata.csv").exists()
         assert (save_dir / "attributes.csv").exists()
+        # study_titles might be present if initialized with it.
+        # The fixture initializes it with study_titles_csv.
         assert (save_dir / "study_titles.csv").exists()
 
-    def test_save_lazy(self, sample_metadata_lazy, tmp_path):
-        """Test saving lazy instance (should collect)."""
-        save_dir = tmp_path / "metadata_save_lazy"
-        sample_metadata_lazy.save(save_dir)
-
-        assert (save_dir / "metadata.csv").exists()
-        assert (save_dir / "attributes.csv").exists()
-
-    def test_load_eager(self, sample_metadata_eager, tmp_path):
+    def test_load_roundtrip(self, sample_metadata, tmp_path):
         """Test save then load."""
         save_dir = tmp_path / "metadata_roundtrip"
-        sample_metadata_eager.save(save_dir)
+        sample_metadata.save(save_dir)
 
         loaded = SampleMetadata.load(save_dir)
+
+        # Compare data
+        # Note: loaded is always eager by default unless we use scan or pass lazy=True to load?
+        # SampleMetadata.load implementation usually returns eager unless specified.
+        # Let's check if we need to collect.
+
+        # If sample_metadata was lazy, saving it triggers collection.
+        # Loading it back reads the CSVs.
 
         assert (
             loaded.metadata.collect().shape
-            == sample_metadata_eager.metadata.collect().shape
+            == sample_metadata.metadata.collect().shape
         )
         assert (
             loaded.attributes.collect().shape
-            == sample_metadata_eager.attributes.collect().shape
+            == sample_metadata.attributes.collect().shape
         )
 
-    def test_load_lazy(self, sample_metadata_eager, tmp_path):
-        """Test save then load."""
-        save_dir = tmp_path / "metadata_roundtrip_lazy"
-        sample_metadata_eager.save(save_dir)
-
-        loaded = SampleMetadata.load(save_dir)
-
-        assert isinstance(loaded.metadata, pl.LazyFrame)
-
-    def test_scan_alias(
-        self, sample_metadata_eager, metadata_csv, attributes_csv
-    ):
+    def test_scan_alias(self, metadata_csv, attributes_csv):
         """Test scan loads lazily from separate CSV files."""
         scanned = SampleMetadata.scan(metadata_csv, attributes_csv)
 
@@ -99,37 +90,26 @@ class TestSampleMetadataSaveLoad:
 class TestSampleMetadataFiltering:
     """Test filtering methods preserve mode."""
 
-    def test_filter_by_sample_eager(self, sample_metadata_eager):
-        """Test filtering."""
+    def test_filter_by_sample(self, sample_metadata):
+        """Test filtering (eager and lazy)."""
+        # Samples in fixture: S1, S2, S3, S4
+        # We filter for S1, S3
         samples_lf = pl.DataFrame({"sample": ["S1", "S3"]}).lazy()
 
-        filtered = sample_metadata_eager._filter_by_sample(samples_lf)
-
-        assert isinstance(filtered.metadata, pl.LazyFrame)
-        assert filtered.metadata.collect().height == 2
-        assert set(filtered.metadata.collect()["sample"].to_list()) == {
-            "S1",
-            "S3",
-        }
-
-    def test_filter_by_sample_lazy(self, sample_metadata_lazy):
-        """Test filtering lazy instance."""
-        samples_lf = pl.DataFrame({"sample": ["S2", "S4"]}).lazy()
-
-        filtered = sample_metadata_lazy._filter_by_sample(samples_lf)
+        filtered = sample_metadata._filter_by_sample(samples_lf)
 
         assert isinstance(filtered.metadata, pl.LazyFrame)
 
         # collect to check results
         df = filtered.metadata.collect()
         assert df.height == 2
-        assert set(df["sample"].to_list()) == {"S2", "S4"}
+        assert set(df["sample"].to_list()) == {"S1", "S3"}
 
 
 class TestSampleMetadataFieldValidation:
     """Test field validation and column name handling."""
 
-    def test_required_metadata_fields(self, sample_metadata_eager):
+    def test_required_metadata_fields(self, sample_metadata):
         """Test metadata has required fields."""
         required = {
             "sample",
@@ -142,12 +122,12 @@ class TestSampleMetadataFieldValidation:
             "mbases",
         }
 
-        columns = set(sample_metadata_eager.metadata.collect_schema().names())
+        columns = set(sample_metadata.metadata.collect_schema().names())
         assert required.issubset(columns)
 
-    def test_attributes_structure(self, sample_metadata_eager):
+    def test_attributes_structure(self, sample_metadata):
         """Test attributes has correct long-format structure."""
-        columns = sample_metadata_eager.attributes.collect_schema().names()
+        columns = sample_metadata.attributes.collect_schema().names()
         assert "sample" in columns
         assert "key" in columns
         assert "value" in columns

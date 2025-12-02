@@ -146,18 +146,18 @@ class DerivedMetadataFields(MetadataFields):
         "Day of sample collection",
         [],
     )
-    SEASON_CLASS: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
-        "season_class",
+    CLIMATE: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
+        "climate",
         pl.Utf8,
         False,
-        "Season classification based on Koppen classification",
+        "Climate classification based on Koppen",
         [],
     )
     SEASON: Tuple[str, Any, bool, str, List[str]] = (  # type: ignore
         "season",
         pl.Utf8,
         False,
-        "Season based on month and season class",
+        "Season based on month and Koppen climate classification",
         [],
     )
 
@@ -399,6 +399,232 @@ class SampleMetadata:
         new_instance.study_titles = filtered_study_titles
 
         return new_instance
+
+    def __getattr__(self, name: str) -> pl.LazyFrame:
+        """Enable direct column access via attributes.
+
+        Searches in order:
+        1. Core metadata columns (using field enum for alternatives)
+        2. Derived metadata columns
+        3. Attributes table (key-value pairs)
+        4. Study titles columns
+
+        Examples:
+            metadata.latitude   # Returns LazyFrame with ['sample', 'lat']
+            metadata.ecoregion  # Returns LazyFrame with ['sample', 'ecoregion'] from attributes
+            metadata.study_title # Returns LazyFrame from study_titles
+
+        Returns:
+            LazyFrame with 'sample' column and requested field
+
+        Raises:
+            AttributeError: If field not found in any structure
+        """
+        # 1. Check core metadata fields (with alternative names)
+        for field in CoreMetadataFields:  # type: ignore[assignment]
+            if name in field.all_names or name == field.column_name:
+                actual_col = field.find_column_name(self.metadata)
+                if actual_col:
+                    return self.metadata.select(["sample", actual_col])
+
+        # 2. Check derived metadata fields
+        for field in DerivedMetadataFields:  # type: ignore[assignment]
+            if name in field.all_names or name == field.column_name:
+                actual_col = field.find_column_name(self.metadata)
+                if actual_col:
+                    return self.metadata.select(["sample", actual_col])
+
+        # 3. Check attributes table (key-value pairs)
+        try:
+            attr_result = (
+                self.attributes.filter(pl.col("key") == name)
+                .select(["sample", "value"])
+                .rename({"value": name})
+            )
+            # Check if any rows match (collect first row to verify)
+            if attr_result.head(1).collect().height > 0:
+                return attr_result
+        except Exception:
+            pass
+
+        # 4. Check study_titles if available
+        if self.study_titles is not None:
+            for field in StudyMetadataFields:  # type: ignore[assignment]
+                if name in field.all_names or name == field.column_name:
+                    actual_col = field.find_column_name(self.study_titles)
+                    if actual_col:
+                        return self.study_titles.select(["sample", actual_col])
+
+        # Not found anywhere
+        raise AttributeError(
+            f"'{type(self).__name__}' has no field '{name}'. "
+            f"Check available fields with metadata.get_available_fields()"
+        )
+
+    def __dir__(self) -> list[str]:
+        """Enable autocomplete for dynamic attributes."""
+        base_attrs = list(object.__dir__(self))
+
+        # Add all metadata columns
+        metadata_cols = [
+            col
+            for col in self.metadata.collect_schema().names()
+            if col != "sample"
+        ]
+
+        # Add study title columns if available
+        study_cols = []
+        if self.study_titles is not None:
+            study_cols = [
+                col
+                for col in self.study_titles.collect_schema().names()
+                if col != "sample"
+            ]
+
+        # Add attribute keys (this requires collecting - consider caching)
+        attr_keys = (
+            self.attributes.select("key")
+            .unique()
+            .collect()
+            .to_series()
+            .to_list()
+        )
+
+        return sorted(set(base_attrs + metadata_cols + study_cols + attr_keys))
+
+    def get_available_fields(self) -> dict:
+        """Get all available fields organized by source.
+
+        Returns:
+            Dictionary with keys 'metadata', 'attributes', 'study_titles'
+
+        Examples:
+            fields = metadata.get_available_fields()
+            print(fields['metadata'])    # Core columns
+            print(fields['attributes'])  # Key-value attributes
+        """
+        result = {
+            "metadata": [
+                col
+                for col in self.metadata.collect_schema().names()
+                if col != "sample"
+            ],
+            "attributes": (
+                self.attributes.select("key")
+                .unique()
+                .collect()
+                .to_series()
+                .to_list()
+            ),
+        }
+
+        if self.study_titles is not None:
+            result["study_titles"] = [
+                col
+                for col in self.study_titles.collect_schema().names()
+                if col != "sample"
+            ]
+
+        return result
+
+    def get(self, *columns: str) -> pl.LazyFrame:
+        """Get one or more metadata fields in a single query.
+
+        Searches across metadata, attributes, and study_titles to find
+        the requested columns and returns them in a single LazyFrame.
+
+        Args:
+            *columns: Column names to retrieve
+
+        Returns:
+            LazyFrame with 'sample' and requested columns
+
+        Examples:
+            metadata.get('lat', 'lon')  # Get latitude and longitude
+            metadata.get('ecoregion', 'biome', 'study_title')  # Mixed sources
+
+        Raises:
+            ValueError: If any column not found
+        """
+        result = self.metadata.select(["sample"])
+        found_cols = set()
+
+        for col in columns:
+            col_found = False
+
+            # 1. Check core metadata fields
+            for field in CoreMetadataFields:  # type: ignore[assignment]
+                if col in field.all_names or col == field.column_name:
+                    actual_col = field.find_column_name(self.metadata)
+                    if actual_col:
+                        result = result.join(
+                            self.metadata.select(["sample", actual_col]),
+                            on="sample",
+                            how="left",
+                        )
+                        found_cols.add(col)
+                        col_found = True
+                        break
+
+            if col_found:
+                continue
+
+            # 2. Check derived metadata fields
+            for field in DerivedMetadataFields:  # type: ignore[assignment]
+                if col in field.all_names or col == field.column_name:
+                    actual_col = field.find_column_name(self.metadata)
+                    if actual_col:
+                        result = result.join(
+                            self.metadata.select(["sample", actual_col]),
+                            on="sample",
+                            how="left",
+                        )
+                        found_cols.add(col)
+                        col_found = True
+                        break
+
+            if col_found:
+                continue
+
+            # 3. Check attributes
+            try:
+                attr_data = (
+                    self.attributes.filter(pl.col("key") == col)
+                    .select(["sample", "value"])
+                    .rename({"value": col})
+                )
+                if attr_data.head(1).collect().height > 0:
+                    result = result.join(attr_data, on="sample", how="left")
+                    found_cols.add(col)
+                    col_found = True
+                    continue
+            except Exception:
+                pass
+
+            # 4. Check study_titles
+            if self.study_titles is not None:
+                for field in StudyMetadataFields:  # type: ignore[assignment]
+                    if col in field.all_names or col == field.column_name:
+                        actual_col = field.find_column_name(self.study_titles)
+                        if actual_col:
+                            result = result.join(
+                                self.study_titles.select(
+                                    ["sample", actual_col]
+                                ),
+                                on="sample",
+                                how="left",
+                            )
+                            found_cols.add(col)
+                            col_found = True
+                            break
+
+            if not col_found:
+                raise ValueError(
+                    f"Field '{col}' not found in metadata, attributes, or study_titles. "
+                    f"Use get_available_fields() to see available fields."
+                )
+
+        return result
 
     def _get_sample_list(self) -> Set[str]:
         """Extract sample IDs from this metadata instance.

@@ -63,12 +63,12 @@ class TestLazyWorkflow:
 class TestTarGzWorkflow:
     """Test tar.gz compression/extraction workflows."""
 
-    def test_compress_extract_roundtrip(self, sample_dataset_eager, tmp_path):
-        """Test complete tar.gz save/load cycle."""
+    def test_compress_extract_roundtrip(self, sample_dataset, tmp_path):
+        """Test complete tar.gz save/load cycle (eager and lazy)."""
         archive_path = tmp_path / "dataset.tar.gz"
 
         # Save compressed
-        sample_dataset_eager.save(archive_path, compress=True)
+        sample_dataset.save(archive_path, compress=True)
         assert archive_path.exists()
 
         # Load from archive
@@ -76,22 +76,30 @@ class TestTarGzWorkflow:
 
         assert loaded.metadata is not None
         assert loaded.profiles is not None
-        assert set(loaded._sample_ids) == set(sample_dataset_eager._sample_ids)
+        # sample_dataset might be lazy, so we need to collect sample_ids to compare sets
+        # But Dataset._sample_ids is usually computed on init or sync.
+        # If lazy, it might be None until sync?
+        # Dataset implementation: _sample_ids is computed in __init__ if metadata/profiles provided.
 
-    def test_compress_without_extension(self, sample_dataset_eager, tmp_path):
+        # If sample_dataset is lazy, let's ensure we compare correctly.
+        # sample_dataset fixture returns a Dataset instance.
+
+        assert set(loaded._sample_ids) == set(sample_dataset._sample_ids)
+
+    def test_compress_without_extension(self, sample_dataset, tmp_path):
         """Test compression adds .tar.gz extension."""
         save_path = tmp_path / "dataset"
 
-        sample_dataset_eager.save(save_path, compress=True)
+        sample_dataset.save(save_path, compress=True)
 
         # Should create dataset.tar.gz
         assert (tmp_path / "dataset.tar.gz").exists()
 
-    def test_lazy_load_from_archive(self, sample_dataset_eager, tmp_path):
+    def test_lazy_load_from_archive(self, sample_dataset, tmp_path):
         """Test lazy loading from tar.gz."""
         archive_path = tmp_path / "dataset_lazy.tar.gz"
 
-        sample_dataset_eager.save(archive_path, compress=True)
+        sample_dataset.save(archive_path, compress=True)
 
         loaded = Dataset.scan(archive_path)
 
@@ -103,60 +111,14 @@ class TestTarGzWorkflow:
 class TestMultiComponentSync:
     """Test synchronization across multiple components."""
 
-    def test_sync_all_components(self, tmp_path):
+    def test_sync_all_components(self, sync_data_files):
         """Test sync with metadata, profiles, features, and labels."""
-        # Create data with overlapping samples
-        # Metadata: S1, S2, S3, S4
-        metadata_df = pl.DataFrame(
-            {
-                "sample": ["S1", "S2", "S3", "S4"],
-                "biosample": ["BS1", "BS2", "BS3", "BS4"],
-                "bioproject": ["BP1", "BP1", "BP1", "BP1"],
-                "lat": [0.0, 0.0, 0.0, 0.0],
-                "lon": [0.0, 0.0, 0.0, 0.0],
-                "collection_date": ["2020-01-01"] * 4,
-                "biome": ["soil"] * 4,
-                "mbases": [1000] * 4,
-            }
-        )
-        metadata_csv = tmp_path / "metadata_sync.csv"
-        metadata_df.write_csv(metadata_csv)
-
-        attributes_df = pl.DataFrame(
-            {
-                "sample": ["S1", "S2", "S3", "S4"],
-                "key": ["pH"] * 4,
-                "value": ["7.0"] * 4,
-            }
-        )
-        attributes_csv = tmp_path / "attributes_sync.csv"
-        attributes_df.write_csv(attributes_csv)
-
-        # Profiles: S1, S2, S3 (missing S4)
-        profiles_df = pl.DataFrame(
-            {
-                "sample": ["S1", "S1", "S2", "S2", "S3", "S3"],
-                "taxonomy": ["d__Bacteria", "d__Bacteria;p__Proteobacteria"]
-                * 3,
-                "coverage": [100.0, 50.0] * 3,
-            }
-        )
-        profiles_csv = tmp_path / "profiles_sync.csv"
-        profiles_df.write_csv(profiles_csv)
-
-        # Features: S1, S2 (missing S3, S4)
-        features_df = pl.DataFrame(
-            {"sample": ["S1", "S2"], "feat1": [0.5, 0.3], "feat2": [0.2, 0.4]}
-        )
-        features_csv = tmp_path / "features_sync.csv"
-        features_df.write_csv(features_csv)
-
-        # Labels: S1, S2, S3 (missing S4)
-        labels_df = pl.DataFrame(
-            {"sample": ["S1", "S2", "S3"], "target": [0, 1, 0]}
-        )
-        labels_csv = tmp_path / "labels_sync.csv"
-        labels_df.write_csv(labels_csv)
+        # Use fixture data
+        metadata_csv = sync_data_files["metadata"]
+        attributes_csv = sync_data_files["attributes"]
+        profiles_csv = sync_data_files["profiles"]
+        features_csv = sync_data_files["features"]
+        labels_csv = sync_data_files["labels"]
 
         # Build dataset - should sync to intersection (S1, S2)
         dataset = (
@@ -183,17 +145,15 @@ class TestMultiComponentSync:
 class TestManifestValidation:
     """Test manifest.json generation and validation."""
 
-    def test_manifest_tracks_components(self, sample_dataset_eager, tmp_path):
+    def test_manifest_tracks_components(self, sample_dataset, tmp_path):
         """Test manifest accurately tracks all components."""
         import json
 
         # Add features
-        sample_dataset_eager.add_features(
-            "test_features", rank=TaxonomicRanks.GENUS
-        )
+        sample_dataset.add_features("test_features", rank=TaxonomicRanks.GENUS)
 
         save_dir = tmp_path / "manifest_test"
-        sample_dataset_eager.save(save_dir)
+        sample_dataset.save(save_dir)
 
         with open(save_dir / "manifest.json", "r") as f:
             manifest = json.load(f)
@@ -204,12 +164,12 @@ class TestManifestValidation:
         assert "features" in manifest["components"]
         assert "test_features" in manifest["components"]["features"]
 
-    def test_manifest_sample_count(self, sample_dataset_eager, tmp_path):
+    def test_manifest_sample_count(self, sample_dataset, tmp_path):
         """Test manifest tracks sample counts correctly."""
         import json
 
         save_dir = tmp_path / "manifest_count"
-        sample_dataset_eager.save(save_dir)
+        sample_dataset.save(save_dir)
 
         with open(save_dir / "manifest.json", "r") as f:
             manifest = json.load(f)
@@ -220,15 +180,13 @@ class TestManifestValidation:
 
         assert metadata_count == sample_ids_count
 
-    def test_manifest_version_and_timestamp(
-        self, sample_dataset_eager, tmp_path
-    ):
+    def test_manifest_version_and_timestamp(self, sample_dataset, tmp_path):
         """Test manifest includes version and creation timestamp."""
         import json
         from datetime import datetime
 
         save_dir = tmp_path / "manifest_version"
-        sample_dataset_eager.save(save_dir)
+        sample_dataset.save(save_dir)
 
         with open(save_dir / "manifest.json", "r") as f:
             manifest = json.load(f)

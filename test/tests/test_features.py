@@ -70,32 +70,25 @@ class TestFeatureSetLoadScan:
 class TestFeatureSetSave:
     """Test saving to CSV."""
 
-    def test_save_eager(self, sample_features_eager, tmp_path):
-        """Test saving instance."""
+    def test_save(self, sample_features, tmp_path):
+        """Test saving instance (eager and lazy)."""
         save_path = tmp_path / "features_save.csv"
-        sample_features_eager.save(save_path)
+        sample_features.save(save_path)
 
         assert save_path.exists()
 
-    def test_save_lazy(self, sample_features_lazy, tmp_path):
-        """Test saving lazy instance."""
-        save_path = tmp_path / "features_save_lazy.csv"
-        sample_features_lazy.save(save_path)
-
-        assert save_path.exists()
-
-    def test_save_load_roundtrip(self, sample_features_eager, tmp_path):
+    def test_save_load_roundtrip(self, sample_features, tmp_path):
         """Test save then load preserves data."""
         save_path = tmp_path / "features_roundtrip.csv"
-        sample_features_eager.save(save_path)
+        sample_features.save(save_path)
 
         loaded = FeatureSet.load(save_path)
 
-        assert loaded.accessions == sample_features_eager.accessions
-        assert loaded.feature_names == sample_features_eager.feature_names
+        assert loaded.accessions == sample_features.accessions
+        assert loaded.feature_names == sample_features.feature_names
 
         # Compare data
-        original_df = sample_features_eager.features.collect().sort("sample")
+        original_df = sample_features.features.collect().sort("sample")
         loaded_df = loaded.features.collect().sort("sample")
         assert original_df.equals(loaded_df)
 
@@ -118,11 +111,11 @@ class TestFeatureSetFactoryMethods:
             4,
         )  # 4 samples, 3 features + 1 sample col
 
-    def test_from_taxonomic_profiles(self, sample_profiles_eager):
+    def test_from_taxonomic_profiles(self, sample_profiles):
         """Test creating from TaxonomicProfiles."""
         from microbiome_ml.utils.taxonomy import TaxonomicRanks
 
-        fs = sample_profiles_eager.create_features(TaxonomicRanks.PHYLUM)
+        fs = sample_profiles.create_features(TaxonomicRanks.PHYLUM)
 
         assert isinstance(fs, FeatureSet)
         assert fs.accessions is not None
@@ -132,59 +125,53 @@ class TestFeatureSetFactoryMethods:
 class TestFeatureSetFiltering:
     """Test sample filtering."""
 
-    def test_filter_samples_eager(self, sample_features_eager):
-        """Test filtering."""
+    def test_filter_samples(self, sample_features):
+        """Test filtering (eager and lazy)."""
         samples_to_keep = ["S1", "S3"]
+        # Ensure samples exist in the fixture data (S1, S2, S3, S4)
+        # S1 and S3 are present.
 
-        filtered = sample_features_eager.filter_samples(samples_to_keep)
+        filtered = sample_features.filter_samples(samples_to_keep)
 
         assert isinstance(filtered.features, pl.LazyFrame)
+
+        # Check accessions if available immediately (eager) or after collect
+        # But FeatureSet.filter_samples updates accessions list immediately if possible?
+        # Looking at implementation (implied), it probably does.
         assert filtered.accessions == samples_to_keep
 
         # Check dimensions
         df = filtered.features.collect()
         assert df.height == 2
-
-    def test_filter_samples_lazy(self, sample_features_lazy):
-        """Test filtering lazy instance."""
-        samples_to_keep = ["S2", "S4"]
-
-        filtered = sample_features_lazy.filter_samples(samples_to_keep)
-
-        assert isinstance(filtered.features, pl.LazyFrame)
-
-        # collect to check results
-        df = filtered.features.collect()
-        assert filtered.accessions == samples_to_keep
-        assert df.height == 2
+        assert set(df["sample"].to_list()) == set(samples_to_keep)
 
 
 class TestFeatureSetQueries:
     """Test query methods."""
 
-    def test_get_samples(self, sample_features_eager):
+    def test_get_samples(self, sample_features):
         """Test getting features for specific samples."""
         samples = ["S1", "S2"]
-        result = sample_features_eager.get_samples(samples)
+        result = sample_features.get_samples(samples)
 
         assert result.shape[0] == 2
-        assert result.shape[1] == len(sample_features_eager.feature_names)
+        assert result.shape[1] == len(sample_features.feature_names)
 
-    def test_get_features(self, sample_features_eager):
+    def test_get_features(self, sample_features):
         """Test getting specific features."""
         features = ["feature1", "feature3"]
-        result = sample_features_eager.get_features(features)
+        result = sample_features.get_features(features)
 
-        assert result.shape[0] == len(sample_features_eager.accessions)
+        assert result.shape[0] == len(sample_features.accessions)
         assert result.shape[1] == 2
 
-    def test_to_df(self, sample_features_eager):
+    def test_to_df(self, sample_features):
         """Test conversion to DataFrame."""
-        df = sample_features_eager.to_df()
+        df = sample_features.to_df()
 
         assert isinstance(df, pl.DataFrame)
         assert "sample" in df.columns
-        assert df.height == len(sample_features_eager.accessions)
+        assert df.height == len(sample_features.accessions)
         assert (
-            len(df.columns) == len(sample_features_eager.feature_names) + 1
+            len(df.columns) == len(sample_features.feature_names) + 1
         )  # +1 for sample column

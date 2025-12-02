@@ -6,7 +6,7 @@ import tarfile
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import polars as pl
@@ -15,6 +15,7 @@ from microbiome_ml.utils.taxonomy import TaxonomicRanks
 from microbiome_ml.wrangle.features import FeatureSet
 from microbiome_ml.wrangle.metadata import SampleMetadata
 from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+from microbiome_ml.wrangle.splits import SplitManager
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,12 @@ class Dataset:
             Union[TaxonomicProfiles, str, Path, pl.LazyFrame]
         ] = None,
         features: Optional[Dict[str, FeatureSet]] = None,
+        labels: Optional[
+            Union[pl.DataFrame, str, Path, Dict[str, Any]]
+        ] = None,
+        groupings: Optional[
+            Union[pl.DataFrame, str, Path, Dict[str, Any]]
+        ] = None,
     ):
         """Initialize Dataset with optional components.
 
@@ -60,12 +67,16 @@ class Dataset:
             metadata: SampleMetadata instance or dict with metadata sources
             profiles: TaxonomicProfiles instance or data source
             features: Dict of FeatureSets by name
+            labels: Labels DataFrame or source
+            groupings: Groupings DataFrame or source
         """
         # Initialize empty structure
         self.metadata: Optional[SampleMetadata] = None
         self.profiles: Optional[TaxonomicProfiles] = None
         self.feature_sets: Dict[str, FeatureSet] = {}
-        self.labels: Dict[str, Any] = {}
+        self.labels: Optional[pl.DataFrame] = None
+        self.groupings: Optional[pl.DataFrame] = None
+        self.splits: Dict[str, SplitManager] = {}
         self._sample_ids: Optional[List[str]] = None
 
         self.metadata_qc_done: bool = False
@@ -78,6 +89,10 @@ class Dataset:
             self.add_profiles(profiles)
         if features is not None:
             self.feature_sets.update(features)
+        if labels is not None:
+            self.add_labels(labels)
+        if groupings is not None:
+            self.add_groupings(groupings)
 
         self._sync_accessions()
 
@@ -260,18 +275,46 @@ class Dataset:
     def iter_labels(
         self, names: Optional[List[str]] = None
     ) -> Any:  # Returns generator
-        """Iterate over label sets.
+        """Iterate over label columns.
 
         Args:
-            names: List of label set names to iterate over (all if None)
+            names: List of label names to iterate over (all if None)
 
         Yields:
-            Tuple of (name, label_data) for each label set
+            Tuple of (name, DataFrame) for each label set (sample + label column)
         """
+        if self.labels is None:
+            return
+
+        available_names = [c for c in self.labels.columns if c != "sample"]
         if names is None:
-            names = list(self.labels.keys())
+            names = available_names
+
         for name in names:
-            yield name, self.labels[name]
+            if name in available_names:
+                yield name, self.labels.select(["sample", name])
+
+    def iter_groupings(
+        self, names: Optional[List[str]] = None
+    ) -> Any:  # Returns generator
+        """Iterate over grouping columns.
+
+        Args:
+            names: List of grouping names to iterate over (all if None)
+
+        Yields:
+            Tuple of (name, DataFrame) for each grouping set (sample + grouping column)
+        """
+        if self.groupings is None:
+            return
+
+        available_names = [c for c in self.groupings.columns if c != "sample"]
+        if names is None:
+            names = available_names
+
+        for name in names:
+            if name in available_names:
+                yield name, self.groupings.select(["sample", name])
 
     def get_sample_ids(self) -> List[str]:
         """Get the canonical list of sample IDs after synchronization.
@@ -340,35 +383,6 @@ class Dataset:
                 component_counts["feature_sets"] = features_samples.height
                 logger.debug(
                     f"Feature sets (intersection) have {features_samples.height} samples"
-                )
-
-        if self.labels:
-            # Get intersection of all label sets
-            label_accs_list = []
-            for label_data in self.labels.values():
-                if isinstance(label_data, pl.DataFrame):
-                    label_accs_list.append(
-                        set(label_data.select("sample").to_series().to_list())
-                    )
-                elif isinstance(label_data, pl.LazyFrame):
-                    label_accs_list.append(
-                        set(
-                            label_data.select("sample")
-                            .collect()
-                            .to_series()
-                            .to_list()
-                        )
-                    )
-                elif isinstance(label_data, dict):
-                    label_accs_list.append(set(label_data.keys()))
-
-            if label_accs_list:
-                labels_accs = set.intersection(*label_accs_list)
-                labels_samples = pl.DataFrame({"sample": list(labels_accs)})
-                sample_dfs.append(("labels", labels_samples))
-                component_counts["labels"] = labels_samples.height
-                logger.debug(
-                    f"Labels (intersection) have {labels_samples.height} samples"
                 )
 
         # If no components, set to None and return
@@ -453,20 +467,30 @@ class Dataset:
                 self._sample_ids  # type: ignore
             )
 
-        # Filter labels
-        for name, label_data in list(self.labels.items()):
-            if isinstance(label_data, pl.DataFrame):
-                self.labels[name] = label_data.join(
-                    canonical_lf.collect(), on="sample", how="semi"
-                )
+        # Align labels and groupings (left join to keep canonical samples)
+        canonical_df = canonical_lf.collect()
 
-    def _update_sample_ids(self) -> None:
-        """Recalculate canonical sample list when components change.
+        if self.labels is not None:
+            self.labels = canonical_df.join(
+                self.labels, on="sample", how="left"
+            )
 
-        Calls _sync_accessions() to perform strict intersection-based
-        synchronization.
-        """
-        self._sync_accessions()
+        if self.groupings is not None:
+            self.groupings = canonical_df.join(
+                self.groupings, on="sample", how="left"
+            )
+
+        # Filter splits (holdout and CV schemes in each SplitManager)
+        if self.splits:
+            for label, split_manager in self.splits.items():
+                if split_manager.holdout is not None:
+                    split_manager.holdout = canonical_df.join(
+                        split_manager.holdout, on="sample", how="left"
+                    )
+                for scheme_name, cv_df in split_manager.cv_schemes.items():
+                    split_manager.cv_schemes[scheme_name] = canonical_df.join(
+                        cv_df, on="sample", how="left"
+                    )
 
     def add_feature_set(
         self,
@@ -518,7 +542,7 @@ class Dataset:
                     f"Unsupported feature set source type: {type(features)}"
                 )
 
-        self._update_sample_ids()
+        self._sync_accessions()
         return self
 
     def add_labels(
@@ -528,11 +552,13 @@ class Dataset:
         ],
         name: Optional[str] = None,
     ) -> "Dataset":
-        """Add one or multiple label sets.
+        """Add labels to the dataset.
+
+        Merges into self.labels DataFrame.
 
         Args:
             labels: Dict mapping names to sources, single file path, or DataFrame
-            name: Name for single label set (required if labels is not dict)
+            name: Name for single label set (required if labels is not dict and has single value column)
 
         Returns:
             Self for chaining
@@ -545,31 +571,103 @@ class Dataset:
         if isinstance(labels, dict):
             # Batch addition: dict mapping names to sources
             for label_name, label_source in labels.items():
-                if isinstance(label_source, pl.DataFrame):
-                    self.labels[label_name] = label_source
-                elif isinstance(label_source, (str, Path)):
-                    self.labels[label_name] = pl.read_csv(label_source)
-                else:
-                    raise ValueError(
-                        f"Unsupported label source type for '{label_name}': {type(label_source)}"
-                    )
+                self.add_labels(label_source, name=label_name)
+            return self
+
+        # Load
+        if isinstance(labels, (str, Path)):
+            new_df = pl.read_csv(labels)
+        elif isinstance(labels, pl.DataFrame):
+            new_df = labels
         else:
-            # Single addition
-            if name is None:
-                raise ValueError(
-                    "name parameter required when adding single label set"
-                )
+            raise ValueError(f"Unsupported label source type: {type(labels)}")
 
-            if isinstance(labels, pl.DataFrame):
-                self.labels[name] = labels
-            elif isinstance(labels, (str, Path)):
-                self.labels[name] = pl.read_csv(labels)
-            else:
-                raise ValueError(
-                    f"Unsupported label source type: {type(labels)}"
-                )
+        if "sample" not in new_df.columns:
+            raise ValueError("Labels must contain 'sample' column")
 
-        self._update_sample_ids()
+        # Rename if name provided and single value column
+        value_cols = [c for c in new_df.columns if c != "sample"]
+        if name:
+            if len(value_cols) == 1:
+                new_df = new_df.rename({value_cols[0]: name})
+            elif name not in value_cols:
+                pass
+
+        if self.labels is None:
+            self.labels = new_df
+        else:
+            # Check collisions
+            new_cols = set(new_df.columns) - {"sample"}
+            existing_cols = set(self.labels.columns) - {"sample"}
+            overlap = new_cols.intersection(existing_cols)
+            if overlap:
+                raise ValueError(f"Duplicate label columns: {overlap}")
+
+            self.labels = self.labels.join(new_df, on="sample", how="outer")
+
+        self._sync_accessions()
+        return self
+
+    def add_groupings(
+        self,
+        groupings: Union[
+            Dict[str, Union[str, Path, pl.DataFrame]], str, Path, pl.DataFrame
+        ],
+        name: Optional[str] = None,
+    ) -> "Dataset":
+        """Add groupings to the dataset.
+
+        Merges into self.groupings DataFrame.
+
+        Args:
+            groupings: Dict mapping names to sources, single file path, or DataFrame
+            name: Name for single grouping set (required if groupings is not dict and has single value column)
+
+        Returns:
+            Self for chaining
+        """
+        if isinstance(groupings, dict):
+            # Batch addition: dict mapping names to sources
+            for group_name, group_source in groupings.items():
+                self.add_groupings(group_source, name=group_name)
+            return self
+
+        # Load
+        if isinstance(groupings, (str, Path)):
+            new_df = pl.read_csv(groupings)
+        elif isinstance(groupings, pl.DataFrame):
+            new_df = groupings
+        else:
+            raise ValueError(
+                f"Unsupported grouping source type: {type(groupings)}"
+            )
+
+        if "sample" not in new_df.columns:
+            raise ValueError("Groupings must contain 'sample' column")
+
+        # Rename if name provided and single value column
+        value_cols = [c for c in new_df.columns if c != "sample"]
+        if name:
+            if len(value_cols) == 1:
+                new_df = new_df.rename({value_cols[0]: name})
+            elif name not in value_cols:
+                pass
+
+        if self.groupings is None:
+            self.groupings = new_df
+        else:
+            # Check collisions
+            new_cols = set(new_df.columns) - {"sample"}
+            existing_cols = set(self.groupings.columns) - {"sample"}
+            overlap = new_cols.intersection(existing_cols)
+            if overlap:
+                raise ValueError(f"Duplicate grouping columns: {overlap}")
+
+            self.groupings = self.groupings.join(
+                new_df, on="sample", how="outer"
+            )
+
+        self._sync_accessions()
         return self
 
     def add_taxonomic_features(
@@ -587,7 +685,7 @@ class Dataset:
             Self for chaining
 
         Examples:
-            .add_taxonomic_features()  # All ranks
+            .add_taxonomic_features()  # All ranks (phylum to species)
             .add_taxonomic_features(ranks=["genus", "family"])
             .add_taxonomic_features(ranks=[TaxonomicRanks.GENUS], prefix="rel")
         """
@@ -596,35 +694,400 @@ class Dataset:
                 "Profiles must be added before generating taxonomic features"
             )
 
-        # Default to all standard ranks
+        # Default to all standard ranks (e.g., phylum to species)
         if ranks is None:
-            ranks = [
-                TaxonomicRanks.DOMAIN,
-                TaxonomicRanks.PHYLUM,
-                TaxonomicRanks.CLASS,
-                TaxonomicRanks.ORDER,
-                TaxonomicRanks.FAMILY,
-                TaxonomicRanks.GENUS,
-                TaxonomicRanks.SPECIES,
-            ]
-
-        # Convert string ranks to enums
-        rank_enums = []
-        for rank in ranks:
-            if isinstance(rank, str):
-                rank_enums.append(TaxonomicRanks.from_name(rank))
-            else:
-                rank_enums.append(rank)
+            ranks_iter: Union[
+                Iterator[TaxonomicRanks], List[Union[str, TaxonomicRanks]]
+            ] = TaxonomicRanks.PHYLUM.iter_down()
+        else:
+            ranks_iter = ranks
 
         # Generate feature sets for each rank
-        for rank in rank_enums:
+        for rank in ranks_iter:
+            # Convert string to enum if needed
+            if isinstance(rank, str):
+                rank = TaxonomicRanks.from_name(rank)
+
             feature_set = self.profiles.create_features(rank)
             feature_name = f"{prefix}_{rank.name.lower()}"
             feature_set.name = feature_name
             self.feature_sets[feature_name] = feature_set
 
-        self._update_sample_ids()
+        self._sync_accessions()
         return self
+
+    def create_default_groupings(
+        self,
+        groupings: Optional[List[str]] = None,
+        force: bool = False,
+    ) -> "Dataset":
+        """Create default grouping columns from metadata fields.
+
+        Automatically extracts common grouping variables from metadata for use
+        in train/test splitting and analysis. Fields are extracted as-is without
+        transformation, and null values are preserved.
+
+        Args:
+            groupings: List of specific groupings to create. If None, creates all
+                      available default groupings: ['bioproject', 'biome', 'domain',
+                      'ecoregion', 'year', 'month', 'climate', 'season']
+            force: If True, overwrite existing groupings. If False, merge with existing
+
+        Returns:
+            Self for chaining
+
+        Examples:
+            # Create all available default groupings
+            dataset.create_default_groupings()
+
+            # Create only specific groupings
+            dataset.create_default_groupings(groupings=['bioproject', 'biome'])
+
+            # Overwrite existing groupings
+            dataset.create_default_groupings(force=True)
+
+        Raises:
+            ValueError: If metadata is not available
+        """
+        if self.metadata is None:
+            raise ValueError(
+                "Metadata must be added before creating default groupings"
+            )
+
+        # Define default groupings to attempt
+        default_groupings = [
+            "bioproject",
+            "biome",
+            "domain",
+            "ecoregion",
+            "year",
+            "month",
+            "climate",
+            "season",
+        ]
+
+        # Use provided list or defaults
+        fields_to_extract = (
+            groupings if groupings is not None else default_groupings
+        )
+
+        # Try to extract each field, skip if not available
+        extracted_fields = []
+        for field in fields_to_extract:
+            try:
+                # Use the new metadata API to get the field
+                field_data = getattr(self.metadata, field)
+                # Verify it has data by checking if we can collect at least one row
+                if field_data.head(1).collect().height > 0:
+                    extracted_fields.append(field)
+            except AttributeError:
+                logger.warning(
+                    f"Field '{field}' not found in metadata, skipping"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Could not extract field '{field}' from metadata: {e}"
+                )
+
+        if not extracted_fields:
+            logger.warning(
+                "No grouping fields could be extracted from metadata"
+            )
+            return self
+
+        # Extract all available fields at once using the get() method
+        groupings_data = self.metadata.get(*extracted_fields).collect()
+
+        # Add or merge with existing groupings
+        if self.groupings is None or force:
+            self.groupings = groupings_data
+        else:
+            # Merge with existing groupings
+            self.add_groupings(groupings_data)
+
+        logger.info(f"Created default groupings: {extracted_fields}")
+
+        return self
+
+    def create_holdout_split(
+        self,
+        label: Optional[str] = None,
+        test_size: float = 0.2,
+        n_bins: int = 5,
+        grouping: Optional[str] = None,
+        random_state: int = 42,
+        force: bool = False,
+    ) -> "Dataset":
+        """Create holdout train/test splits for one or all labels.
+
+        Uses stratified sampling with optional group awareness.
+        Handles both continuous (via binning) and categorical targets.
+
+        Args:
+            label: Specific label to split. If None, splits all labels.
+            test_size: Fraction of samples for test set
+            n_bins: Number of bins for continuous targets
+            grouping: Optional grouping column to prevent leakage
+            random_state: Random seed for reproducibility
+            force: If True, overwrite existing splits
+
+        Returns:
+            Self for chaining
+        """
+        if self.labels is None:
+            raise ValueError("Labels must be added before creating splits")
+
+        # Get all label columns
+        all_label_cols = [c for c in self.labels.columns if c != "sample"]
+        if not all_label_cols:
+            raise ValueError("No label columns found in labels DataFrame")
+
+        # Determine which labels to process
+        if label is not None:
+            if label not in all_label_cols:
+                raise ValueError(f"Label '{label}' not found in labels")
+            label_list = [label]
+        else:
+            label_list = all_label_cols
+
+        # Create splits for each label
+        for lbl in label_list:
+            # Check if split already exists
+            if lbl in self.splits and not force:
+                logger.warning(
+                    f"Split for '{lbl}' already exists. Use force=True to overwrite."
+                )
+                continue
+
+            logger.info(f"Creating holdout split for label: {lbl}")
+
+            # Initialize SplitManager if needed
+            if lbl not in self.splits:
+                self.splits[lbl] = SplitManager(lbl)
+
+            # Prepare data
+            data = self.labels.select(["sample", lbl])
+
+            if grouping is not None:
+                if (
+                    self.groupings is None
+                    or grouping not in self.groupings.columns
+                ):
+                    raise ValueError(
+                        f"Grouping '{grouping}' not found in groupings"
+                    )
+                groups = self.groupings.select(["sample", grouping])
+                data = data.join(groups, on="sample", how="left")
+
+            # Filter nulls
+            initial_count = data.height
+            null_cols = [lbl] if grouping is None else [lbl, grouping]
+            data = data.drop_nulls(subset=null_cols)
+            if data.height < initial_count:
+                logger.warning(
+                    f"Dropped {initial_count - data.height} samples with null values for {lbl}"
+                )
+
+            # Create holdout split
+            self.splits[lbl].create_holdout(
+                data=data,
+                grouping=grouping,
+                test_size=test_size,
+                n_bins=n_bins,
+                random_state=random_state,
+            )
+
+        return self
+
+    def create_cv_folds(
+        self,
+        label: Optional[str] = None,
+        n_folds: int = 5,
+        n_bins: int = 5,
+        grouping: Optional[
+            str
+        ] = "all",  # New default: "all" creates all schemes
+        random_state: int = 42,
+        force: bool = False,
+    ) -> "Dataset":
+        """Create k-fold cross-validation splits for one or all labels.
+
+        By default, creates CV folds for ALL available groupings plus a random baseline.
+        Use grouping="random" to create only random splits, or specify a specific grouping.
+
+        Args:
+            label: Specific label to create folds for. If None, creates for all labels.
+            n_folds: Number of folds
+            n_bins: Number of bins for continuous targets
+            grouping: Grouping strategy:
+                - "all" (default): Create CV schemes for all groupings + random
+                - "random": Create only random (no grouping) CV scheme
+                - <column_name>: Create CV scheme for specific grouping column
+                - None: Same as "random" (backward compatibility)
+            random_state: Random seed for reproducibility
+            force: If True, overwrite existing CV schemes
+
+        Returns:
+            Self for chaining
+
+        Examples:
+            # Create all CV schemes (random + all groupings) for all labels
+            dataset.create_cv_folds()
+
+            # Create all CV schemes for specific label
+            dataset.create_cv_folds(label="pH")
+
+            # Create only random CV for all labels
+            dataset.create_cv_folds(grouping="random")
+
+            # Create only specific grouping for all labels
+            dataset.create_cv_folds(grouping="bioproject")
+        """
+        if self.labels is None:
+            raise ValueError("Labels must be added before creating CV folds")
+
+        # Get all label columns
+        all_label_cols = [c for c in self.labels.columns if c != "sample"]
+        if not all_label_cols:
+            raise ValueError("No label columns found in labels DataFrame")
+
+        # Determine which labels to process
+        if label is not None:
+            if label not in all_label_cols:
+                raise ValueError(f"Label '{label}' not found in labels")
+            label_list = [label]
+        else:
+            label_list = all_label_cols
+
+        # Determine which groupings to use
+        if grouping == "all":
+            # Get all available grouping columns
+            if self.groupings is not None:
+                available_groupings = [
+                    c for c in self.groupings.columns if c != "sample"
+                ]
+            else:
+                available_groupings = []
+
+            # Create list: random + all groupings
+            groupings_to_use = [("random", None)] + [
+                (g, g) for g in available_groupings
+            ]
+
+            if not available_groupings:
+                logger.warning(
+                    "No groupings available, creating only random CV"
+                )
+
+        elif grouping == "random" or grouping is None:
+            # Only random
+            groupings_to_use = [("random", None)]
+
+        else:
+            # Specific grouping column
+            if (
+                self.groupings is None
+                or grouping not in self.groupings.columns
+            ):
+                raise ValueError(
+                    f"Grouping '{grouping}' not found in groupings"
+                )
+            groupings_to_use = [(grouping, grouping)]
+
+        # Create CV folds for each label × grouping combination
+        for lbl in label_list:
+            # Initialize SplitManager if needed
+            if lbl not in self.splits:
+                self.splits[lbl] = SplitManager(lbl)
+
+            for scheme_name, grouping_col in groupings_to_use:
+                # Check if scheme already exists
+                if scheme_name in self.splits[lbl].cv_schemes and not force:
+                    logger.warning(
+                        f"CV scheme '{scheme_name}' for label '{lbl}' already exists. "
+                        f"Use force=True to overwrite."
+                    )
+                    continue
+
+                logger.info(
+                    f"Creating {n_folds}-fold CV (scheme: {scheme_name}) for label: {lbl}"
+                )
+
+                # Prepare data
+                data = self.labels.select(["sample", lbl])
+
+                if grouping_col is not None and self.groupings is not None:
+                    groups = self.groupings.select(["sample", grouping_col])
+                    data = data.join(groups, on="sample", how="left")
+
+                # Filter nulls
+                initial_count = data.height
+                null_cols = (
+                    [lbl] if grouping_col is None else [lbl, grouping_col]
+                )
+                data = data.drop_nulls(subset=null_cols)
+                if data.height < initial_count:
+                    logger.warning(
+                        f"Dropped {initial_count - data.height} samples with null values for {lbl}"
+                    )
+
+                # Create CV folds
+                self.splits[lbl].create_cv_folds(
+                    data=data,
+                    grouping=grouping_col,
+                    n_folds=n_folds,
+                    n_bins=n_bins,
+                    random_state=random_state,
+                    scheme_name=scheme_name,
+                )
+
+        return self
+
+    def iter_cv_folds(
+        self,
+        label: Optional[str] = None,
+        scheme_name: Optional[str] = None,
+    ) -> Any:  # Returns generator
+        """Iterate over CV folds across labels and schemes.
+
+        Yields tuples of (label, scheme_name, cv_df) where cv_df has
+        columns {sample, fold}.
+
+        Args:
+            label: Specific label to iterate over (all if None)
+            scheme_name: Specific scheme to iterate over (all if None)
+
+        Yields:
+            Tuple of (label_name, scheme_name, cv_dataframe)
+        """
+        # Determine which labels to iterate
+        if label is not None:
+            if label not in self.splits:
+                logger.warning(f"No splits found for label '{label}'")
+                return
+            label_list = [label]
+        else:
+            label_list = list(self.splits.keys())
+
+        # Iterate over all label × scheme combinations
+        for lbl in label_list:
+            split_manager = self.splits[lbl]
+
+            # Determine which schemes to iterate
+            if scheme_name is not None:
+                if scheme_name not in split_manager.cv_schemes:
+                    logger.warning(
+                        f"CV scheme '{scheme_name}' not found for label '{lbl}'"
+                    )
+                    continue
+                scheme_list = [scheme_name]
+            else:
+                scheme_list = list(split_manager.cv_schemes.keys())
+
+            # Yield each combination
+            for scheme in scheme_list:
+                cv_df = split_manager.cv_schemes[scheme]
+                yield lbl, scheme, cv_df
 
     def apply_preprocessing(
         self,
@@ -797,19 +1260,63 @@ class Dataset:
                 }
 
         # Save labels
-        if self.labels:
+        if self.labels is not None:
             labels_dir = work_dir / "labels"
             labels_dir.mkdir(parents=True, exist_ok=True)
-            manifest["components"]["labels"] = {}
 
-            for name, label_data in self.labels.items():
-                label_path = labels_dir / f"{name}.csv"
-                if isinstance(label_data, pl.DataFrame):
-                    label_data.write_csv(label_path)
-                    manifest["components"]["labels"][name] = {
-                        "file": f"{name}.csv",
-                        "n_samples": label_data.height,
-                    }
+            labels_path = labels_dir / "labels.csv"
+            self.labels.write_csv(labels_path)
+            manifest["components"]["labels"] = {
+                "file": "labels.csv",
+                "n_samples": self.labels.height,
+                "columns": [c for c in self.labels.columns if c != "sample"],
+            }
+
+        # Save groupings
+        if self.groupings is not None:
+            groupings_dir = work_dir / "groupings"
+            groupings_dir.mkdir(parents=True, exist_ok=True)
+
+            groupings_path = groupings_dir / "groupings.csv"
+            self.groupings.write_csv(groupings_path)
+            manifest["components"]["groupings"] = {
+                "file": "groupings.csv",
+                "n_samples": self.groupings.height,
+                "columns": [
+                    c for c in self.groupings.columns if c != "sample"
+                ],
+            }
+
+        # Save splits (SplitManager structure)
+        if self.splits:
+            splits_dir = work_dir / "splits"
+            splits_dir.mkdir(parents=True, exist_ok=True)
+            manifest["components"]["splits"] = {}
+
+            for label, split_manager in self.splits.items():
+                label_dir = splits_dir / label
+                label_dir.mkdir(parents=True, exist_ok=True)
+
+                label_info: Dict[str, Any] = {
+                    "holdout": None,
+                    "cv_schemes": [],
+                }
+
+                # Save holdout split
+                if split_manager.holdout is not None:
+                    holdout_path = label_dir / "holdout.csv"
+                    split_manager.holdout.write_csv(holdout_path)
+                    label_info["holdout"] = "holdout.csv"
+
+                # Save CV schemes
+                cv_schemes_list: List[str] = []
+                for scheme_name, cv_df in split_manager.cv_schemes.items():
+                    cv_path = label_dir / f"cv_{scheme_name}.csv"
+                    cv_df.write_csv(cv_path)
+                    cv_schemes_list.append(scheme_name)
+                label_info["cv_schemes"] = cv_schemes_list
+
+                manifest["components"]["splits"][label] = label_info
 
         # Save manifest
         manifest_path = work_dir / "manifest.json"
@@ -907,16 +1414,110 @@ class Dataset:
 
         # Load labels
         if "labels" in manifest["components"]:
+            labels_info = manifest["components"]["labels"]
             labels_dir = path / "labels"
-            for name, info in manifest["components"]["labels"].items():
-                label_path = labels_dir / info["file"]
+
+            # Check if new format (single file) or legacy (dict of files)
+            if "file" in labels_info:
+                # New format
+                label_path = labels_dir / labels_info["file"]
                 if label_path.exists():
                     if lazy:
-                        dataset.labels[name] = pl.scan_csv(
-                            label_path
-                        ).collect()  # Labels are small, collect anyway
+                        dataset.labels = pl.scan_csv(label_path).collect()
                     else:
-                        dataset.labels[name] = pl.read_csv(label_path)
+                        dataset.labels = pl.read_csv(label_path)
+            else:
+                # Legacy format
+                for name, info in labels_info.items():
+                    label_path = labels_dir / info["file"]
+                    if label_path.exists():
+                        # Use add_labels to merge legacy files
+                        dataset.add_labels(label_path, name=name)
+
+        # Load groupings
+        if "groupings" in manifest["components"]:
+            groupings_info = manifest["components"]["groupings"]
+            groupings_dir = path / "groupings"
+
+            if "file" in groupings_info:
+                groupings_path = groupings_dir / groupings_info["file"]
+                if groupings_path.exists():
+                    if lazy:
+                        dataset.groupings = pl.scan_csv(
+                            groupings_path
+                        ).collect()
+                    else:
+                        dataset.groupings = pl.read_csv(groupings_path)
+
+        # Load splits (SplitManager structure)
+        if "splits" in manifest["components"]:
+            splits_info = manifest["components"]["splits"]
+            splits_dir = path / "splits"
+
+            # Check if new SplitManager format (dict of labels) or legacy format
+            if isinstance(splits_info, dict) and "file" not in splits_info:
+                # New format: Dict[label, {holdout, cv_schemes}]
+                for label, label_info in splits_info.items():
+                    label_dir = splits_dir / label
+                    if not label_dir.exists():
+                        continue
+
+                    # Create SplitManager
+                    split_manager = SplitManager(label)
+
+                    # Load holdout
+                    if label_info.get("holdout"):
+                        holdout_path = label_dir / label_info["holdout"]
+                        if holdout_path.exists():
+                            if lazy:
+                                split_manager.holdout = pl.scan_csv(
+                                    holdout_path
+                                ).collect()
+                            else:
+                                split_manager.holdout = pl.read_csv(
+                                    holdout_path
+                                )
+
+                    # Load CV schemes
+                    for scheme_name in label_info.get("cv_schemes", []):
+                        cv_path = label_dir / f"cv_{scheme_name}.csv"
+                        if cv_path.exists():
+                            if lazy:
+                                split_manager.cv_schemes[scheme_name] = (
+                                    pl.scan_csv(cv_path).collect()
+                                )
+                            else:
+                                split_manager.cv_schemes[scheme_name] = (
+                                    pl.read_csv(cv_path)
+                                )
+
+                    dataset.splits[label] = split_manager
+
+            elif "file" in splits_info:
+                # Legacy format: single splits.csv file
+                # Convert to new format by treating each column as a separate label's holdout
+                splits_path = splits_dir / splits_info["file"]
+                if splits_path.exists():
+                    if lazy:
+                        legacy_splits = pl.scan_csv(splits_path).collect()
+                    else:
+                        legacy_splits = pl.read_csv(splits_path)
+
+                    # Each column (except 'sample') becomes a label's holdout split
+                    for col in legacy_splits.columns:
+                        if col == "sample":
+                            continue
+                        # Extract label name (remove '_split' suffix if present)
+                        label = (
+                            col.replace("_split", "")
+                            if col.endswith("_split")
+                            else col
+                        )
+                        split_manager = SplitManager(label)
+                        split_manager.holdout = legacy_splits.select(
+                            ["sample", col]
+                        ).rename({col: "split"})
+                        dataset.splits[label] = split_manager
 
         # Restore canonical sample IDs
         dataset._sample_ids = manifest.get("sample_ids", None)

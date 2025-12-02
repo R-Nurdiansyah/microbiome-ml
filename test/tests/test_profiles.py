@@ -49,46 +49,32 @@ class TestTaxonomicProfilesInitialization:
 class TestTaxonomicProfilesSaveLoad:
     """Test save/load round-trips."""
 
-    def test_save_eager(self, sample_profiles_eager, tmp_path):
-        """Test saving eager instance."""
+    def test_save(self, sample_profiles, tmp_path):
+        """Test saving instance (eager and lazy)."""
         save_dir = tmp_path / "profiles_save"
-        sample_profiles_eager.save(save_dir)
+        sample_profiles.save(save_dir)
 
         assert (save_dir / "profiles.csv").exists()
+        # root.csv might be present if initialized with root
+        # The fixture initializes it with root_csv
         assert (save_dir / "root.csv").exists()
 
-    def test_save_lazy(self, sample_profiles_lazy, tmp_path):
-        """Test saving lazy instance (should collect)."""
-        save_dir = tmp_path / "profiles_save_lazy"
-        sample_profiles_lazy.save(save_dir)
-
-        assert (save_dir / "profiles.csv").exists()
-
-    def test_load_eager(self, sample_profiles_eager, tmp_path):
-        """Test save then load in eager mode."""
+    def test_load_roundtrip(self, sample_profiles, tmp_path):
+        """Test save then load."""
         save_dir = tmp_path / "profiles_roundtrip"
-        sample_profiles_eager.save(save_dir)
+        sample_profiles.save(save_dir)
 
         loaded = TaxonomicProfiles.load(save_dir, check_filled=False)
 
         assert (
             loaded.profiles.collect().shape
-            == sample_profiles_eager.profiles.collect().shape
+            == sample_profiles.profiles.collect().shape
         )
 
-    def test_load_lazy(self, sample_profiles_eager, tmp_path):
-        """Test save then load in lazy mode."""
-        save_dir = tmp_path / "profiles_roundtrip_lazy"
-        sample_profiles_eager.save(save_dir)
-
-        loaded = TaxonomicProfiles.load(save_dir, check_filled=False)
-
-        assert isinstance(loaded.profiles, pl.LazyFrame)
-
-    def test_scan_alias(self, sample_profiles_eager, tmp_path):
+    def test_scan_alias(self, sample_profiles, tmp_path):
         """Test scan is alias for load(lazy=True)."""
         save_dir = tmp_path / "profiles_scan"
-        sample_profiles_eager.save(save_dir)
+        sample_profiles.save(save_dir)
 
         scanned = TaxonomicProfiles.scan(save_dir, check_filled=False)
 
@@ -98,11 +84,13 @@ class TestTaxonomicProfilesSaveLoad:
 class TestTaxonomicProfilesFiltering:
     """Test filtering methods preserve mode."""
 
-    def test_filter_by_sample_eager(self, sample_profiles_eager):
-        """Test filtering preserves eager mode."""
+    def test_filter_by_sample(self, sample_profiles):
+        """Test filtering preserves mode."""
+        # Samples in fixture: S1, S2
+        # Filter for S1
         samples_lf = pl.DataFrame({"sample": ["S1"]}).lazy()
 
-        filtered = sample_profiles_eager._filter_by_sample(samples_lf)
+        filtered = sample_profiles._filter_by_sample(samples_lf)
 
         assert filtered.profiles is not None
         unique_samples = set(
@@ -110,43 +98,27 @@ class TestTaxonomicProfilesFiltering:
         )
         assert unique_samples == {"S1"}
 
-    def test_filter_by_sample_lazy(self, sample_profiles_lazy):
-        """Test filtering preserves lazy mode."""
-        samples_lf = pl.DataFrame({"sample": ["S2"]}).lazy()
-
-        filtered = sample_profiles_lazy._filter_by_sample(samples_lf)
-
-        assert isinstance(filtered.profiles, pl.LazyFrame)
-
-        # collect to check results
-        unique_samples = set(
-            filtered.profiles.collect()["sample"].unique().to_list()
-        )
-        assert unique_samples == {"S2"}
-
 
 class TestTaxonomicProfilesTaxonomy:
     """Test taxonomy operations."""
 
-    def test_taxonomy_standardization(self, sample_profiles_eager):
+    def test_taxonomy_standardization(self, sample_profiles):
         """Test taxonomy strings are properly formatted."""
         # Check that taxonomy strings don't have spaces after semicolons
-        taxonomies = sample_profiles_eager.profiles.collect()[
-            "taxonomy"
-        ].to_list()
+        taxonomies = sample_profiles.profiles.collect()["taxonomy"].to_list()
         for tax in taxonomies:
             assert (
                 "; " not in tax
             ), f"Taxonomy has space after semicolon: {tax}"
 
-    def test_is_filled_flag(self, sample_profiles_eager):
+    def test_is_filled_flag(self, sample_profiles):
         """Test is_filled flag is set correctly."""
         # Our test data is in filled format
-        assert sample_profiles_eager.is_filled is True
+        assert sample_profiles.is_filled is True
 
-    def test_rank_extraction(self, sample_profiles_eager):
+    def test_rank_extraction(self, sample_profiles):
         """Test extracting specific taxonomic rank."""
-        rank_lf = sample_profiles_eager.get_rank(TaxonomicRanks.PHYLUM)
+        rank_lf = sample_profiles.get_rank(TaxonomicRanks.PHYLUM)
 
         assert rank_lf is not None
         # Collect to DataFrame to inspect
@@ -164,33 +136,25 @@ class TestTaxonomicProfilesTaxonomy:
 class TestTaxonomicProfilesFeatureCreation:
     """Test feature set creation from profiles."""
 
-    def test_create_features_eager(self, sample_profiles_eager):
-        """Test creating FeatureSet from eager profiles."""
-        features = sample_profiles_eager.create_features(TaxonomicRanks.PHYLUM)
+    def test_create_features(self, sample_profiles):
+        """Test creating FeatureSet from profiles (eager and lazy)."""
+        features = sample_profiles.create_features(TaxonomicRanks.PHYLUM)
 
         assert isinstance(features, FeatureSet)
         assert features.accessions is not None
         assert features.feature_names is not None
         assert features.features is not None
 
-    def test_create_features_lazy(self, sample_profiles_lazy):
-        """Test creating FeatureSet from lazy profiles."""
-        features = sample_profiles_lazy.create_features(TaxonomicRanks.PHYLUM)
-
-        assert isinstance(features, FeatureSet)
-        # create_features() always returns eager FeatureSet (calls .collect())
-        assert features.features is not None
-
 
 class TestTaxonomicProfilesRelativeAbundance:
     """Test coverage to relative abundance conversion."""
 
-    def test_to_relabund(self, sample_profiles_eager):
+    def test_to_relabund(self, sample_profiles):
         """Test conversion to relative abundance."""
         # Profiles should already be in relabund format after initialization
         # Check that relabund column exists and values are normalized per-taxonomy
         relabund_values = (
-            sample_profiles_eager.profiles.filter(pl.col("sample") == "S1")
+            sample_profiles.profiles.filter(pl.col("sample") == "S1")
             .collect()["relabund"]
             .to_list()
         )
