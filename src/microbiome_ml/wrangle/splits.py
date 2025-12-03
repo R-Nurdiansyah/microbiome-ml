@@ -279,18 +279,89 @@ class SplitManager:
         train_samples = df.filter(pl.col(group_col).is_in(train_groups))[
             "sample"
         ].to_list()
+        total_samples = len(test_samples) + len(train_samples)
 
-        test_df = pl.DataFrame(
-            {
-                "sample": test_samples,
-                split_col_name: ["test"] * len(test_samples),
+        # Try to adjust group assignments to better match requested test_size
+        desired_test_count = int(round(total_samples * test_size))
+        achieved_test_count = len(test_samples)
+
+        if achieved_test_count != desired_test_count:
+            # Precompute group sizes
+            group_counts = {
+                row[group_col]: row["count"]
+                for row in df.group_by(group_col).agg(pl.count().alias("count")).iter_rows(named=True)
             }
-        )
-        train_df = pl.DataFrame(
-            {
-                "sample": train_samples,
-                split_col_name: ["train"] * len(train_samples),
-            }
-        )
+
+            # Helper to compute best single-group move
+            def best_move(candidates, direction):
+                # direction = +1 means move group from train->test (increase achieved)
+                # direction = -1 means move group from test->train (decrease achieved)
+                best_g = None
+                best_diff = abs(desired_test_count - achieved_test_count)
+                for g in candidates:
+                    size = group_counts.get(g, 0)
+                    potential = achieved_test_count + direction * size
+                    diff = abs(desired_test_count - potential)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_g = g
+                return best_g, best_diff
+
+            # Iteratively move the single group that most improves the closeness
+            moved = True
+            # Use sets for faster membership updates
+            test_set = set(test_groups)
+            train_set = set(train_groups)
+
+            while moved:
+                moved = False
+                current_diff = abs(desired_test_count - achieved_test_count)
+                if achieved_test_count < desired_test_count and train_set:
+                    # need more test samples -> consider moving from train to test
+                    g, new_diff = best_move(list(train_set), +1)
+                    if g is not None and new_diff < current_diff:
+                        train_set.remove(g)
+                        test_set.add(g)
+                        achieved_test_count += group_counts.get(g, 0)
+                        moved = True
+                elif achieved_test_count > desired_test_count and test_set:
+                    # too many test samples -> move from test to train
+                    g, new_diff = best_move(list(test_set), -1)
+                    if g is not None and new_diff < current_diff:
+                        test_set.remove(g)
+                        train_set.add(g)
+                        achieved_test_count -= group_counts.get(g, 0)
+                        moved = True
+
+            # Replace group lists after adjustments
+            test_groups = list(test_set)
+            train_groups = list(train_set)
+
+        # Recreate sample lists after possible adjustments
+        test_samples = df.filter(pl.col(group_col).is_in(test_groups))["sample"].to_list()
+        train_samples = df.filter(pl.col(group_col).is_in(train_groups))["sample"].to_list()
+
+        test_df = pl.DataFrame({"sample": test_samples, split_col_name: ["test"] * len(test_samples)})
+        train_df = pl.DataFrame({"sample": train_samples, split_col_name: ["train"] * len(train_samples)})
+
+        # Ensure consistent string dtypes even when one side is empty
+        try:
+            test_df = test_df.with_columns(pl.col("sample").cast(pl.Utf8), pl.col(split_col_name).cast(pl.Utf8))
+        except Exception:
+            pass
+        try:
+            train_df = train_df.with_columns(pl.col("sample").cast(pl.Utf8), pl.col(split_col_name).cast(pl.Utf8))
+        except Exception:
+            pass
+
+        # Log achieved ratio vs requested
+        final_test = len(test_samples)
+        final_train = len(train_samples)
+        final_total = final_test + final_train
+        final_ratio = final_test / final_total if final_total > 0 else 0.0
+        if abs(final_ratio - test_size) > 1e-6:
+            logger.info(
+                f"Requested test_size={test_size:.3f}, achieved test proportion={final_ratio:.3f} (n_test={final_test}, n_train={final_train}, n_total={final_total})"
+            )
 
         return pl.concat([test_df, train_df])

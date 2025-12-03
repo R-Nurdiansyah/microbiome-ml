@@ -400,7 +400,7 @@ class Dataset:
 
         # Inner join with each subsequent component to get strict intersection
         for comp_name, comp_df in sample_dfs[1:]:
-            canonical_df = canonical_df.join(comp_df, on="sample", how="inner")
+            canonical_df = canonical_df.join(comp_df, on="sample", how="inner", coalesce=True)
 
         # Sort for deterministic ordering and extract list
         self._sample_ids = (
@@ -472,12 +472,12 @@ class Dataset:
 
         if self.labels is not None:
             self.labels = canonical_df.join(
-                self.labels, on="sample", how="left"
+                self.labels, on="sample", how="left", coalesce=True
             )
 
         if self.groupings is not None:
             self.groupings = canonical_df.join(
-                self.groupings, on="sample", how="left"
+                self.groupings, on="sample", how="left", coalesce=True
             )
 
         # Filter splits (holdout and CV schemes in each SplitManager)
@@ -485,11 +485,11 @@ class Dataset:
             for label, split_manager in self.splits.items():
                 if split_manager.holdout is not None:
                     split_manager.holdout = canonical_df.join(
-                        split_manager.holdout, on="sample", how="left"
+                        split_manager.holdout, on="sample", how="left", coalesce=True
                     )
                 for scheme_name, cv_df in split_manager.cv_schemes.items():
                     split_manager.cv_schemes[scheme_name] = canonical_df.join(
-                        cv_df, on="sample", how="left"
+                        cv_df, on="sample", how="left", coalesce=True
                     )
 
     def add_feature_set(
@@ -602,8 +602,7 @@ class Dataset:
             overlap = new_cols.intersection(existing_cols)
             if overlap:
                 raise ValueError(f"Duplicate label columns: {overlap}")
-
-            self.labels = self.labels.join(new_df, on="sample", how="outer")
+            self.labels = self.labels.join(new_df, on="sample", how="outer", coalesce=True)
 
         self._sync_accessions()
         return self
@@ -664,7 +663,7 @@ class Dataset:
                 raise ValueError(f"Duplicate grouping columns: {overlap}")
 
             self.groupings = self.groupings.join(
-                new_df, on="sample", how="outer"
+                new_df, on="sample", how="outer", coalesce=True
             )
 
         self._sync_accessions()
@@ -877,7 +876,7 @@ class Dataset:
                         f"Grouping '{grouping}' not found in groupings"
                     )
                 groups = self.groupings.select(["sample", grouping])
-                data = data.join(groups, on="sample", how="left")
+                data = data.join(groups, on="sample", how="left", coalesce=True)
 
             # Filter nulls
             initial_count = data.height
@@ -1018,7 +1017,7 @@ class Dataset:
 
                 if grouping_col is not None and self.groupings is not None:
                     groups = self.groupings.select(["sample", grouping_col])
-                    data = data.join(groups, on="sample", how="left")
+                    data = data.join(groups, on="sample", how="left", coalesce=True)
 
                 # Filter nulls
                 initial_count = data.height
