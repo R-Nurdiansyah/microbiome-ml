@@ -90,3 +90,29 @@ class TaxonomicRanks(IntEnum):
         while rank is not None:
             yield rank
             rank = rank.child
+
+    def get_regex(self) -> str:
+        """
+        Get regex pattern for matching taxonomy strings at exactly this rank.
+        
+        Returns:
+            Regex pattern that requires this rank and excludes child ranks.
+        
+        Examples:
+            >>> TaxonomicRanks.PHYLUM.get_regex()
+            'p__[^;]+(?:;c__)?$'  # Requires p__, optionally ends with child prefix
+            
+            >>> TaxonomicRanks.GENUS.get_regex()
+            'g__[^;]+(?:;s__)?$'  # Requires g__, optionally ends with child prefix
+        """
+        # Match this rank's prefix
+        pattern = f"{self.prefix}[^;]+"
+        
+        # Optionally allow immediate child prefix at the end
+        child = self.child
+        if child:
+            pattern += f"(?:;{child.prefix})?$"
+        else:
+            pattern += "$"
+        
+        return pattern

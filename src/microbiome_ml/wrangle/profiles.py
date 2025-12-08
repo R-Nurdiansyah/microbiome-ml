@@ -771,7 +771,7 @@ class TaxonomicProfiles:
 
         # Extract features at the specified rank
         features = (
-            profiles_lf.filter(pl.col("taxonomy").str.contains(rank.prefix))
+            profiles_lf.filter(pl.col("taxonomy").str.contains(rank.get_regex()))
             .select(["sample", "taxonomy", "relabund"])
             .collect()
             .pivot(
