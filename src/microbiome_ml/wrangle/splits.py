@@ -66,6 +66,7 @@ class SplitManager:
         n_bins: int = 5,
         random_state: int = 42,
         scheme_name: Optional[str] = None,
+        use_holdout: bool = False,
     ) -> None:
         """Create k-fold cross-validation splits.
 
@@ -76,6 +77,7 @@ class SplitManager:
             n_bins: Number of bins for continuous targets
             random_state: Random seed for reproducibility
             scheme_name: Name for this CV scheme (defaults to grouping value or "random")
+            use_holdout: If True, only use training samples from holdout split, must be created first with create_holdout_split()
         """
         # Default scheme_name based on grouping
         if scheme_name is None:
@@ -184,6 +186,22 @@ class SplitManager:
             fold_dfs.append(fold_df)
 
         cv_df = pl.concat(fold_dfs)
+
+        # Warn if fewer folds than requested contain samples (can happen when
+        # data/grouping diversity is limited and some folds remain empty).
+        try:
+            present_folds = set(cv_df.select("fold").to_series().to_list())
+            if len(present_folds) < n_folds:
+                logger.warning(
+                    f"Requested n_folds={n_folds}, but only {len(present_folds)} "
+                    f"fold(s) contain samples (this can occur with limited data or grouping)."
+                )
+        except Exception:
+            # If cv_df is empty or selection fails, still warn
+            if cv_df.height == 0:
+                logger.warning(
+                    f"No samples assigned to CV folds (n_folds={n_folds})."
+                )
 
         # Store CV scheme
         self.cv_schemes[scheme_name] = cv_df
