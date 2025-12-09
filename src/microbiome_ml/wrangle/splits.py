@@ -1,7 +1,7 @@
 """Split management for train/test and cross-validation."""
 
 import logging
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import polars as pl
@@ -289,11 +289,15 @@ class SplitManager:
             # Precompute group sizes
             group_counts = {
                 row[group_col]: row["count"]
-                for row in df.group_by(group_col).agg(pl.count().alias("count")).iter_rows(named=True)
+                for row in df.group_by(group_col)
+                .agg(pl.count().alias("count"))
+                .iter_rows(named=True)
             }
 
             # Helper to compute best single-group move
-            def best_move(candidates: List[str], direction: int) -> Tuple[Optional[str], int]:
+            def best_move(
+                candidates: List[str], direction: int
+            ) -> Tuple[Optional[str], int]:
                 # direction = +1 means move group from train->test (increase achieved)
                 # direction = -1 means move group from test->train (decrease achieved)
                 best_g = None
@@ -338,19 +342,39 @@ class SplitManager:
             train_groups = list(train_set)
 
         # Recreate sample lists after possible adjustments
-        test_samples = df.filter(pl.col(group_col).is_in(test_groups))["sample"].to_list()
-        train_samples = df.filter(pl.col(group_col).is_in(train_groups))["sample"].to_list()
+        test_samples = df.filter(pl.col(group_col).is_in(test_groups))[
+            "sample"
+        ].to_list()
+        train_samples = df.filter(pl.col(group_col).is_in(train_groups))[
+            "sample"
+        ].to_list()
 
-        test_df = pl.DataFrame({"sample": test_samples, split_col_name: ["test"] * len(test_samples)})
-        train_df = pl.DataFrame({"sample": train_samples, split_col_name: ["train"] * len(train_samples)})
+        test_df = pl.DataFrame(
+            {
+                "sample": test_samples,
+                split_col_name: ["test"] * len(test_samples),
+            }
+        )
+        train_df = pl.DataFrame(
+            {
+                "sample": train_samples,
+                split_col_name: ["train"] * len(train_samples),
+            }
+        )
 
         # Ensure consistent string dtypes even when one side is empty
         try:
-            test_df = test_df.with_columns(pl.col("sample").cast(pl.Utf8), pl.col(split_col_name).cast(pl.Utf8))
+            test_df = test_df.with_columns(
+                pl.col("sample").cast(pl.Utf8),
+                pl.col(split_col_name).cast(pl.Utf8),
+            )
         except Exception:
             pass
         try:
-            train_df = train_df.with_columns(pl.col("sample").cast(pl.Utf8), pl.col(split_col_name).cast(pl.Utf8))
+            train_df = train_df.with_columns(
+                pl.col("sample").cast(pl.Utf8),
+                pl.col(split_col_name).cast(pl.Utf8),
+            )
         except Exception:
             pass
 

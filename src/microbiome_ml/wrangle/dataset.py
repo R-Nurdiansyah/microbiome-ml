@@ -400,7 +400,9 @@ class Dataset:
 
         # Inner join with each subsequent component to get strict intersection
         for comp_name, comp_df in sample_dfs[1:]:
-            canonical_df = canonical_df.join(comp_df, on="sample", how="inner", coalesce=True)
+            canonical_df = canonical_df.join(
+                comp_df, on="sample", how="inner", coalesce=True
+            )
 
         # Sort for deterministic ordering and extract list
         self._sample_ids = (
@@ -485,7 +487,10 @@ class Dataset:
             for label, split_manager in self.splits.items():
                 if split_manager.holdout is not None:
                     split_manager.holdout = canonical_df.join(
-                        split_manager.holdout, on="sample", how="left", coalesce=True
+                        split_manager.holdout,
+                        on="sample",
+                        how="left",
+                        coalesce=True,
                     )
                 for scheme_name, cv_df in split_manager.cv_schemes.items():
                     split_manager.cv_schemes[scheme_name] = canonical_df.join(
@@ -602,7 +607,9 @@ class Dataset:
             overlap = new_cols.intersection(existing_cols)
             if overlap:
                 raise ValueError(f"Duplicate label columns: {overlap}")
-            self.labels = self.labels.join(new_df, on="sample", how="outer", coalesce=True)
+            self.labels = self.labels.join(
+                new_df, on="sample", how="outer", coalesce=True
+            )
 
         self._sync_accessions()
         return self
@@ -876,7 +883,9 @@ class Dataset:
                         f"Grouping '{grouping}' not found in groupings"
                     )
                 groups = self.groupings.select(["sample", grouping])
-                data = data.join(groups, on="sample", how="left", coalesce=True)
+                data = data.join(
+                    groups, on="sample", how="left", coalesce=True
+                )
 
             # Filter nulls
             initial_count = data.height
@@ -1017,7 +1026,9 @@ class Dataset:
 
                 if grouping_col is not None and self.groupings is not None:
                     groups = self.groupings.select(["sample", grouping_col])
-                    data = data.join(groups, on="sample", how="left", coalesce=True)
+                    data = data.join(
+                        groups, on="sample", how="left", coalesce=True
+                    )
 
                 # Filter nulls
                 initial_count = data.height

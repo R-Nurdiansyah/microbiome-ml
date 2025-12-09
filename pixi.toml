@@ -59,7 +59,11 @@ line_length = 79
 
 [tasks]
 lint = "flake8 --extend-ignore=E203,W503,D,E501 --per-file-ignores='**/conftest.py:E501' src/ test/tests/"
-format = "autoflake --remove-all-unused-imports --remove-unused-variables --in-place --recursive src/ test/tests/ && docformatter --in-place --wrap-summaries 79 --wrap-descriptions 79 --recursive src/ test/tests/ && black --line-length 79 src/ test/tests/ && isort src/ test/tests/"
+format-autoflake = "autoflake --remove-all-unused-imports --remove-unused-variables --in-place --recursive src/ test/tests/"
+format-docformatter = "docformatter --in-place --wrap-summaries 79 --wrap-descriptions 79 --recursive src/ test/tests/"
+format-isort = "isort src/ test/tests/"
+format-black = "black --line-length 79 src/ test/tests/"
+format = { depends-on = ["format-autoflake", "format-docformatter", "format-isort", "format-black"] }
 type-check = "mypy src/"
 docs-serve = "mkdocs serve"
 docs-build = "mkdocs build"
@@ -67,6 +71,7 @@ pre-commit-install = "pre-commit install"
 clean = "find . -type d -name __pycache__ -delete && find . -name '*.pyc' -delete"
 install-dev = "pip install -e ."
 test = { depends-on = ["install-dev"], cmd = "pytest test/tests/" }
+local-check = { depends-on = ["lint", "type-check", "test"] }
 
 
 [environments]
