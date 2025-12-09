@@ -773,15 +773,6 @@ class TaxonomicProfiles:
         features = (
             profiles_lf.filter(pl.col("taxonomy").str.contains(rank.prefix))
             .select(["sample", "taxonomy", "relabund"])
-            # extract the rank token (e.g. "p__Actinobacteriota") into 'taxon'
-            .with_columns(
-                pl.col("taxonomy")
-                .map_elements(
-                    lambda s: next(
-                        (part.strip() for part in s.split(";") if part.strip().startswith(rank.prefix)),
-                        s,
-                    )
-                ).alias("taxonomy"))
             .collect()
             .pivot(
                 values="relabund",
