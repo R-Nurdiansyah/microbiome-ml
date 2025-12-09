@@ -22,6 +22,7 @@ pytest-mock = ">=3.10.0"
 black = ">=23.0.0"
 isort = ">=5.12.0"
 flake8 = ">=6.0.0"
+flake8-pyproject = ">=1.2.0"
 mypy = ">=1.0.0"
 pre-commit = ">=3.0.0"
 hypothesis = ">=6.0.0"
@@ -61,8 +62,8 @@ line_length = 79
 lint = "flake8 --extend-ignore=E203,W503,D,E501 --per-file-ignores='**/conftest.py:E501' src/ test/tests/"
 format-autoflake = "autoflake --remove-all-unused-imports --remove-unused-variables --in-place --recursive src/ test/tests/"
 format-docformatter = "docformatter --in-place --wrap-summaries 79 --wrap-descriptions 79 --recursive src/ test/tests/"
-format-isort = "isort src/ test/tests/"
-format-black = "black --line-length 79 src/ test/tests/"
+format-isort = "isort src/ test/tests/"  # Reads from pyproject.toml
+format-black = "black src/ test/tests/"  # Reads from pyproject.toml
 format = { depends-on = ["format-autoflake", "format-docformatter", "format-isort", "format-black"] }
 type-check = "mypy src/"
 docs-serve = "mkdocs serve"

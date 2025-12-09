@@ -61,11 +61,12 @@ dev = [
 where = ["src"]
 
 [tool.black]
-line-length = 88
+line-length = 79
 target-version = ["py39"]
 
 [tool.isort]
 profile = "black"
+line_length = 79
 multi_line_output = 3
 
 [tool.mypy]
@@ -78,7 +79,7 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = [
     "netcdf4.*",
-    "rasterio.*", 
+    "rasterio.*",
     "cdsapi.*",
     "geopandas.*",
     "fiona.*",
@@ -90,6 +91,11 @@ module = [
     "tqdm.*",
 ]
 ignore_missing_imports = true
+
+[tool.flake8]
+max-line-length = 79
+extend-ignore = ["E203", "W503", "D", "E501"]
+per-file-ignores = ["**/conftest.py:E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["test/tests"]

@@ -8,26 +8,35 @@ repos:
       - id: check-added-large-files
       - id: check-merge-conflict
 
-  - repo: https://github.com/psf/black
-    rev: 23.7.0
+  - repo: https://github.com/PyCQA/autoflake
+    rev: v2.2.0
     hooks:
-      - id: black
-        language_version: python3
+      - id: autoflake
+        args: [--remove-all-unused-imports, --remove-unused-variables, --in-place]
 
   - repo: https://github.com/pycqa/isort
     rev: 5.12.0
     hooks:
       - id: isort
-        args: ["--profile", "black"]
+        # Reads line_length and profile from pyproject.toml
+
+  - repo: https://github.com/psf/black
+    rev: 23.7.0
+    hooks:
+      - id: black
+        # Reads line-length from pyproject.toml
+        language_version: python3
 
   - repo: https://github.com/pycqa/flake8
     rev: 6.0.0
     hooks:
       - id: flake8
-        args: [--max-line-length=88, --extend-ignore=E203]
+        # Reads config from pyproject.toml via flake8-pyproject
+        additional_dependencies: [flake8-pyproject]
 
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.5.1
     hooks:
       - id: mypy
         additional_dependencies: [types-requests]
+        # Reads config from pyproject.toml

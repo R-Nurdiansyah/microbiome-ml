@@ -66,11 +66,22 @@ pixi run local-check
 
 ## Code Style Guidelines
 
+### Configuration Location
+
+All code style settings are centralized in **[`pyproject.toml`](pyproject.toml)** to ensure consistency across all tools:
+
+- **Black** formatting rules: `[tool.black]`
+- **isort** import sorting: `[tool.isort]`
+- **mypy** type checking: `[tool.mypy]`
+- **flake8** linting: `[tool.flake8]` (via flake8-pyproject plugin)
+
+Both Pixi tasks and pre-commit hooks read from these configuration files, so you only need to update settings in one place.
+
 ### Python Style
 
-- **Line length**: 79 characters (to match Black configuration)
-- **Import sorting**: Uses `isort` with Black profile
-- **Code formatting**: Uses `black` formatter
+- **Line length**: 79 characters (configured in [`pyproject.toml`](pyproject.toml))
+- **Import sorting**: Uses `isort` with Black profile (configured in [`pyproject.toml`](pyproject.toml))
+- **Code formatting**: Uses `black` formatter (configured in [`pyproject.toml`](pyproject.toml))
 - **Docstring style**: Google-style docstrings, wrapped at 79 characters
 
 ### Type Hints
