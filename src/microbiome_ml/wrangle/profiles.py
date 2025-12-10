@@ -8,7 +8,7 @@ from typing import Any, List, Optional, Set, Type, Union
 import polars as pl
 
 from microbiome_ml.utils.taxonomy import TaxonomicRanks
-from microbiome_ml.wrangle.features import FeatureSet
+from microbiome_ml.wrangle.features import SampleFeatureSet
 
 logger = logging.getLogger(__name__)
 
@@ -409,7 +409,8 @@ class TaxonomicProfiles:
         invalid = comparison.filter(
             pl.col("parent_abundance") < (pl.col("child_sum") - 1e-10)
         )
-        return invalid.collect().height == 0
+        invalid_count = invalid.collect().height
+        return bool(invalid_count == 0)
 
     def _is_filled(self, sample_size: int = 1000) -> bool:
         """Check if profiles are in filled format.
@@ -540,13 +541,14 @@ class TaxonomicProfiles:
         Returns:
             List of unique sample IDs
         """
-        return (
+        samples: List[str] = (
             self.profiles.select("sample")
             .unique()
             .collect()
             .to_series()
             .to_list()
         )
+        return samples
 
     def filter_dominated_samples(
         self,
@@ -743,13 +745,14 @@ class TaxonomicProfiles:
 
     def create_features(
         self, rank: Union[str, TaxonomicRanks]
-    ) -> "FeatureSet":
-        """Create a FeatureSet from the taxonomic profiles at a specified rank.
+    ) -> SampleFeatureSet:
+        """Create a SampleFeatureSet from the taxonomic profiles at a specified
+        rank.
 
         Args:
             rank: Taxonomic rank to extract features from
         Returns:
-            FeatureSet instance with features at the specified rank
+            SampleFeatureSet instance with features at the specified rank
         """
         if self.profiles is None:
             raise ValueError("No profiles available to create features.")
@@ -784,6 +787,6 @@ class TaxonomicProfiles:
             )
         )
 
-        return FeatureSet.from_df(
+        return SampleFeatureSet.from_df(
             df=features, name=f"{rank.name.lower()}_features"
         )

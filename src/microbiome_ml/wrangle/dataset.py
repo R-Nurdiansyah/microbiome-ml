@@ -11,8 +11,18 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import polars as pl
 
+from microbiome_ml.core.config import (
+    AggregationConfig,
+    AggregationMethod,
+    WeightingStrategy,
+)
 from microbiome_ml.utils.taxonomy import TaxonomicRanks
-from microbiome_ml.wrangle.features import FeatureSet
+from microbiome_ml.wrangle.aggregation import FeatureAggregator
+from microbiome_ml.wrangle.features import (
+    FeatureSet,
+    SampleFeatureSet,
+    SpeciesFeatureSet,
+)
 from microbiome_ml.wrangle.metadata import SampleMetadata
 from microbiome_ml.wrangle.profiles import TaxonomicProfiles
 from microbiome_ml.wrangle.splits import SplitManager
@@ -73,7 +83,10 @@ class Dataset:
         # Initialize empty structure
         self.metadata: Optional[SampleMetadata] = None
         self.profiles: Optional[TaxonomicProfiles] = None
-        self.feature_sets: Dict[str, FeatureSet] = {}
+        self.feature_sets: Dict[str, FeatureSet] = {}  # Sample-wise features
+        self.species_feature_sets: Dict[
+            str, SpeciesFeatureSet
+        ] = {}  # Species-wise features
         self.labels: Optional[pl.DataFrame] = None
         self.groupings: Optional[pl.DataFrame] = None
         self.splits: Dict[str, SplitManager] = {}
@@ -243,7 +256,7 @@ class Dataset:
             self.feature_sets[name] = feature_set
         # Create directly from components
         elif accessions and feature_names and feature_array is not None:
-            self.feature_sets[name] = FeatureSet(
+            self.feature_sets[name] = SampleFeatureSet(
                 accessions=accessions,
                 feature_names=feature_names,
                 features=feature_array,
@@ -255,6 +268,336 @@ class Dataset:
             )
 
         return self
+
+    def add_species_features(
+        self,
+        name: str,
+        species_features: Optional[SpeciesFeatureSet] = None,
+        species_ids: Optional[List[str]] = None,
+        feature_names: Optional[List[str]] = None,
+        feature_array: Optional[np.ndarray] = None,
+        data: Optional[Union[str, Path, pl.DataFrame, pl.LazyFrame]] = None,
+        accession_col: str = "species",
+        **kwargs: Any,
+    ) -> "Dataset":
+        """Add species-wise feature set with flexible input handling.
+
+        Args:
+            name: Name for the species feature set
+            species_features: SpeciesFeatureSet instance
+            species_ids: List of species IDs
+            feature_names: List of feature names
+            feature_array: Feature data as numpy array
+            data: DataFrame, LazyFrame, or CSV path with species features
+            accession_col: Column name for species IDs in data (default: "species")
+            **kwargs: Additional parameters
+
+        Returns:
+            Self for chaining
+
+        Examples:
+            # From SpeciesFeatureSet instance
+            .add_species_features("traits", species_features=species_fs)
+
+            # From numpy arrays
+            .add_species_features("traits", species_ids=[...], feature_names=[...], feature_array=array)
+
+            # From DataFrame/LazyFrame
+            .add_species_features("traits", data=df, accession_col="species")
+
+            # From CSV file
+            .add_species_features("traits", data="species_traits.csv")
+        """
+        if isinstance(species_features, SpeciesFeatureSet):
+            self.species_feature_sets[name] = species_features
+        elif (
+            species_ids is not None
+            and feature_names is not None
+            and feature_array is not None
+        ):
+            self.species_feature_sets[name] = SpeciesFeatureSet(
+                accessions=species_ids,
+                feature_names=feature_names,
+                features=feature_array,
+                name=name,
+            )
+        elif data is not None:
+            # Load data from various sources
+            if isinstance(data, (str, Path)):
+                df = pl.read_csv(data)
+            elif isinstance(data, pl.LazyFrame):
+                df = data.collect()
+            elif isinstance(data, pl.DataFrame):
+                df = data
+            else:
+                raise ValueError(f"Unsupported data type: {type(data)}")
+
+            # Validate accession column exists
+            if accession_col not in df.columns:
+                raise ValueError(
+                    f"Accession column '{accession_col}' not found in data"
+                )
+
+            # Extract species IDs and feature columns
+            extracted_species_ids = (
+                df.select(accession_col).to_series().to_list()
+            )
+            feature_cols = [col for col in df.columns if col != accession_col]
+
+            if not feature_cols:
+                raise ValueError("No feature columns found in data")
+
+            # Convert to numpy array (species x features)
+            feature_matrix = df.select(feature_cols).to_numpy()
+
+            self.species_feature_sets[name] = SpeciesFeatureSet(
+                accessions=extracted_species_ids,
+                feature_names=feature_cols,
+                features=feature_matrix,
+                name=name,
+            )
+        else:
+            raise ValueError(
+                "Must provide SpeciesFeatureSet instance, species_ids+feature_names+feature_array, or data source"
+            )
+
+        return self
+
+    def aggregate_species_to_samples(
+        self,
+        species_feature_name: Optional[str] = None,
+        output_name: Optional[str] = None,
+        method: Optional[Union[str, AggregationMethod]] = None,
+        weighting: Optional[Union[str, WeightingStrategy]] = None,
+        k: int = 10,
+        min_abundance: float = 0.001,
+        create_all: bool = False,
+        **kwargs: Any,
+    ) -> "Dataset":
+        """Aggregate species-wise features to sample-wise features.
+
+        Note:
+            Aggregation requires taxonomic profiles with relative abundance data. If your
+            profiles contain coverage data, they will be automatically converted to relative
+            abundances during TaxonomicProfiles initialization.
+
+        Args:
+            species_feature_name: Name of species feature set to aggregate (required unless create_all=True)
+            output_name: Name for resulting sample feature set (auto-generated if None)
+            method: Aggregation method to use (default: ARITHMETIC_MEAN, or all if create_all=True)
+            weighting: Weighting strategy (default: NONE, or all if create_all=True)
+            k: Number of top species for top_k_abundant method
+            min_abundance: Minimum abundance threshold
+            create_all: If True, create all method×weighting×species_feature combinations
+            **kwargs: Additional aggregation parameters
+
+        Returns:
+            Self for chaining
+
+        Raises:
+            ValueError: If species feature set not found or profiles missing
+
+        Examples:
+            # Single aggregation
+            .aggregate_species_to_samples("traits", "sample_traits")
+
+            # Create all possible combinations
+            .aggregate_species_to_samples(create_all=True)
+
+            # All combinations for specific feature set
+            .aggregate_species_to_samples(species_feature_name="traits", create_all=True)
+        """
+        if self.profiles is None:
+            raise ValueError("TaxonomicProfiles required for aggregation")
+
+        if create_all or (species_feature_name is None and method is None):
+            # Create all possible combinations
+            return self._create_all_aggregations(
+                species_feature_name=species_feature_name,
+                k=k,
+                min_abundance=min_abundance,
+                **kwargs,
+            )
+
+        # Single aggregation mode
+        if species_feature_name is None:
+            raise ValueError(
+                "species_feature_name is required unless create_all=True"
+            )
+
+        if species_feature_name not in self.species_feature_sets:
+            raise ValueError(
+                f"Species feature set '{species_feature_name}' not found"
+            )
+
+        # Set defaults
+        if method is None:
+            method = AggregationMethod.ARITHMETIC_MEAN
+        if weighting is None:
+            weighting = WeightingStrategy.NONE
+
+        # Generate output name if not provided
+        if output_name is None:
+            method_str = (
+                method.value
+                if isinstance(method, AggregationMethod)
+                else str(method)
+            )
+            weight_str = (
+                weighting.value
+                if isinstance(weighting, WeightingStrategy)
+                else str(weighting)
+            )
+            output_name = f"{species_feature_name}_{method_str}_{weight_str}"
+
+        # Get species features
+        species_features = self.species_feature_sets[species_feature_name]
+
+        # Create aggregation config
+        config = AggregationConfig(
+            method=(
+                AggregationMethod(method)
+                if isinstance(method, str)
+                else method
+            ),
+            weighting=(
+                WeightingStrategy(weighting)
+                if isinstance(weighting, str)
+                else weighting
+            ),
+            k=k,
+            min_abundance=min_abundance,
+            **kwargs,
+        )
+
+        # Perform aggregation
+        aggregator = FeatureAggregator()
+        sample_features = aggregator.get_sample_features(
+            species_features=species_features,
+            relabund_lf=self.profiles.profiles,
+            config=config,
+        )
+
+        # Add to sample feature sets
+        self.feature_sets[output_name] = sample_features
+
+        return self
+
+    def _create_all_aggregations(
+        self,
+        species_feature_name: Optional[str] = None,
+        k: int = 10,
+        min_abundance: float = 0.001,
+        **kwargs: Any,
+    ) -> "Dataset":
+        """Create all possible aggregation combinations.
+
+        Args:
+            species_feature_name: Specific feature set name, or None for all
+            k: Number of top species for top_k_abundant method
+            min_abundance: Minimum abundance threshold
+            **kwargs: Additional aggregation parameters
+
+        Returns:
+            Self for chaining
+        """
+        if not self.species_feature_sets:
+            logger.warning(
+                "No species feature sets found, skipping aggregation"
+            )
+            return self
+
+        # Define aggregation methods to use
+        methods = [
+            AggregationMethod.ARITHMETIC_MEAN,
+            AggregationMethod.GEOMETRIC_MEAN,
+            AggregationMethod.HARMONIC_MEAN,
+            AggregationMethod.MEDIAN,
+            AggregationMethod.PRESENCE_ABSENCE,
+            AggregationMethod.MAX_ABUNDANCE,
+            AggregationMethod.MIN_ABUNDANCE,
+            AggregationMethod.TOP_K_ABUNDANT,
+        ]
+
+        # Define weighting strategies
+        weightings = [
+            WeightingStrategy.NONE,
+            WeightingStrategy.ABUNDANCE,
+            WeightingStrategy.SQRT_ABUNDANCE,
+        ]
+
+        # Determine which species feature sets to process
+        if species_feature_name is not None:
+            if species_feature_name not in self.species_feature_sets:
+                raise ValueError(
+                    f"Species feature set '{species_feature_name}' not found"
+                )
+            feature_names = [species_feature_name]
+        else:
+            feature_names = list(self.species_feature_sets.keys())
+
+        created_count = 0
+
+        # Create all combinations
+        for feat_name in feature_names:
+            for method in methods:
+                for weighting in weightings:
+                    # Skip invalid combinations
+                    if (
+                        method == AggregationMethod.PRESENCE_ABSENCE
+                        and weighting != WeightingStrategy.NONE
+                    ):
+                        continue  # Presence/absence doesn't use weighting
+
+                    # Generate descriptive output name
+                    method_str = method.value
+                    weight_str = weighting.value
+                    output_name = f"{feat_name}_{method_str}_{weight_str}"
+
+                    # Skip if already exists
+                    if output_name in self.feature_sets:
+                        logger.debug(
+                            f"Skipping existing feature set: {output_name}"
+                        )
+                        continue
+
+                    try:
+                        # Create aggregation
+                        self.aggregate_species_to_samples(
+                            species_feature_name=feat_name,
+                            output_name=output_name,
+                            method=method,
+                            weighting=weighting,
+                            k=k,
+                            min_abundance=min_abundance,
+                            **kwargs,
+                        )
+                        created_count += 1
+
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to create aggregation {output_name}: {e}"
+                        )
+                        continue
+
+        logger.info(f"Created {created_count} aggregated feature sets")
+        return self
+
+    def iter_species_feature_sets(
+        self, names: Optional[List[str]] = None
+    ) -> Any:  # Returns generator
+        """Iterate over species feature sets.
+
+        Args:
+            names: List of species feature set names to iterate over (all if None)
+
+        Yields:
+            Tuple of (name, SpeciesFeatureSet) for each species feature set
+        """
+        if names is None:
+            names = list(self.species_feature_sets.keys())
+        for name in names:
+            yield name, self.species_feature_sets[name]
 
     def iter_feature_sets(
         self, names: Optional[List[str]] = None
@@ -428,7 +771,7 @@ class Dataset:
                 )
 
         # Warn if no samples remain after intersection
-        if len(self._sample_ids) == 0:
+        if self._sample_ids is None or len(self._sample_ids) == 0:
             warnings.warn(
                 "Accession synchronization resulted in empty sample set (no samples common to all components). "
                 "No filtering will be performed. Check that your components have overlapping sample IDs.",
@@ -1493,13 +1836,13 @@ class Dataset:
                         cv_path = label_dir / f"cv_{scheme_name}.csv"
                         if cv_path.exists():
                             if lazy:
-                                split_manager.cv_schemes[scheme_name] = (
-                                    pl.scan_csv(cv_path).collect()
-                                )
+                                split_manager.cv_schemes[
+                                    scheme_name
+                                ] = pl.scan_csv(cv_path).collect()
                             else:
-                                split_manager.cv_schemes[scheme_name] = (
-                                    pl.read_csv(cv_path)
-                                )
+                                split_manager.cv_schemes[
+                                    scheme_name
+                                ] = pl.read_csv(cv_path)
 
                     dataset.splits[label] = split_manager
 

@@ -4,6 +4,7 @@ This module provides comprehensive configuration classes for all major
 processing workflows in the microbiome ML pipeline.
 """
 
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Union
@@ -17,7 +18,13 @@ class AggregationMethod(Enum):
 
     ARITHMETIC_MEAN = "arithmetic_mean"
     GEOMETRIC_MEAN = "geometric_mean"
+    HARMONIC_MEAN = "harmonic_mean"
     MEDIAN = "median"
+    PRESENCE_ABSENCE = "presence_absence"
+    TOP_K_ABUNDANT = "top_k_abundant"
+    MAX_ABUNDANCE = "max_abundance"
+    MIN_ABUNDANCE = "min_abundance"
+    # Legacy methods for backward compatibility
     MAX = "max"
     MIN = "min"
     SUM = "sum"
@@ -27,11 +34,42 @@ class AggregationMethod(Enum):
 class WeightingStrategy(Enum):
     """Enumeration of available weighting strategies."""
 
+    NONE = "none"
     ABUNDANCE = "abundance"
+    SQRT_ABUNDANCE = "sqrt_abundance"
+    # Legacy strategies for backward compatibility
     UNIFORM = "uniform"
     INVERSE_ABUNDANCE = "inverse_abundance"
     LOG_ABUNDANCE = "log_abundance"
     PRESENCE_ABSENCE = "presence_absence"
+
+
+@dataclass
+class AggregationConfig:
+    """Configuration for feature aggregation operations."""
+
+    method: AggregationMethod
+    weighting: WeightingStrategy = WeightingStrategy.ABUNDANCE
+    uncommon_feature_cutoff: int = 10
+    pseudocount: float = 1e-8
+    min_abundance: float = 0.001
+    k: int = 10  # for top_k_abundant method
+
+    def __post_init__(self) -> None:
+        """Validate configuration after initialization."""
+        if not isinstance(self.method, AggregationMethod):
+            if isinstance(self.method, str):
+                self.method = AggregationMethod(self.method)
+            else:
+                raise ValueError(f"Invalid aggregation method: {self.method}")
+
+        if not isinstance(self.weighting, WeightingStrategy):
+            if isinstance(self.weighting, str):
+                self.weighting = WeightingStrategy(self.weighting)
+            else:
+                raise ValueError(
+                    f"Invalid weighting strategy: {self.weighting}"
+                )
 
 
 class Config:

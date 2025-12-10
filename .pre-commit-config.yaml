@@ -47,5 +47,6 @@ repos:
     rev: v1.5.1
     hooks:
       - id: mypy
+        files: ^src/
         additional_dependencies: [types-requests]
         # Reads config from pyproject.toml

@@ -65,7 +65,7 @@ format-docformatter = "docformatter --in-place --wrap-summaries 79 --wrap-descri
 format-isort = "isort src/ test/tests/"  # Reads from pyproject.toml
 format-black = "black src/ test/tests/"  # Reads from pyproject.toml
 format = { depends-on = ["format-autoflake", "format-docformatter", "format-isort", "format-black"] }
-type-check = "mypy src/"
+type-check = "mypy"
 docs-serve = "mkdocs serve"
 docs-build = "mkdocs build"
 pre-commit-install = "pre-commit install"
