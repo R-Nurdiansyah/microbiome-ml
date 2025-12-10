@@ -1259,6 +1259,7 @@ class Dataset:
             str
         ] = "all",  # New default: "all" creates all schemes
         random_state: int = 42,
+        use_holdout: bool = False,
         force: bool = False,
     ) -> "Dataset":
         """Create k-fold cross-validation splits for one or all labels.
@@ -1373,6 +1374,36 @@ class Dataset:
                         groups, on="sample", how="left", coalesce=True
                     )
 
+                # and if use_holdout, merge holdout info and filter sample with split == train
+                if use_holdout:
+                    # Narrow the SplitManager and its holdout to local names so
+                    # the type checker can reason that `holdout` is not None
+                    # before calling DataFrame methods like `.filter()`.
+                    if lbl not in self.splits:
+                        raise ValueError(
+                            f"Holdout split for label '{lbl}' not found. "
+                            f"Create holdout split before using use_holdout=True."
+                        )
+                    split_manager = self.splits[lbl]
+                    if split_manager.holdout is None:
+                        raise ValueError(
+                            f"Holdout split for label '{lbl}' not found. "
+                            f"Create holdout split before using use_holdout=True."
+                        )
+
+                    holdout_df = split_manager.holdout.filter(
+                        pl.col("split") == "train"
+                    ).select("sample")
+
+                    # Keep only samples present in the holdout TRAIN set.
+                    # Use inner join here (not left) so non-holdout samples are removed.
+                    data = data.join(
+                        holdout_df,
+                        on="sample",
+                        how="inner",
+                        coalesce=True
+                    )
+
                 # Filter nulls
                 initial_count = data.height
                 null_cols = (
@@ -1392,6 +1423,7 @@ class Dataset:
                     n_bins=n_bins,
                     random_state=random_state,
                     scheme_name=scheme_name,
+                    use_holdout=use_holdout
                 )
 
         return self
