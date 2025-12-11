@@ -130,9 +130,12 @@ for name, feature_set in dataset.feature_sets.items():
     # e.g., "tax_genus", "sample_genes", "pathway_features_arithmetic_mean_none"
 ```
 
-# Save and load (human-readable directory structure)
+# Save and load (human-readable directory structure) and Result visualization
+```python
 dataset.save("path/to/save/dataset", compress=True)  # .tar.gz
+dataset.save("path/to/save/dataset") # saved in directory
 dataset = Dataset.load("path/to/save/dataset.tar.gz")
+dataset = Dataset.load("path/to/save/dataset") #load from directory
 
 # Machine learning - iterates over all feature sets, models, and labels
 cv = CrossValidator(
