@@ -152,3 +152,29 @@ def test_params_and_model_saving(tmp_path):
     loaded = CV_Result.load_model(out_model)
     # loaded object should be an estimator with predict
     assert hasattr(loaded, "predict")
+
+
+def test_string_alias_and_mixed_models(tmp_path):
+    samples = [f"s{i}" for i in range(6)]
+    X = np.arange(12).reshape(6, 2).astype(float)
+    y = X[:, 0] * 1.0 + np.random.RandomState(2).randn(6) * 0.01
+    ds = DummyDataset(samples, X, y)
+
+    p = tmp_path / "params.json"
+    p.write_text(json.dumps({}))
+
+    cv = CrossValidator(
+        ds,
+        models=["rf", LinearRegression()],
+        cv_folds=2,
+        label="target",
+        scheme="schemeA",
+    )
+
+    res_run = cv.run(param_path=str(p))
+    assert isinstance(res_run, dict)
+    assert len(res_run) >= 1
+
+    res_grid = cv.run_grid(param_path=str(p))
+    assert isinstance(res_grid, dict)
+    assert len(res_grid) >= 1

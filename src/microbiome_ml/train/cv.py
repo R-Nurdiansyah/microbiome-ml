@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -148,6 +149,23 @@ class CrossValidator:
             self.best_result_key = key
             self.best_result = cv_result
             self.best_model_estimator = estimator
+
+    def _select_n_jobs(
+        self,
+        grid: object,
+        user_n_jobs: Optional[int],
+        params_per_job: int = 2,
+    ) -> int:
+        if user_n_jobs is not None:
+            return int(user_n_jobs)
+        try:
+            combos = len(list(ParameterGrid(grid)))
+        except Exception:
+            combos = 1
+        cpus = os.cpu_count() or 1
+        # determine number of parallel jobs: one job per `params_per_job` combos
+        calc = max(1, combos // max(1, params_per_job))
+        return min(cpus, calc)
 
     def run(
         self,
@@ -318,6 +336,8 @@ class CrossValidator:
     def run_grid(
         self,
         param_path: str = "hyperparameters.yaml",
+        n_jobs: Optional[int] = None,
+        params_per_job: int = 2,
     ) -> dict:
         """Performs grid search cross-validation using predefined splits.
 
@@ -407,16 +427,32 @@ class CrossValidator:
                     grid = param_grids.get(model_key, [{}])
                     estimator = _MODEL_CONSTRUCTORS[model_key]()
                 else:
-                    grid = [{}]
+                    # estimator instance: prefer class-name key, then canonical short keys
+                    est_name = model.__class__.__name__.lower()
+                    grid = param_grids.get(est_name, None)
+                    if grid is None:
+                        canon = None
+                        for k, ctor in _MODEL_CONSTRUCTORS.items():
+                            try:
+                                if isinstance(model, ctor().__class__):
+                                    canon = k
+                                    break
+                            except Exception:
+                                continue
+                        grid = (
+                            param_grids.get(canon, [{}])
+                            if canon is not None
+                            else [{}]
+                        )
                     estimator = model
-
+                n_jobs_use = self._select_n_jobs(grid, n_jobs, params_per_job)
                 gs = GridSearchCV(
                     estimator=estimator,
                     param_grid=grid,
                     cv=ps,
                     scoring=scorers,
                     refit="r2",
-                    n_jobs=-1,
+                    n_jobs=n_jobs_use,
                 )
                 gs.fit(X_arr, y_arr)
                 cvres = gs.cv_results_
@@ -440,10 +476,13 @@ class CrossValidator:
                     validation_r2_per_fold=per_r2,
                     validation_mse_per_fold=per_mse,
                 )
+                # attach best hyperparameters from GridSearchCV if present
+                cv_result.best_params = getattr(gs, "best_params_", None)
                 results[result_key] = cv_result
                 self._update_best_model(
                     result_key, cv_result, estimator=gs.best_estimator_
                 )
+                logger.info(f"Best hyperparameters: {gs.best_params_}\n")
         return results
 
     def _prepare_inputs(

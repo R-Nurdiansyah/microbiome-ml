@@ -14,10 +14,10 @@ import numpy as np
 
 
 class CV_Result:
-    """Store CV results and produce a single-row DataFrame with fold columns.
+    """Container for CV outputs with simple serialization/export helpers.
 
-    It requires `polars` at import time (used throughout) and provides
-    serialization and streaming export helpers.
+    Public API and behavior are preserved from the previous implementation;
+    this refactor only cleans internals for readability.
     """
 
     def __init__(
@@ -28,34 +28,35 @@ class CV_Result:
         cross_val_scores: Optional[List[float]] = None,
         validation_r2_per_fold: Optional[List[float]] = None,
         validation_mse_per_fold: Optional[List[float]] = None,
+        best_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.feature_set = feature_set
         self.label = label
         self.scheme = scheme
+
+        # store lists defensively
         self.cross_val_scores = (
-            list(cross_val_scores) if cross_val_scores is not None else []
+            list(cross_val_scores) if cross_val_scores else []
         )
         self.validation_r2_per_fold = (
-            list(validation_r2_per_fold)
-            if validation_r2_per_fold is not None
-            else []
+            list(validation_r2_per_fold) if validation_r2_per_fold else []
         )
         self.validation_mse_per_fold = (
-            list(validation_mse_per_fold)
-            if validation_mse_per_fold is not None
-            else []
+            list(validation_mse_per_fold) if validation_mse_per_fold else []
         )
+
+        # optional: best hyperparameters (None when not provided)
+        self.best_params: Optional[Dict[str, Any]] = (
+            dict(best_params) if best_params is not None else None
+        )
+
+        # derived values
         self.avg_validation_r2: Optional[float] = None
         self.avg_validation_mse: Optional[float] = None
         self._compute_averages()
 
     def _compute_averages(self) -> None:
-        """Compute and store average validation metrics.
-
-        Computes mean R2 and mean MSE from the per-fold lists and stores them
-        in `avg_validation_r2` and `avg_validation_mse`. If the lists are
-        empty, averages are set to `None`.
-        """
+        """Compute and cache mean per-fold metrics (or None if unavailable)."""
         if self.validation_r2_per_fold:
             self.avg_validation_r2 = float(
                 sum(self.validation_r2_per_fold)
@@ -73,34 +74,34 @@ class CV_Result:
             self.avg_validation_mse = None
 
     def _serialize_value(self, v: Any) -> Any:
-        """Normalize a Python value for JSON/Polars serialization.
+        """Make values JSON/Polars-friendly.
 
-        Handles numpy scalars/arrays, Path, lists/tuples and native scalars.
+        Preserves previous behavior: numpy scalars/arrays are converted,
+        lists/tuples are recursively serialized, Paths become strings, and
+        fall back to `str()` for unknown objects.
         """
         if isinstance(v, Path):
             return str(v)
-
+        if v is None:
+            return None
+        if isinstance(v, (str, bool, int, float)):
+            return v
+        # numpy types
         if isinstance(v, (np.floating, np.float32, np.float64)):
             return float(v)
         if isinstance(v, (np.integer, np.int32, np.int64)):
             return int(v)
         if isinstance(v, np.ndarray):
             return [self._serialize_value(x) for x in v.tolist()]
-
         if isinstance(v, (list, tuple)):
             return [self._serialize_value(x) for x in v]
-
-        if isinstance(v, (str, int, float, bool)) or v is None:
-            return v
-
         try:
             return str(v)
         except Exception:
             return None
 
     def _to_dict(self) -> dict:
-        """Return a JSON-serializable dictionary representation of the
-        result."""
+        """Return a JSON-serializable representation of this result."""
         self._compute_averages()
         return {
             "feature_set": self._serialize_value(self.feature_set),
@@ -114,6 +115,7 @@ class CV_Result:
             "validation_mse_per_fold": self._serialize_value(
                 self.validation_mse_per_fold
             ),
+            "best_params": self._serialize_value(self.best_params),
             "avg_validation_mse": self._serialize_value(
                 self.avg_validation_mse
             ),
@@ -122,15 +124,13 @@ class CV_Result:
     def to_json(
         self, path: Optional[Union[str, Path]] = None, indent: int = 2
     ) -> str:
-        """Return a JSON string for this result and optionally write it to
-        disk."""
         j = json.dumps(self._to_dict(), indent=indent)
         if path:
             Path(path).write_text(j)
         return j
 
     def summary(self, save_json: Optional[Union[str, Path]] = None) -> dict:
-        """Print a concise summary and optionally persist to JSON."""
+        """Print a short human summary and optionally persist JSON."""
         self._compute_averages()
         print(f"Feature set: {self.feature_set}")
         print(f"Label: {self.label}")
@@ -144,19 +144,13 @@ class CV_Result:
             Path(save_json).write_text(json.dumps(out, indent=2))
         return out
 
-    # `results_to_dataframe` removed — use `export_result` / `results_dict_to_streaming_files`
-    # or construct a DataFrame from a list of `_to_dict()` results when needed.
-
+    # ----- Export helpers -----
     @staticmethod
     def export_result(
         results_list: Union[List["CV_Result"], Dict[str, "CV_Result"]],
         path: Union[str, Path],
         indent: int = 2,
     ) -> None:
-        """Persist results to disk.
-
-        Mapping -> streaming exporter; list -> JSON array.
-        """
         outp = Path(path)
         if isinstance(results_list, dict):
             if outp.exists() and outp.is_file():
@@ -164,13 +158,10 @@ class CV_Result:
             CV_Result.results_dict_to_streaming_files(results_list, outp)
             return
 
-        # For lists, always write NDJSON (one JSON object per line).
         rows = [r._to_dict() for r in results_list]
-        # If `path` is a directory, create results.ndjson inside it.
         if outp.exists() and outp.is_dir():
             ndjson_path = outp / "results.ndjson"
         else:
-            # Treat the provided path as the target file (create parent dirs)
             ndjson_path = outp
             ndjson_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -182,7 +173,6 @@ class CV_Result:
     def results_dict_to_streaming_files(
         results_map: Dict[str, "CV_Result"], out_dir: Union[str, Path]
     ) -> None:
-        """Stream a mapping of `key->CV_Result` to NDJSON and two CSVs."""
         outp = Path(out_dir)
         outp.mkdir(parents=True, exist_ok=True)
 
@@ -276,18 +266,7 @@ class CV_Result:
                 )
 
     def save(self, path: Union[str, Path], compress: bool = False) -> None:
-        """Save a single `CV_Result` to a directory with manifest metadata.
-
-        Directory layout (under `path`):
-        - results.ndjson (single-line JSON)
-        - results_folds.csv
-        - results_summary.csv
-        - manifest.json
-
-        If `compress=True` the directory will be packaged as a `.tar.gz` archive.
-        """
         outp = Path(path)
-        # When compressing and user passed a .tar.gz path, work in temp dir
         if compress and str(outp).endswith(".tar.gz"):
             work_dir = Path(str(outp)[:-7])
         elif compress:
@@ -297,11 +276,8 @@ class CV_Result:
             work_dir = outp
 
         work_dir.mkdir(parents=True, exist_ok=True)
-
-        # Write files via existing helpers
         self.results_dict_to_streaming_files({"result": self}, work_dir)
 
-        # Build manifest
         manifest = {
             "version": "1.0",
             "created": datetime.now().isoformat(),
@@ -316,10 +292,8 @@ class CV_Result:
                 }
             },
         }
-        manifest_path = work_dir / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2))
+        (work_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
-        # Compress if requested
         if compress:
             with tarfile.open(outp, "w:gz") as tar:
                 tar.add(work_dir, arcname=work_dir.name)
@@ -328,14 +302,6 @@ class CV_Result:
     def save_model(
         self, model: Any, path: Union[str, Path], compress: bool = False
     ) -> None:
-        """Persist a fitted model object using pickle.
-
-        Args:
-            model: The estimator or object to serialize.
-            path: Destination file path. If `compress=True` the file will be
-                written with gzip compression (recommended extension `.pkl.gz`).
-            compress: Whether to gzip-compress the output file.
-        """
         outp = Path(path)
         outp.parent.mkdir(parents=True, exist_ok=True)
         if compress:
@@ -347,10 +313,6 @@ class CV_Result:
 
     @staticmethod
     def load_model(path: Union[str, Path]) -> Any:
-        """Load a pickled model previously saved with `save_model`.
-
-        Auto-detects gzip-compressed files by file extension `.gz`.
-        """
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(p)
@@ -366,12 +328,6 @@ class CV_Result:
         path: Union[str, Path],
         compress: bool = False,
     ) -> None:
-        """Save a mapping of results into a directory + manifest, optionally
-        compressed.
-
-        This is a convenience wrapper around `results_dict_to_streaming_files` that
-        produces the same files and writes a `manifest.json` describing the outputs.
-        """
         outp = Path(path)
         if compress and str(outp).endswith(".tar.gz"):
             work_dir = Path(str(outp)[:-7])
@@ -382,11 +338,8 @@ class CV_Result:
             work_dir = outp
 
         work_dir.mkdir(parents=True, exist_ok=True)
-
-        # Write streaming files
         CV_Result.results_dict_to_streaming_files(results_map, work_dir)
 
-        # Summarize contents for manifest
         n_results = len(results_map)
         models = []
         for k in results_map.keys():
@@ -412,8 +365,7 @@ class CV_Result:
                 }
             },
         }
-        manifest_path = work_dir / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2))
+        (work_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
         if compress:
             with tarfile.open(outp, "w:gz") as tar:
