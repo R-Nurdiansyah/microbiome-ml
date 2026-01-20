@@ -138,6 +138,8 @@ def test_params_and_model_saving(tmp_path):
     # two parameter combos should produce two results
     assert isinstance(res_run, dict)
     assert len(res_run) == 2
+    for entry in res_run.values():
+        assert entry.model is not None
 
     # run_grid should produce a best estimator we can save/load
     res_grid = cv.run_grid(param_path=str(p))
@@ -178,3 +180,37 @@ def test_string_alias_and_mixed_models(tmp_path):
     res_grid = cv.run_grid(param_path=str(p))
     assert isinstance(res_grid, dict)
     assert len(res_grid) >= 1
+
+
+def test_export_result_writes_manifest_and_models(tmp_path):
+    samples = [f"s{i}" for i in range(6)]
+    X = np.arange(12).reshape(6, 2).astype(float)
+    y = X[:, 0] * 1.0 + np.random.RandomState(3).randn(6) * 0.01
+    ds = DummyDataset(samples, X, y)
+
+    payload = {"linearregression": {"fit_intercept": [True]}}
+    p = tmp_path / "params.json"
+    p.write_text(json.dumps(payload))
+
+    cv = CrossValidator(
+        ds,
+        models=LinearRegression(),
+        cv_folds=2,
+        label="target",
+        scheme="schemeA",
+    )
+    res = cv.run(param_path=str(p))
+    out_dir = tmp_path / "cv_export"
+    CV_Result.export_result(res, out_dir)
+
+    assert (out_dir / "manifest.json").exists()
+    assert (out_dir / "results.ndjson").exists()
+    assert (out_dir / "results_summary.csv").exists()
+    models = list((out_dir / "models").rglob("*.pkl"))
+    assert models
+
+    first_result = next(iter(res.values()))
+    single_dir = tmp_path / "single_result"
+    single_dir.mkdir(parents=True, exist_ok=True)
+    CV_Result.save_cv_result(first_result, single_dir)
+    assert (single_dir / "results.ndjson").exists()

@@ -1,23 +1,12 @@
-"""Plot ML result.
+"""Plot CV export history as histogram summaries.
 
-CV in form of histograms from NDJSON results.
-
-Loads a results NDJSON file (or a directory containing `results.ndjson`) produced
-by `CV_Result` exports and plots three histograms:
- - validation R² per fold (flattened across all results)
- - average validation R² per result
- - average validation MSE per result
+Loads a results NDJSON file (or a directory containing `results.ndjson`) created
+by `CV_Result.export_result`. It builds three charts that highlight per-fold
+validation R² (flattened), average validation R² per run, and average validation
+MSE per run so you can eyeball stability and spread across combinations.
 
 Usage:
-    python -m visualisations.visualisations --results path/to/results.ndjson --out figs.png
-
-If seaborn is available the script will use it for nicer defaults; otherwise
-it falls back to plain matplotlib.
-
-Example:
     from visualisations.visualisations import Visualiser
-
-    # let the Visualiser load the results and save the histogram
     vis = Visualiser("path/to/results.ndjson", out="figs.png")
     vis.plot_cv_bars()
 """
@@ -170,7 +159,7 @@ class Visualiser:
         bar_color: str = "#4c72b0",
         figsize_per_fold: float = 0.8,
     ) -> None:
-        """Plot bar chart (one file per combo) showing validation_r2_per_fold and avg_validation_r2.
+        """Plot bar chart (one file per combo, including model information) showing validation_r2_per_fold and avg_validation_r2.
 
         - Groups records by (feature_set, label, scheme).
         - Each group's file is saved as <feature_set>__<label>__<scheme>.png in `out_dir`
@@ -186,6 +175,7 @@ class Visualiser:
                 rec.get("feature_set") or "unknown_feature_set",
                 rec.get("label") or "unknown_label",
                 rec.get("scheme") or "unknown_scheme",
+                rec.get("model") or "unknown_model",
             )
             groups.setdefault(key, []).append(rec)
 
@@ -201,7 +191,9 @@ class Visualiser:
             s = re.sub(r"[^\w\-]+", "_", s)
             return s.strip("_") or "item"
 
-        for (feature_set, label, scheme), recs in sorted(groups.items()):
+        for (feature_set, label, scheme, model), recs in sorted(
+            groups.items()
+        ):
             # If multiple records per key, flatten their folds together in order
             folds: List[float] = []
             avg_r_vals: List[float] = []
@@ -289,8 +281,8 @@ class Visualiser:
             )
             ax.set_xlabel("Fold")
             ax.set_ylabel("Validation R²")
-            title = f"{feature_set} — {label} — {scheme}"
-            ax.set_title(title)
+            title = f"{feature_set} — {label} — {scheme} — {model}"
+            ax.set_title(title, wrap=True)
             ax.set_xticks(x)
 
             if show_values:
@@ -307,34 +299,23 @@ class Visualiser:
 
             ax.legend(loc="best")
             ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-            # place average mse text centered below the x-axis if available
+            # place average mse legend text below the axis so it clears the x-axis label
             if mse_val is not None:
                 try:
-                    # place relative to axis (outside) to avoid overlapping xlabel
-                    ax.annotate(
+                    fig.text(
+                        0.5,
+                        0.02,
                         f"average_mse = {mse_val:.3f}",
-                        xy=(0.5, -0.18),
-                        xycoords="axes fraction",
                         ha="center",
-                        va="top",
+                        va="bottom",
                         fontsize=9,
+                        color="#555555",
                     )
                 except Exception:
-                    # fallback to figure coords if annotate fails
-                    bbox = ax.get_position()
-                    fx = bbox.x0 + bbox.width / 2.0
-                    fy = bbox.y0 - 0.04
-                    fig.text(
-                        fx,
-                        fy,
-                        f"average_mse = {mse_val:.3f}",
-                        ha="center",
-                        va="top",
-                        fontsize=9,
-                    )
-            out_name = f"{_safe_name(feature_set)}__{_safe_name(label)}__{_safe_name(scheme)}.png"
+                    pass
+            out_name = f"{_safe_name(feature_set)}__{_safe_name(label)}__{_safe_name(scheme)}__{_safe_name(model)}.png"
             out_path = out_dir / out_name
-            fig.tight_layout()
+            fig.tight_layout(rect=(0, 0.05, 1, 0.95))
             fig.savefig(out_path, dpi=150)
             plt.close(fig)
             logging.info("Saved CV results to %s", out_path)

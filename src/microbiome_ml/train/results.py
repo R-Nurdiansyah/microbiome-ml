@@ -1,14 +1,25 @@
-# microbiome_ml/src/microbiome_ml/train/results.py
+"""Helpers for persisting CV_Result objects and their trained estimators.
+
+Typical workflow:
+
+    results = cv.run(param_path="hyperparameters.yaml")
+    # flush out manifests, ndjson/csv and per-combo model pickles
+    CV_Result.export_result(results, "out/cv_results")
+
+Use `CV_Result.save_cv_result(result, path)` when you just need the
+metadata for a single combo, and `CV_Result.save_model(estimator, path)` for
+pickling models on demand.  `load_model` can restore those pickles later.
+"""
 
 import csv
 import gzip
+import hashlib
 import json
 import pickle
-import shutil
-import tarfile
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 
@@ -29,6 +40,7 @@ class CV_Result:
         validation_r2_per_fold: Optional[List[float]] = None,
         validation_mse_per_fold: Optional[List[float]] = None,
         best_params: Optional[Dict[str, Any]] = None,
+        trained_model: Optional[Any] = None,
     ) -> None:
         self.feature_set = feature_set
         self.label = label
@@ -49,6 +61,9 @@ class CV_Result:
         self.best_params: Optional[Dict[str, Any]] = (
             dict(best_params) if best_params is not None else None
         )
+
+        # optional: trained estimator associated with this result
+        self.model: Optional[Any] = trained_model
 
         # derived values
         self.avg_validation_r2: Optional[float] = None
@@ -76,7 +91,7 @@ class CV_Result:
     def _serialize_value(self, v: Any) -> Any:
         """Make values JSON/Polars-friendly.
 
-        Preserves previous behavior: numpy scalars/arrays are converted,
+        numpy scalars/arrays are converted,
         lists/tuples are recursively serialized, Paths become strings, and
         fall back to `str()` for unknown objects.
         """
@@ -121,53 +136,145 @@ class CV_Result:
             ),
         }
 
-    def to_json(
-        self, path: Optional[Union[str, Path]] = None, indent: int = 2
-    ) -> str:
-        j = json.dumps(self._to_dict(), indent=indent)
-        if path:
-            Path(path).write_text(j)
-        return j
-
-    def summary(self, save_json: Optional[Union[str, Path]] = None) -> dict:
-        """Print a short human summary and optionally persist JSON."""
-        self._compute_averages()
-        print(f"Feature set: {self.feature_set}")
-        print(f"Label: {self.label}")
-        print(f"Scheme: {self.scheme}")
-        print(f"avg_validation_r2: {self.avg_validation_r2}")
-        print(f"avg_validation_mse: {self.avg_validation_mse}")
-        print(f"cross_val_scores: {self.cross_val_scores}")
-
-        out = self._to_dict()
-        if save_json:
-            Path(save_json).write_text(json.dumps(out, indent=2))
-        return out
-
     # ----- Export helpers -----
+
+    @staticmethod
+    def _sanitize_segment(value: Optional[str], fallback: str) -> str:
+        text = str(value) if value else fallback
+        sanitized = re.sub(r"[^A-Za-z0-9_\-\.]+", "_", text)
+        return sanitized.strip("_") or fallback
+
+    @staticmethod
+    def _sanitize_filename(value: str) -> str:
+        return CV_Result._sanitize_segment(value, "model")
+
+    @staticmethod
+    def _model_file_name(key: Optional[str]) -> str:
+        key_str = str(key) if key is not None else "model"
+        short_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:8]
+        label = CV_Result._sanitize_filename(key_str)[:120] or "model"
+        return f"{label}_{short_hash}.pkl"
+
+    @staticmethod
+    def _normalize_results_input(
+        values: Union[
+            "CV_Result", Sequence["CV_Result"], Dict[str, "CV_Result"]
+        ]
+    ) -> Dict[str, "CV_Result"]:
+        if isinstance(values, CV_Result):
+            return {"result": values}
+        if isinstance(values, dict):
+            if not all(isinstance(v, CV_Result) for v in values.values()):
+                raise TypeError("All values must be CV_Result instances")
+            return values
+        if isinstance(values, Sequence) and not isinstance(
+            values, (str, bytes)
+        ):
+            normalized: Dict[str, "CV_Result"] = {}
+            for idx, item in enumerate(values):
+                if not isinstance(item, CV_Result):
+                    raise TypeError(
+                        "Sequence items must be CV_Result instances"
+                    )
+                normalized[f"result_{idx}"] = item
+            return normalized
+        raise TypeError("Unsupported results payload passed to export_result")
+
+    @staticmethod
+    def _extract_metadata(
+        key: str, result: "CV_Result"
+    ) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
+        feature_set = result.feature_set
+        label = result.label
+        scheme = result.scheme
+        model_name: Optional[str] = None
+        if result.model is not None:
+            model_name = result.model.__class__.__name__
+        elif isinstance(key, str) and "::" in key:
+            try:
+                left, _ = key.rsplit("::", 1)
+                if "::" in left:
+                    _, model_name = left.rsplit("::", 1)
+                else:
+                    model_name = left
+            except Exception:  # pragma: no cover - conservative fallback
+                model_name = None
+        return feature_set or "unknown_feature_set", label, scheme, model_name
+
+    @staticmethod
+    def _combo_dir_name(result: "CV_Result") -> str:
+        feat = CV_Result._sanitize_segment(result.feature_set, "feature_set")
+        label = CV_Result._sanitize_segment(result.label, "label")
+        scheme = CV_Result._sanitize_segment(result.scheme, "scheme")
+        return f"{feat};{label};{scheme}"
+
     @staticmethod
     def export_result(
-        results_list: Union[List["CV_Result"], Dict[str, "CV_Result"]],
+        results: Union[
+            "CV_Result", Sequence["CV_Result"], Dict[str, "CV_Result"]
+        ],
         path: Union[str, Path],
         indent: int = 2,
     ) -> None:
-        outp = Path(path)
-        if isinstance(results_list, dict):
-            if outp.exists() and outp.is_file():
-                outp = outp.parent
-            CV_Result.results_dict_to_streaming_files(results_list, outp)
-            return
+        results_map = CV_Result._normalize_results_input(results)
+        out_dir = Path(path)
+        if out_dir.exists() and out_dir.is_file():
+            out_dir = out_dir.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        rows = [r._to_dict() for r in results_list]
+        CV_Result.results_dict_to_streaming_files(results_map, out_dir)
+
+        models_dir = out_dir / "models"
+        model_files: List[str] = []
+        for key, result in results_map.items():
+            model_obj = getattr(result, "model", None)
+            if model_obj is None:
+                continue
+            model_path = (
+                models_dir
+                / CV_Result._combo_dir_name(result)
+                / CV_Result._model_file_name(key)
+            )
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            CV_Result.save_model(model_obj, model_path)
+            model_files.append(str(model_path.relative_to(out_dir)))
+
+        manifest = {
+            "version": "1.0",
+            "created": datetime.now().isoformat(),
+            "components": {
+                "results": {
+                    "files": [
+                        "results.ndjson",
+                        "results_summary.csv",
+                        "results_folds.csv",
+                    ],
+                    "n_results": len(results_map),
+                },
+                "models": {
+                    "path": "models",
+                    "n_models": len(model_files),
+                    "files": model_files,
+                },
+            },
+        }
+        (out_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=indent)
+        )
+
+    @staticmethod
+    def save_cv_result(
+        result: "CV_Result",
+        path: Union[str, Path],
+    ) -> None:
+        outp = Path(path)
         if outp.exists() and outp.is_dir():
             ndjson_path = outp / "results.ndjson"
         else:
             ndjson_path = outp
             ndjson_path.parent.mkdir(parents=True, exist_ok=True)
-
         with ndjson_path.open("w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row, default=str) + "\n")
+            f.write(json.dumps(result._to_dict(), default=str) + "\n")
 
     @staticmethod
     def results_dict_to_streaming_files(
@@ -212,22 +319,12 @@ class CV_Result:
             )
 
             for key, res in results_map.items():
-                model_name = None
-                feat_name = res.feature_set
-                label_name = res.label
-                scheme_name = res.scheme
-                if isinstance(key, str) and "::" in key:
-                    try:
-                        left, model_name = key.rsplit("::", 1)
-                        parts = left.split("::")
-                        if len(parts) >= 1:
-                            feat_name = parts[0]
-                        if len(parts) >= 2:
-                            label_name = parts[1]
-                        if len(parts) >= 3:
-                            scheme_name = parts[2]
-                    except Exception:
-                        model_name = None
+                (
+                    feat_name,
+                    label_name,
+                    scheme_name,
+                    model_name,
+                ) = CV_Result._extract_metadata(key, res)
 
                 out_record = res._to_dict()
                 out_record["model"] = model_name
@@ -265,42 +362,9 @@ class CV_Result:
                     ]
                 )
 
-    def save(self, path: Union[str, Path], compress: bool = False) -> None:
-        outp = Path(path)
-        if compress and str(outp).endswith(".tar.gz"):
-            work_dir = Path(str(outp)[:-7])
-        elif compress:
-            work_dir = outp
-            outp = Path(str(outp) + ".tar.gz")
-        else:
-            work_dir = outp
-
-        work_dir.mkdir(parents=True, exist_ok=True)
-        self.results_dict_to_streaming_files({"result": self}, work_dir)
-
-        manifest = {
-            "version": "1.0",
-            "created": datetime.now().isoformat(),
-            "components": {
-                "results": {
-                    "files": [
-                        "results.ndjson",
-                        "results_folds.csv",
-                        "results_summary.csv",
-                    ],
-                    "n_results": 1,
-                }
-            },
-        }
-        (work_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-
-        if compress:
-            with tarfile.open(outp, "w:gz") as tar:
-                tar.add(work_dir, arcname=work_dir.name)
-            shutil.rmtree(work_dir)
-
+    @staticmethod
     def save_model(
-        self, model: Any, path: Union[str, Path], compress: bool = False
+        model: Any, path: Union[str, Path], compress: bool = False
     ) -> None:
         outp = Path(path)
         outp.parent.mkdir(parents=True, exist_ok=True)
@@ -321,53 +385,3 @@ class CV_Result:
                 return pickle.load(f)
         with p.open("rb") as f:
             return pickle.load(f)
-
-    @staticmethod
-    def save_mapping(
-        results_map: Dict[str, "CV_Result"],
-        path: Union[str, Path],
-        compress: bool = False,
-    ) -> None:
-        outp = Path(path)
-        if compress and str(outp).endswith(".tar.gz"):
-            work_dir = Path(str(outp)[:-7])
-        elif compress:
-            work_dir = outp
-            outp = Path(str(outp) + ".tar.gz")
-        else:
-            work_dir = outp
-
-        work_dir.mkdir(parents=True, exist_ok=True)
-        CV_Result.results_dict_to_streaming_files(results_map, work_dir)
-
-        n_results = len(results_map)
-        models = []
-        for k in results_map.keys():
-            if isinstance(k, str) and "::" in k:
-                try:
-                    _, model = k.rsplit("::", 1)
-                    models.append(model)
-                except Exception:
-                    pass
-
-        manifest = {
-            "version": "1.0",
-            "created": datetime.now().isoformat(),
-            "components": {
-                "results": {
-                    "files": [
-                        "results.ndjson",
-                        "results_folds.csv",
-                        "results_summary.csv",
-                    ],
-                    "n_results": n_results,
-                    "models": list(sorted(set(models))) if models else None,
-                }
-            },
-        }
-        (work_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-
-        if compress:
-            with tarfile.open(outp, "w:gz") as tar:
-                tar.add(work_dir, arcname=work_dir.name)
-            shutil.rmtree(work_dir)

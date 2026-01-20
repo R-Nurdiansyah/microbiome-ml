@@ -158,20 +158,33 @@ results = cv.run(param_path="parameters.yaml")
 
 # Grid Cross validation run
 results_grid = cv.run_grid(param_path="hyperparameters.yaml")
-000
+
 # Save model and result
 from microbiome_ml.train.results import CV_Result
+
+# Persist all CV outputs: manifest, results.ndjson, a summary CSV and per-combo
+# model pickles under models/<feature_set>;<label>;<scheme>
+CV_Result.export_result(results, "out/results")
+CV_Result.export_result(results_grid, "out/grid-results")
+
 if cv.best_model_estimator is not None and cv.best_result is not None:
-# Save the best estimator (gzip recommended, .pkl.gz)
-cv.best_result.save_model(cv.best_model_estimator, "out/best_model.pkl.gz", compress=True)
+    # Save the best estimator (gzip recommended, .pkl.gz) and its CV record alone
+    CV_Result.save_model(
+        cv.best_model_estimator, "out/best_model.pkl.gz", compress=True
+    )
+    CV_Result.save_cv_result(cv.best_result, "out/best_result.ndjson")
 
-# Persist results mapping or a single CV_Result
-CV_Result.save_mapping(results, "out/results", compress=True)
+## Visualization
 
-# Visualization
 visualiser = Visualiser(results)
 visualiser.plot_performance_metrics()
 visualiser.plot_feature_importances()
+
+# Plot CV result in barplot
+visualiser.plot_cv_bars(out_dir="out/cv_bars")  # creates per combo histograms
+
+plot_cv_bars consumes the result NDJSON (or directory) and writes one PNG per feature set / label / scheme / model
+combination. Filenames embed each dimension (e.g., Feature_Set__label__scheme__model.png).
 ```
 
 ## Development

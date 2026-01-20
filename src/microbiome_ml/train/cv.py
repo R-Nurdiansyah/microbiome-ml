@@ -1,3 +1,16 @@
+"""Cross-validation helpers and command-line usage sample for CV exports.
+
+Instantiate `CrossValidator` with a dataset and model(s), run `run()` or
+`run_grid()` to evaluate every feature/label/scheme combination, then flush the
+outputs via `CV_Result.export_result(results, "out/cv_results")` to capture the
+NDJSON/CSV manifests plus per-combo pickled models.
+
+Example:
+    cv = CrossValidator(dataset, models="rf")
+    results = cv.run(param_path="hyperparameters.yaml")
+    CV_Result.export_result(results, "out/cv_results")
+"""
+
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -288,6 +301,7 @@ class CrossValidator:
                         result_key = (
                             f"{key}::{base_model.__class__.__name__}::{params}"
                         )
+                        base_model.fit(X_arr, y_arr)
                         cv_result = CV_Result(
                             feature_set=feature_name,
                             label=label_name,
@@ -295,9 +309,13 @@ class CrossValidator:
                             cross_val_scores=per_r2,
                             validation_r2_per_fold=per_r2,
                             validation_mse_per_fold=per_mse,
+                            best_params=dict(params),
+                            trained_model=base_model,
                         )
                         results[result_key] = cv_result
-                        self._update_best_model(result_key, cv_result)
+                        self._update_best_model(
+                            result_key, cv_result, estimator=base_model
+                        )
                     continue  # skip to next model after processing all param combos
                 else:
                     # estimator instance provided by user
@@ -320,6 +338,7 @@ class CrossValidator:
                         result_key = (
                             f"{key}::{est.__class__.__name__}::{params}"
                         )
+                        est.fit(X_arr, y_arr)
                         cv_result = CV_Result(
                             feature_set=feature_name,
                             label=label_name,
@@ -327,9 +346,13 @@ class CrossValidator:
                             cross_val_scores=per_r2,
                             validation_r2_per_fold=per_r2,
                             validation_mse_per_fold=per_mse,
+                            best_params=dict(params),
+                            trained_model=est,
                         )
                         results[result_key] = cv_result
-                        self._update_best_model(result_key, cv_result)
+                        self._update_best_model(
+                            result_key, cv_result, estimator=est
+                        )
 
         return results
 
@@ -468,6 +491,7 @@ class CrossValidator:
                 ]  # negate because scorer is neg MSE
 
                 result_key = f"{key}::{gs.best_estimator_.__class__.__name__}"
+                best_params = getattr(gs, "best_params_", None)
                 cv_result = CV_Result(
                     feature_set=feature_name,
                     label=label_name,
@@ -475,9 +499,9 @@ class CrossValidator:
                     cross_val_scores=per_r2,
                     validation_r2_per_fold=per_r2,
                     validation_mse_per_fold=per_mse,
+                    best_params=best_params,
+                    trained_model=gs.best_estimator_,
                 )
-                # attach best hyperparameters from GridSearchCV if present
-                cv_result.best_params = getattr(gs, "best_params_", None)
                 results[result_key] = cv_result
                 self._update_best_model(
                     result_key, cv_result, estimator=gs.best_estimator_
