@@ -1398,10 +1398,7 @@ class Dataset:
                     # Keep only samples present in the holdout TRAIN set.
                     # Use inner join here (not left) so non-holdout samples are removed.
                     data = data.join(
-                        holdout_df,
-                        on="sample",
-                        how="inner",
-                        coalesce=True
+                        holdout_df, on="sample", how="inner", coalesce=True
                     )
 
                 # Filter nulls
@@ -1423,7 +1420,7 @@ class Dataset:
                     n_bins=n_bins,
                     random_state=random_state,
                     scheme_name=scheme_name,
-                    use_holdout=use_holdout
+                    use_holdout=use_holdout,
                 )
 
         return self
