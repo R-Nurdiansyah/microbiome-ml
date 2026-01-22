@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -159,10 +160,11 @@ class Visualiser:
         bar_color: str = "#4c72b0",
         figsize_per_fold: float = 0.8,
     ) -> None:
-        """Plot bar chart (one file per combo, including model information) showing validation_r2_per_fold and avg_validation_r2.
+        """Plot bar chart (one file per combo, including model information)
+        showing validation_r2_per_fold and avg_validation_r2.
 
         - Groups records by (feature_set, label, scheme).
-        - Each group's file is saved as <feature_set>__<label>__<scheme>.png in `out_dir`
+        - Each group's file is saved as <feature_set>__<label>__<scheme>__<model>.png in `out_dir`
           (defaults to `self.out.parent / "per_combo"`).
         """
         load_path = Path(results) if results is not None else self.results
@@ -181,11 +183,14 @@ class Visualiser:
 
         # prepare output directory
         if out_dir is None:
-            out_dir = self.out.parent / "cv_results"
+            # If the configured `out` looks like a directory (suffixless) use it directly,
+            # otherwise fall back to the previous cv_results parent folder.
+            if self.out.suffix:
+                out_dir = self.out.parent / "cv_results"
+            else:
+                out_dir = self.out
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-
-        import re
 
         def _safe_name(s: str) -> str:
             s = re.sub(r"[^\w\-]+", "_", s)

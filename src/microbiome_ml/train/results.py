@@ -91,9 +91,9 @@ class CV_Result:
     def _serialize_value(self, v: Any) -> Any:
         """Make values JSON/Polars-friendly.
 
-        numpy scalars/arrays are converted,
-        lists/tuples are recursively serialized, Paths become strings, and
-        fall back to `str()` for unknown objects.
+        numpy scalars/arrays are converted, lists/tuples are recursively
+        serialized, Paths become strings, and fall back to `str()` for unknown
+        objects.
         """
         if isinstance(v, Path):
             return str(v)

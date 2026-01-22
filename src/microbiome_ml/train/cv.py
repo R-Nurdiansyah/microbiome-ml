@@ -16,6 +16,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import polars as pl
 import yaml  # type: ignore[import]
 from sklearn.base import clone
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
@@ -38,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 # Mapping of model short names to their constructors
 # Canonical constructors keyed by short names (keeps compatibility with hyperparameters.yaml)
+# For now works with regressor models only (random forest, gradient boosting, xgboost)
 _MODEL_CONSTRUCTORS = {
     "rf": lambda: RandomForestRegressor(),
     "gb": lambda: GradientBoostingRegressor(),
@@ -74,6 +76,8 @@ _MODEL_ALIASES = {
 
 
 def _normalize_alias(name: str) -> str:
+    # Normalize a model alias by lowercasing and removing non-alphanumeric
+    # characters (except spaces), collapsing multiple spaces.
     s = (name or "").lower()
     # keep only alnum and spaces, collapse spaces
     s = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in s)
@@ -144,6 +148,7 @@ class CrossValidator:
 
     @staticmethod
     def load_param_grids(path: str) -> dict:
+        # Load hyperparameter grids from a YAML file
         with open(path, "r") as f:
             cfg = yaml.safe_load(f) or {}
         return cfg
@@ -154,6 +159,7 @@ class CrossValidator:
         cv_result: CV_Result,
         estimator: Optional[Any] = None,
     ) -> None:
+        # Update the best model if the current CV result has a higher average R²
         avg_r2 = cv_result.avg_validation_r2
         if avg_r2 is None:
             return
@@ -169,6 +175,8 @@ class CrossValidator:
         user_n_jobs: Optional[int],
         params_per_job: int = 2,
     ) -> int:
+        # Determine the number of parallel jobs for GridSearchCV, if n_jobs is None then use CPU count and
+        # number of hyperparameter combinations to estimate
         if user_n_jobs is not None:
             return int(user_n_jobs)
         try:
@@ -368,6 +376,8 @@ class CrossValidator:
             label: Union[str, List[str]] = None (specific label(s) to use; defaults to self.label or all label attributes in dataset)
             scheme: Union[str, List[str]] = None (specific CV scheme(s) to use; defaults to all schemes in dataset)
             param_path: str = "hyperparameters.yaml" (path to YAML file with hyperparameter grids)
+            n_jobs: Optional[int] = None (number of parallel jobs for GridSearchCV; if None, auto-determined)
+            params_per_job: int = 2 (used if n_jobs is None; number of hyperparameter combinations per job to estimate n_jobs)
         Outputs:
             Dict[str, CV_Result]: A dictionary mapping each unique combination of feature set, label, scheme, model, and hyperparameters to its CV_Result.
         """
@@ -522,10 +532,6 @@ class CrossValidator:
         Returns a dictionary mapping each unique combination of feature set,
         label, and scheme to its (X, y, joined DataFrame).
         """
-
-        import logging
-
-        import polars as pl
 
         results: Dict[str, Tuple[np.ndarray, np.ndarray, Any]] = {}
 

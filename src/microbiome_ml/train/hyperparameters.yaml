@@ -66,22 +66,22 @@ rf:
 xgb:
   n_estimators:
     - 100
-    - 200
-  max_depth:
-    - 3
-    - 6
-  learning_rate:
-    - 0.01
-    - 0.1
-  subsample:
-    - 0.8
-    - 1.0
-  colsample_bytree:
-    - 0.8
-    - 1.0
-  reg_alpha:  # L1 regularization
-    - 0
-    - 0.1
-  reg_lambda:  # L2 regularization
-    - 1
-    - 2
+# #    - 200
+#   max_depth:
+#     - 3
+# #    - 6
+#   learning_rate:
+#     - 0.01
+# #    - 0.1
+#   subsample:
+#     - 0.8
+# #    - 1.0
+#   colsample_bytree:
+#     - 0.8
+# #    - 1.0
+#   reg_alpha:  # L1 regularization
+#     - 0
+# #    - 0.1
+#   reg_lambda:  # L2 regularization
+#     - 1
+# #    - 2
