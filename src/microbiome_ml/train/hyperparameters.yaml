@@ -1,0 +1,87 @@
+# models + hyperparameters
+# use ~ for None
+rf:
+  n_estimators:
+    - 100
+    # - 200
+    # - 500
+  max_depth:
+    # - 10
+    - ~
+  criterion:
+    - squared_error
+    # - absolute_error
+    # - friedman_mse
+    # - poisson
+  max_features:
+    # - sqrt
+    # - log2
+    - ~
+  ccp_alpha:
+  # this controls the level of pruning performed to reduce overfitting.
+    # - 0
+    # - 0.01
+    # - 0.1
+    - 1
+    # - ~
+  min_samples_leaf:
+  # # if a feature is < this value, it will not be considered to become a terminal node.
+  # # this can prevent overfitting e.g. where all samples get their own leaf
+    - 1
+    # - 5
+    # - 10
+# gb:
+#   n_estimators:
+#     # - 100
+#     # - 200
+#     - 500
+#   max_depth:
+#     - 10
+#     - ~
+#   learning_rate:
+#     - 0.01
+#     # - 0.001
+#     # - 0.0001
+#   min_samples_split:
+#     - 2
+#     - 5
+#     - 10
+#   min_samples_leaf:
+#     - 1
+#     - 5
+#     - 10
+#   subsample:
+#     - 0.8
+#     # - 0.9
+#     # - 1.0
+# en:
+#   alpha:
+#     - 0.1
+#     - 0.5
+#     - 1.0
+#   l1_ratio:
+#     - 0.1
+#     - 0.5
+#     - 1.0
+xgb:
+  n_estimators:
+    - 100
+# #    - 200
+#   max_depth:
+#     - 3
+# #    - 6
+#   learning_rate:
+#     - 0.01
+# #    - 0.1
+#   subsample:
+#     - 0.8
+# #    - 1.0
+#   colsample_bytree:
+#     - 0.8
+# #    - 1.0
+#   reg_alpha:  # L1 regularization
+#     - 0
+# #    - 0.1
+#   reg_lambda:  # L2 regularization
+#     - 1
+# #    - 2

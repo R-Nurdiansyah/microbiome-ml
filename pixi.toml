@@ -15,6 +15,15 @@ requests = ">=2.25.0"
 tqdm = ">=4.64.0"
 pyyaml = ">=0.2.5"
 
+# CV dependencies - used in cross validation
+scikit-learn = ">=1.0.0"
+xgboost = ">=1.7.0"
+
+# visualization - used in visualization
+matplotlib = ">=3.5.3"
+seaborn = ">=0.12.2"
+cmasher = ">=1.9.2"
+
 [feature.dev.dependencies]
 pytest = ">=7.0.0"
 pytest-cov = ">=4.0.0"

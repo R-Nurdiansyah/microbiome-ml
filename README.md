@@ -51,22 +51,22 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 dataset = (
     Dataset()
     .add_metadata(
-        metadata="path/to/metadata.csv",
-        attributes="path/to/attributes.csv",
-        study_titles="path/to/study_titles.csv"
+        metadata="path/to/metadata.csv",                                            # Required
+        attributes="path/to/attributes.csv",                                        # Required
+        study_titles="path/to/study_titles.csv"                                     # Optional
         )
     .add_profiles(
-        profiles="path/to/profiles.csv",
-        root="path/to/root.csv",)
-    .add_species_features("gene_features", data="path/to/gene_features.csv")  # Species-level features
-    .add_species_features("pathway_features", data="path/to/pathway_features.csv")
+        profiles="path/to/profiles.csv",                                            # Required
+        root="path/to/root.csv",)                                                   # Required for relative abundance data
+    .add_species_features("gene_features", data="path/to/gene_features.csv")        # Species-level features (Optional)
+    .add_species_features("pathway_features", data="path/to/pathway_features.csv")  # Optional
     .add_labels({
-        "temperature": "path/to/temperature_labels.csv",
-        "ph": "path/to/ph_labels.csv",
-        "oxygen": "path/to/oxygen_labels.csv",
+        "temperature": "path/to/temperature_labels.csv",                            # Required
+        "ph": "path/to/ph_labels.csv",                                              # Required
+        "oxygen": "path/to/oxygen_labels.csv",                                      # Required
         })
     .add_groupings(
-        custom_groupings="path/to/custom_groupings.csv"
+        custom_groupings="path/to/custom_groupings.csv"                             # Optional
     )
     .apply_preprocessing()
     .add_taxonomic_features()  # Generate abundance features at different ranks
@@ -80,24 +80,26 @@ dataset = (
         method="top_k_abundant",
         k=20
     )
-    .create_default_groupings()  # Extract bioproject, biome, etc.
+    .create_default_groupings()                                                     # Extract bioproject, biome, etc.
     )
 
 # Create holdout train/test splits (supports multiple labels)
 dataset.create_holdout_split(
-    label="temperature",  # Or None to split all labels
+    label="temperature",    # Or None to split all labels
     grouping="bioproject",  # Prevent group leakage
     test_size=0.2
 )
 
 # Create k-fold cross-validation folds (multiple schemes per label)
-dataset.create_all_cv_schemes(
-    n_folds=5
+dataset.create_cv_folds(
+    n_folds=5,
+    use_holdout=True        # To use previous holdout test/train and create fold based on train data only
 )
 
 # Iterate over all CV folds
 for label, scheme, cv_df in dataset.iter_cv_folds():
     print(f"Label: {label}, Scheme: {scheme}, Samples: {cv_df.height}")
+```
 
 ## Feature Engineering Examples
 
@@ -130,22 +132,67 @@ for name, feature_set in dataset.feature_sets.items():
     # e.g., "tax_genus", "sample_genes", "pathway_features_arithmetic_mean_none"
 ```
 
-# Save and load (human-readable directory structure)
-dataset.save("path/to/save/dataset", compress=True)  # .tar.gz
-dataset = Dataset.load("path/to/save/dataset.tar.gz")
+## Cross-validation
 
-# Machine learning - iterates over all feature sets, models, and labels
+```python
+# Cross validation - build cv and iterates over all feature sets, models, and labels
+# The function will try to look any scheme or fold definition based on the result of create_cv_fold and
 cv = CrossValidator(
     dataset,
     models=[RandomForestRegressor(), GradientBoostingRegressor()]
     )
 
-results = cv.run()
+# Specify the label or scheme(s); This case will only work with pH label and bioproject or ecoregion
+cv = CrossValidator(
+    dataset,
+    models=[RandomForestRegressor(), GradientBoostingRegressor()],
+    label="ph",
+    scheme=["bioproject","ecoregion"]
+    )
 
-# Visualization
-visualiser = Visualiser(results)
+# Cross validation run; parameters is required
+results = cv.run(param_path="parameters.yaml")
+
+# Grid Cross validation run -> using GridCV from sklearn
+# Add n_jobs to specify parallezition in GridCV (None will dynamically determine based on CPU and hyperparams combos)
+results_grid = cv.run_grid(param_path="hyperparameters.yaml")
+```
+
+## Save and load dataset (human-readable directory structure) and visualization
+
+```python
+# Save and load dataset
+dataset.save("path/to/save/dataset", compress=True)  # .tar.gz
+dataset.save("path/to/save/dataset") # saved in directory
+dataset = Dataset.load("path/to/save/dataset.tar.gz")
+dataset = Dataset.load("path/to/save/dataset") #load from directory
+
+# Save model and result
+from microbiome_ml.train.results import CV_Result
+
+# Persist all CV outputs: manifest, results.ndjson, a summary CSV and per-combo
+# model pickles under models/<feature_set>;<label>;<scheme>
+CV_Result.export_result(results, "out/results")
+CV_Result.export_result(results_grid, "out/grid-results")
+
+if cv.best_model_estimator is not None and cv.best_result is not None:
+    # Save the best estimator (gzip recommended, .pkl.gz) and its CV record alone
+    CV_Result.save_model(
+        cv.best_model_estimator, "out/best_model.pkl.gz", compress=True
+    )
+    CV_Result.save_cv_result(cv.best_result, "out/best_result.ndjson")
+
+## Visualization
+
+visualiser = Visualiser(results, out_dir="path/to/save/visualization")
 visualiser.plot_performance_metrics()
 visualiser.plot_feature_importances()
+
+# Plot CV result in barplot
+visualiser.plot_cv_bars()  # creates bar plots per CV combo
+
+plot_cv_bars consumes the result NDJSON (or directory) and writes one PNG per feature set / label / scheme / model
+combination. Filenames embed each dimension (e.g., Feature_Set__label__scheme__model.png).
 ```
 
 ## Development
