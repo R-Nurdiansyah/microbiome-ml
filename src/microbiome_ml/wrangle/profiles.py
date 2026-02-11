@@ -485,7 +485,7 @@ class TaxonomicProfiles:
         if isinstance(rank, str):
             rank = TaxonomicRanks.from_name(rank)
 
-        rank_regex = f"{rank.prefix}[^;]+$"
+        rank_regex = rank.get_regex()
         return lf.filter(pl.col("taxonomy").str.contains(rank_regex))
 
     def get_rank(self, rank: Union[str, TaxonomicRanks]) -> pl.LazyFrame:
@@ -761,6 +761,9 @@ class TaxonomicProfiles:
                 "Profiles must be in filled format to create features. Use fill_profiles() first."
             )
 
+        if isinstance(rank, str):
+            rank = TaxonomicRanks.from_name(rank)
+
         # Get profiles as LazyFrame
         profiles_lf = self.profiles
 
@@ -769,14 +772,21 @@ class TaxonomicProfiles:
                 "Profiles must be in relative abundance format to create features. Use _to_relabund_lf() first."
             )
 
-        if isinstance(rank, str):
-            rank = TaxonomicRanks.from_name(rank)
+        # regex that captures the token at the requested rank anywhere in the taxonomy string
+        pattern = f"(?:^|;)((?:{rank.prefix}[^;]+))(?:;|$)"
 
         # Extract features at the specified rank
         features = (
             profiles_lf.filter(
                 pl.col("taxonomy").str.contains(rank.get_regex())
             )
+            .with_columns(
+                pl.col("taxonomy").str.replace_all(r";\s+", ";")
+            )  # normalize
+            .with_columns(
+                pl.col("taxonomy").str.extract(pattern).alias("taxonomy")
+            )
+            .filter(pl.col("taxonomy").is_not_null())
             .select(["sample", "taxonomy", "relabund"])
             .collect()
             .pivot(

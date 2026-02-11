@@ -6,7 +6,7 @@ import tarfile
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import polars as pl
@@ -167,6 +167,11 @@ class Dataset:
                 )
 
         self._sync_accessions()
+        # Log the length
+        logger.info(
+            "Metadata component added with %d samples",
+            len(self.get_sample_ids()),
+        )
         return self
 
     def add_profiles(
@@ -205,6 +210,11 @@ class Dataset:
             )
 
         self._sync_accessions()
+        # Log the length
+        logger.info(
+            "Profiles component added with %d samples",
+            len(self.get_sample_ids()),
+        )
         return self
 
     def add_features(
@@ -955,6 +965,12 @@ class Dataset:
             )
 
         self._sync_accessions()
+        # Log the length and put the label without sample
+        logger.info(
+            "Labels component added with %d samples and columns %s",
+            len(self.get_sample_ids()),
+            list(self.labels.columns),
+        )
         return self
 
     def add_groupings(
@@ -1017,6 +1033,12 @@ class Dataset:
             )
 
         self._sync_accessions()
+        # Log the length
+        logger.info(
+            "Groupings component added with %d samples and columns %s",
+            len(self.get_sample_ids()),
+            list(self.groupings.columns),
+        )
         return self
 
     def add_taxonomic_features(
@@ -1043,26 +1065,54 @@ class Dataset:
                 "Profiles must be added before generating taxonomic features"
             )
 
-        # Default to all standard ranks (e.g., phylum to species)
+        # Normalize ranks to a concrete list for logging/reuse
         if ranks is None:
-            ranks_iter: Union[
-                Iterator[TaxonomicRanks], List[Union[str, TaxonomicRanks]]
-            ] = TaxonomicRanks.PHYLUM.iter_down()
+            ranks_list: List[TaxonomicRanks] = list(
+                TaxonomicRanks.PHYLUM.iter_down()
+            )
         else:
-            ranks_iter = ranks
+            ranks_list = [
+                TaxonomicRanks.from_name(rank)
+                if isinstance(rank, str)
+                else rank
+                for rank in ranks
+            ]
 
-        # Generate feature sets for each rank
-        for rank in ranks_iter:
-            # Convert string to enum if needed
-            if isinstance(rank, str):
-                rank = TaxonomicRanks.from_name(rank)
+        added_ranks: List[str] = []
 
+        # Generate feature sets for each requested rank
+        for rank in ranks_list:
             feature_set = self.profiles.create_features(rank)
             feature_name = f"{prefix}_{rank.name.lower()}"
+
+            if not feature_set.feature_names:
+                logger.warning(
+                    "Skipping taxonomic rank %s (%s): no feature columns produced",
+                    rank.name,
+                    feature_name,
+                )
+                continue
+
+            if not feature_set.accessions:
+                logger.warning(
+                    "Skipping taxonomic rank %s (%s): no samples available",
+                    rank.name,
+                    feature_name,
+                )
+                continue
+
             feature_set.name = feature_name
             self.feature_sets[feature_name] = feature_set
+            added_ranks.append(rank.name.lower())
+
+        if not added_ranks:
+            logger.warning(
+                "No taxonomic feature sets were added; all requested ranks yielded empty data"
+            )
+            return self
 
         self._sync_accessions()
+        logger.info("Added taxonomic feature sets for ranks: %s", added_ranks)
         return self
 
     def create_default_groupings(
@@ -1194,10 +1244,15 @@ class Dataset:
         # Determine which labels to process
         if label is not None:
             if label not in all_label_cols:
+                logger.error("Requested label '%s' not found in labels", label)
                 raise ValueError(f"Label '{label}' not found in labels")
             label_list = [label]
         else:
             label_list = all_label_cols
+
+        metadata_df: Optional[pl.DataFrame] = None
+        if self.metadata is not None:
+            metadata_df = self.metadata.metadata.collect()
 
         # Create splits for each label
         for lbl in label_list:
@@ -1246,9 +1301,91 @@ class Dataset:
                 test_size=test_size,
                 n_bins=n_bins,
                 random_state=random_state,
+                metadata=metadata_df,
             )
 
         return self
+
+    def _require_split_manager(self, label: str) -> SplitManager:
+        if label not in self.splits:
+            raise ValueError(f"Holdout split for '{label}' not found")
+        return self.splits[label]
+
+    def get_train_samples(
+        self, label: str, fold: Optional[str] = None, metadata: bool = True
+    ) -> pl.DataFrame:
+        """Return the training subset from the holdout split for *label*.
+
+        Args:
+            label: Name of the label with a created holdout split
+            fold: Currently unused (reserved for CV extensions)
+            metadata: If False, only the `sample` column is returned. When True (default),
+                any metadata columns present in the split are preserved.
+        Returns:
+            Polars DataFrame of training samples for specified label
+        """
+        if fold is not None:
+            raise NotImplementedError(
+                "fold-based sampling is not yet implemented"
+            )
+
+        split_manager = self._require_split_manager(label)
+        if split_manager.holdout is None:
+            raise ValueError(
+                f"Holdout split for '{label}' has not been created yet"
+            )
+
+        train_df = split_manager.holdout.filter(pl.col("split") == "train")
+        if self.labels is not None and label in self.labels.columns:
+            label_df = self.labels.select(["sample", label])
+            train_df = train_df.join(
+                label_df, on="sample", how="left", coalesce=True
+            )
+        elif label not in train_df.columns:
+            raise ValueError(
+                "Label column not available; add labels or regenerate the holdout split"
+            )
+        if metadata:
+            return train_df
+        return train_df.select("sample", "split", label)
+
+    def get_test_samples(
+        self, label: str, fold: Optional[str] = None, metadata: bool = True
+    ) -> pl.DataFrame:
+        """Return the test subset from the holdout split for *label*.
+
+        Args:
+            label: Name of the label with a created holdout split
+            fold: Currently unused (reserved for CV extensions)
+            metadata: If False, only the `sample` column is returned. When True (default),
+                any metadata columns present in the split are preserved.
+        Returns:
+            Polars DataFrame of test samples for specified label
+        """
+        if fold is not None:
+            raise NotImplementedError(
+                "fold-based sampling is not yet implemented"
+            )
+
+        split_manager = self._require_split_manager(label)
+        if split_manager.holdout is None:
+            raise ValueError(
+                f"Holdout split for '{label}' has not been created yet"
+            )
+
+        test_df = split_manager.holdout.filter(pl.col("split") == "test")
+        if self.labels is not None and label in self.labels.columns:
+            label_df = self.labels.select(["sample", label])
+            test_df = test_df.join(
+                label_df, on="sample", how="left", coalesce=True
+            )
+        elif label not in test_df.columns:
+            raise ValueError(
+                "Label column not available; add labels or regenerate the holdout split"
+            )
+        if metadata:
+            return test_df
+        return test_df.select("sample", "split", label)
 
     def create_cv_folds(
         self,
@@ -1306,6 +1443,7 @@ class Dataset:
         # Determine which labels to process
         if label is not None:
             if label not in all_label_cols:
+                logger.error("Requested label '%s' not found in labels", label)
                 raise ValueError(f"Label '{label}' not found in labels")
             label_list = [label]
         else:
@@ -1507,15 +1645,38 @@ class Dataset:
         Returns:
             Self for chaining
         """
+        # Log the settings
+        logger.info(
+            "Applying preprocessing with settings: metadata_qc=%s, profiles_qc=%s, sync_after=%s, metadata_mbp_cutoff=%.1f, profiles_cov_cutoff=%.1f, profiles_dominated_cutoff=%.2f, profiles_rank=%s",
+            metadata_qc,
+            profiles_qc,
+            sync_after,
+            metadata_mbp_cutoff,
+            profiles_cov_cutoff,
+            profiles_dominated_cutoff,
+            profiles_rank,
+        )
+
         # Apply metadata QC
         if (
             metadata_qc
             and self.metadata is not None
             and not self.metadata_qc_done
         ):
+            height_before = self.metadata.metadata.collect().height
             self.metadata = self.metadata.default_qc(
                 mbp_cutoff=metadata_mbp_cutoff
             )
+            logger.info(
+                "Metadata QC applied: filtered samples with < %d mbp",
+                metadata_mbp_cutoff,
+            )
+            # log how many samples are gone
+            height_after = self.metadata.metadata.collect().height
+            logger.info(
+                "Metadata QC removed %d samples", height_before - height_after
+            )
+
             self.metadata_qc_done = True
 
         # Apply profiles QC
@@ -1543,6 +1704,17 @@ class Dataset:
                 cov_cutoff=profiles_cov_cutoff,
                 dominated_cutoff=profiles_dominated_cutoff,
                 rank=profiles_rank,
+            )
+            logger.info(
+                "Profiles QC applied: coverage >= %.1f and dominated <= %.2f at rank %s",
+                profiles_cov_cutoff,
+                profiles_dominated_cutoff,
+                profiles_rank,
+            )
+            logger.info(
+                "Profiles QC removed %d samples",
+                profiles_lf.collect().height
+                - self.profiles.profiles.collect().height,
             )
             self.profiles_qc_done = True
 

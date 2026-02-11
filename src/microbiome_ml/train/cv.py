@@ -227,6 +227,9 @@ class CrossValidator:
             self.dataset, fillna=0.0, label=label_to_use, scheme=scheme_to_use
         )
         params_grid = self.load_param_grids(param_path)
+        logger.info(
+            f"Starting cross-validation with {len(mapping)} feature/label/scheme combinations and models: {self.models}"
+        )
 
         for key, (X_np, y_np, joined) in mapping.items():
             try:
@@ -360,6 +363,9 @@ class CrossValidator:
                         results[result_key] = cv_result
                         self._update_best_model(
                             result_key, cv_result, estimator=est
+                        )
+                        logger.info(
+                            f"Completed CV for {result_key} with params {params}"
                         )
 
         return results
@@ -516,6 +522,9 @@ class CrossValidator:
                 self._update_best_model(
                     result_key, cv_result, estimator=gs.best_estimator_
                 )
+                logger.info(
+                    f"Completed grid search CV for {result_key} with best params {best_params} and per-fold R²: {per_r2}"
+                )
                 logger.info(f"Best hyperparameters: {gs.best_params_}\n")
         return results
 
@@ -629,9 +638,6 @@ class CrossValidator:
                     )
                     continue
 
-                # Determine CV schemes to use. Accept a single scheme name or a list/tuple/set of names.
-                # If `split_manager` is a plain dict mapping scheme->table, use it directly.
-                # Declare with an explicit Optional type to satisfy static type checkers.
                 available_cv_schemes: Optional[Dict[str, Any]] = None
                 if isinstance(split_manager, dict):
                     available_cv_schemes = split_manager

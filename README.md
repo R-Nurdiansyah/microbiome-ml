@@ -158,6 +158,9 @@ results = cv.run(param_path="parameters.yaml")
 results_grid = cv.run_grid(param_path="hyperparameters.yaml")
 ```
 
+## Final Holdout-Evaluation
+
+
 ## Save and load dataset (human-readable directory structure) and visualization
 
 ```python
@@ -189,7 +192,9 @@ visualiser.plot_performance_metrics()
 visualiser.plot_feature_importances()
 
 # Plot CV result in barplot
-visualiser.plot_cv_bars()  # creates bar plots per CV combo
+visualiser.plot_cv_bars('path to cv result directory', 'output dir')  # creates bar plots per CV combo
+
+# Plot
 
 plot_cv_bars consumes the result NDJSON (or directory) and writes one PNG per feature set / label / scheme / model
 combination. Filenames embed each dimension (e.g., Feature_Set__label__scheme__model.png).

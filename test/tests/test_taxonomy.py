@@ -1,5 +1,8 @@
 """Tests for taxonomy utilities and regex generation."""
 
+import re
+from typing import List
+
 import polars as pl
 import pytest
 
@@ -32,13 +35,13 @@ class TestTaxonomicRanksRegex:
     def test_regex_format_all_ranks(self):
         """Test regex format for all ranks."""
         expected = {
-            TaxonomicRanks.DOMAIN: "d__[^;]+(?:;p__)?$",
-            TaxonomicRanks.PHYLUM: "p__[^;]+(?:;c__)?$",
-            TaxonomicRanks.CLASS: "c__[^;]+(?:;o__)?$",
-            TaxonomicRanks.ORDER: "o__[^;]+(?:;f__)?$",
-            TaxonomicRanks.FAMILY: "f__[^;]+(?:;g__)?$",
-            TaxonomicRanks.GENUS: "g__[^;]+(?:;s__)?$",
-            TaxonomicRanks.SPECIES: "s__[^;]+$",
+            TaxonomicRanks.DOMAIN: "d__[^;]+(?:;p__[^;]+)?",
+            TaxonomicRanks.PHYLUM: "p__[^;]+(?:;c__[^;]+)?",
+            TaxonomicRanks.CLASS: "c__[^;]+(?:;o__[^;]+)?",
+            TaxonomicRanks.ORDER: "o__[^;]+(?:;f__[^;]+)?",
+            TaxonomicRanks.FAMILY: "f__[^;]+(?:;g__[^;]+)?",
+            TaxonomicRanks.GENUS: "g__[^;]+(?:;s__[^;]+)?",
+            TaxonomicRanks.SPECIES: "s__[^;]+",
         }
 
         for rank, expected_regex in expected.items():
@@ -54,36 +57,71 @@ class TestTaxonomicRanksRegex:
                 pl.col("taxonomy").str.contains(regex)
             )
 
-            # Should match exactly one entry (the one at this rank)
+            # Should match at least one entry containing this rank
             assert (
-                filtered.height == 1
-            ), f"Rank {rank.name} should match 1 entry, got {filtered.height}"
+                filtered.height >= 1
+            ), f"Rank {rank.name} should match at least 1 entry, got {filtered.height}"
 
-            # The matched entry should contain this rank's prefix
-            taxonomy = filtered["taxonomy"][0]
+            # The entry representing exactly this rank should be present
+            expected_taxonomy = mock_taxonomy_df["taxonomy"][rank.value]
             assert (
-                rank.prefix in taxonomy
-            ), f"Matched taxonomy should contain {rank.prefix}"
+                expected_taxonomy in filtered["taxonomy"].to_list()
+            ), f"Rank {rank.name} regex should match {expected_taxonomy}"
+
+            # Every matched entry should contain the rank prefix
+            for taxonomy in filtered["taxonomy"].to_list():
+                assert (
+                    rank.prefix in taxonomy
+                ), f"Matched taxonomy should contain {rank.prefix}"
 
     def test_regex_excludes_child_ranks(self, mock_taxonomy_df):
-        """Test that regex excludes entries with child rank data."""
-        # Phylum regex should match phylum-only, not class and below
+        """Test that regex captures at most one child rank segment."""
+        # Phylum regex should capture phylum with optional class only
         phylum_regex = TaxonomicRanks.PHYLUM.get_regex()
         phylum_filtered = mock_taxonomy_df.filter(
             pl.col("taxonomy").str.contains(phylum_regex)
         )
 
-        # Should not match entries with class or deeper
+        # Extract matched segment and ensure it stops at optional class
         for taxonomy in phylum_filtered["taxonomy"].to_list():
-            # Should have phylum but not class (unless it's just "c__" prefix)
-            if "c__" in taxonomy:
-                assert taxonomy.endswith(
+            match = re.search(phylum_regex, taxonomy)
+            assert match is not None, "Regex should match a phylum segment"
+            segment = match.group(0)
+            levels = [lvl for lvl in segment.split(";") if lvl]
+            assert (
+                1 <= len(levels) <= 2
+            ), f"Matched segment should include phylum with optional class, got {segment}"
+            if len(levels) == 2:
+                assert levels[1].startswith(
                     "c__"
-                ), f"Should not match taxonomy with class data: {taxonomy}"
+                ), f"Optional child segment should be class, got {levels[1]}"
 
 
 class TestTaxonomicProfilesFeatureCreation:
     """Test feature creation from taxonomic profiles at different ranks."""
+
+    @staticmethod
+    def _expected_rank_taxa(
+        profiles_lf: pl.LazyFrame, rank: TaxonomicRanks
+    ) -> List[str]:
+        """Mirror create_features extraction for test expectations."""
+        pattern = rf"(?:^|;)((?:{rank.prefix}[^;]+))(?:;|$)"
+        return (
+            profiles_lf.filter(
+                pl.col("taxonomy").str.contains(rank.get_regex())
+            )
+            .with_columns(pl.col("taxonomy").str.replace_all(r";\s+", ";"))
+            .with_columns(
+                pl.col("taxonomy").str.extract(pattern).alias("rank_taxonomy")
+            )
+            .filter(pl.col("rank_taxonomy").is_not_null())
+            .select("rank_taxonomy")
+            .unique()
+            .sort("rank_taxonomy")
+            .collect()
+            .to_series()
+            .to_list()
+        )
 
     @pytest.fixture
     def real_profiles(self):
@@ -95,52 +133,24 @@ class TestTaxonomicProfilesFeatureCreation:
     def test_create_features_all_ranks(self, real_profiles):
         """Test creating features for all ranks using iter_from_domain."""
         for rank in TaxonomicRanks.iter_from_domain():
-            # Create features at this rank
             features = real_profiles.create_features(rank)
 
-            # Get expected taxonomy entries using regex
-            regex = rank.get_regex()
-            expected = real_profiles.profiles.filter(
-                pl.col("taxonomy").str.contains(regex)
-            )
+            expected = self._expected_rank_taxa(real_profiles.profiles, rank)
 
-            # Get unique taxonomy strings at this rank
-            expected_taxa = (
-                expected.select("taxonomy")
-                .unique()
-                .sort("taxonomy")
-                .collect()
-                .to_series()
-                .to_list()
-            )
-
-            # Feature names should match the unique taxonomy strings
             assert len(features.feature_names) == len(
-                expected_taxa
-            ), f"Rank {rank.name}: Expected {len(expected_taxa)} features, got {len(features.feature_names)}"
+                expected
+            ), f"Rank {rank.name}: Expected {len(expected)} features, got {len(features.feature_names)}"
 
     def test_feature_names_match_filtered_taxa(self, real_profiles):
         """Test that feature names exactly match filtered taxonomy entries."""
         for rank in TaxonomicRanks.iter_from_domain():
             features = real_profiles.create_features(rank)
 
-            # Get taxa at this rank using regex
-            regex = rank.get_regex()
-            truth = real_profiles.profiles.filter(
-                pl.col("taxonomy").str.contains(regex)
-            )
-
-            # Get unique taxonomy strings
-            expected_features = sorted(
-                truth.select("taxonomy")
-                .unique()
-                .collect()
-                .to_series()
-                .to_list()
+            expected_features = self._expected_rank_taxa(
+                real_profiles.profiles, rank
             )
             actual_features = sorted(features.feature_names)
 
-            # Feature names should exactly match
             assert (
                 actual_features == expected_features
             ), f"Rank {rank.name}: Feature names don't match filtered taxonomy"

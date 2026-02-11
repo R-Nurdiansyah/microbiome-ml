@@ -17,11 +17,22 @@ import hashlib
 import json
 import pickle
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
+
+
+@dataclass
+class HoldoutEvaluation:
+    """Slice of holdout/final test results suitable for plotting/reporting."""
+
+    metrics: Dict[str, Any]
+    estimator: Any
+    predictions: np.ndarray
+    targets: np.ndarray
 
 
 class CV_Result:
@@ -159,7 +170,7 @@ class CV_Result:
     def _normalize_results_input(
         values: Union[
             "CV_Result", Sequence["CV_Result"], Dict[str, "CV_Result"]
-        ]
+        ],
     ) -> Dict[str, "CV_Result"]:
         if isinstance(values, CV_Result):
             return {"result": values}
@@ -273,8 +284,13 @@ class CV_Result:
         else:
             ndjson_path = outp
             ndjson_path.parent.mkdir(parents=True, exist_ok=True)
+        out_record = result._to_dict()
+        model_obj = getattr(result, "model", None)
+        out_record["model"] = (
+            model_obj.__class__.__name__ if model_obj is not None else None
+        )
         with ndjson_path.open("w", encoding="utf-8") as f:
-            f.write(json.dumps(result._to_dict(), default=str) + "\n")
+            f.write(json.dumps(out_record, default=str) + "\n")
 
     @staticmethod
     def results_dict_to_streaming_files(
