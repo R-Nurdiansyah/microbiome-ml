@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import matplotlib
+import numpy as np
 
 from microbiome_ml.visualise.visualisations import Visualiser
 
@@ -38,11 +39,24 @@ def test_plot_cv_bars_creates_one_file_per_model(tmp_path):
     ndjson = tmp_path / "results.ndjson"
     _write_records(ndjson, records)
     plots_dir = tmp_path / "plots"
-    vis = Visualiser(results=ndjson, out=tmp_path / "dummy.png")
-    vis.plot_cv_bars(out_dir=plots_dir)
+    vis = Visualiser(out=tmp_path / "figs")
+    vis.plot_cv_bars(results=ndjson, out_dir=plots_dir)
 
     names = {p.name for p in plots_dir.glob("*.png")}
     assert names == {
         "Feature_Set__lbl__schemeA__RandomForestRegressor.png",
         "Feature_Set__lbl__schemeA__XGBRegressor.png",
     }
+
+
+def test_visualise_model_performance_saves_holdout(tmp_path):
+    vis = Visualiser(out=tmp_path / "figs")
+    predictions = np.array([1.0, 2.0, 3.0])
+    values = np.array([1.1, 1.9, 3.05])
+    vis.visualise_model_performance(
+        predictions,
+        values,
+        file_name="holdout.png",
+    )
+
+    assert (tmp_path / "figs" / "holdout.png").exists()

@@ -10,6 +10,7 @@ from microbiome_ml.wrangle.dataset import Dataset
 from microbiome_ml.wrangle.features import FeatureSet
 from microbiome_ml.wrangle.metadata import SampleMetadata
 from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+from microbiome_ml.wrangle.splits import SplitManager
 
 
 class TestDatasetInitialization:
@@ -275,6 +276,57 @@ class TestDatasetAccessionSync:
         assert len(sample_ids) > 0
         # Should be sorted
         assert sample_ids == sorted(sample_ids)
+
+
+class TestDatasetHoldoutAccessors:
+    """Ensure the Dataset helpers return the right subsets."""
+
+    def test_get_train_samples_returns_train_rows(self):
+        dataset = Dataset()
+        split_manager = SplitManager("target")
+        split_manager.holdout = pl.DataFrame(
+            {
+                "sample": ["S1", "S2", "S3"],
+                "split": ["test", "train", "train"],
+                "target": [0, 1, 0],
+            }
+        )
+        dataset.splits["target"] = split_manager
+
+        train_df = dataset.get_train_samples("target")
+
+        assert set(train_df["sample"].to_list()) == {
+            "S2",
+            "S3",
+        }
+        assert set(train_df["split"].to_list()) == {"train"}
+
+    def test_get_test_samples_returns_test_rows(self):
+        dataset = Dataset()
+        split_manager = SplitManager("target")
+        split_manager.holdout = pl.DataFrame(
+            {
+                "sample": ["S1", "S2"],
+                "split": ["test", "train"],
+                "target": [0, 1],
+            }
+        )
+        dataset.splits["target"] = split_manager
+
+        test_df = dataset.get_test_samples("target")
+
+        assert test_df["sample"].to_list() == ["S1"]
+        assert test_df["split"].to_list() == ["test"]
+
+    def test_accessors_require_holdout(self):
+        dataset = Dataset()
+        dataset.splits["target"] = SplitManager("target")
+
+        with pytest.raises(ValueError, match="has not been created yet"):
+            dataset.get_train_samples("target")
+
+        with pytest.raises(ValueError, match="has not been created yet"):
+            dataset.get_test_samples("target")
 
 
 class TestDatasetPreprocessing:

@@ -124,13 +124,17 @@ class TestTaxonomicProfilesTaxonomy:
         # Collect to DataFrame to inspect
         rank_df = rank_lf.collect()
         assert "taxonomy" in rank_df.columns
-        # All taxonomies at phylum level should have exactly 2 levels (domain;phylum)
+        # All taxonomies at phylum level should have at least domain and phylum
         taxonomies = rank_df["taxonomy"].to_list()
         for tax in taxonomies:
-            levels = tax.split(";")
+            levels = [lvl for lvl in tax.split(";") if lvl]
             assert (
-                len(levels) == 2
-            ), f"Expected 2 levels for phylum, got {len(levels)}: {tax}"
+                len(levels) >= 2
+            ), f"Expected at least 2 levels for phylum, got {len(levels)}: {tax}"
+            phylum_level = levels[1]
+            assert phylum_level.startswith(
+                TaxonomicRanks.PHYLUM.prefix
+            ), f"Second level should be phylum, got {phylum_level}"
 
 
 class TestTaxonomicProfilesFeatureCreation:

@@ -1,7 +1,7 @@
 """Split management for train/test and cross-validation."""
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import polars as pl
@@ -17,7 +17,7 @@ class SplitManager:
 
     Attributes:
         label: Name of the target variable
-        holdout: DataFrame with {sample, split} columns ("train"/"test")
+        holdout: DataFrame with {sample, split, label} plus any metadata columns for the holdout samples
         cv_schemes: Dict mapping scheme names to CV DataFrames {sample, fold}
     """
 
@@ -38,6 +38,7 @@ class SplitManager:
         test_size: float = 0.2,
         n_bins: int = 5,
         random_state: int = 42,
+        metadata: Optional[Union[pl.DataFrame, pl.LazyFrame]] = None,
     ) -> None:
         """Create holdout train/test split.
 
@@ -47,6 +48,7 @@ class SplitManager:
             test_size: Fraction of samples for test set
             n_bins: Number of bins for continuous targets
             random_state: Random seed for reproducibility
+            metadata: Optional metadata DataFrame/LazyFrame to attach to results
         """
         self.holdout = self._stratified_split(
             data=data,
@@ -56,6 +58,7 @@ class SplitManager:
             n_bins=n_bins,
             random_state=random_state,
             split_col_name="split",
+            metadata=metadata,
         )
 
     def create_cv_folds(
@@ -215,6 +218,7 @@ class SplitManager:
         n_bins: int,
         random_state: int,
         split_col_name: str,
+        metadata: Optional[Union[pl.DataFrame, pl.LazyFrame]] = None,
     ) -> pl.DataFrame:
         """Internal method to perform stratified group-aware split.
 
@@ -226,12 +230,22 @@ class SplitManager:
             n_bins: Number of bins for continuous targets
             random_state: Random seed
             split_col_name: Name for split column in output
+            metadata: Optional metadata DataFrame/LazyFrame to append
 
         Returns:
             DataFrame with {sample, split_col_name} columns
         """
         # Shuffle and prepare grouping
         df = data.sample(fraction=1.0, shuffle=True, seed=random_state)
+
+        if target_col not in df.columns:
+            logger.error(
+                "Target column '%s' not found in data for holdout split",
+                target_col,
+            )
+            raise ValueError(
+                f"Target column '{target_col}' not found in source data"
+            )
 
         if grouping is not None:
             group_col = grouping
@@ -406,4 +420,52 @@ class SplitManager:
                 f"Requested test_size={test_size:.3f}, achieved test proportion={final_ratio:.3f} (n_test={final_test}, n_train={final_train}, n_total={final_total})"
             )
 
-        return pl.concat([test_df, train_df])
+        holdout_df = pl.concat([test_df, train_df])
+
+        return self._enrich_holdout(
+            holdout_df=holdout_df,
+            data=data,
+            target_col=target_col,
+            metadata=metadata,
+            split_col_name=split_col_name,
+        )
+
+    def _enrich_holdout(
+        self,
+        holdout_df: pl.DataFrame,
+        data: pl.DataFrame,
+        target_col: str,
+        metadata: Optional[Union[pl.DataFrame, pl.LazyFrame]],
+        split_col_name: str,
+    ) -> pl.DataFrame:
+        """Attach label values and optional metadata to the split results."""
+
+        label_df = data.select(["sample", target_col])
+        result = holdout_df.join(
+            label_df, on="sample", how="left", coalesce=True
+        )
+        metadata_cols: List[str] = []
+        if metadata is not None:
+            if isinstance(metadata, pl.LazyFrame):
+                metadata_df = metadata.collect()
+            else:
+                metadata_df = metadata
+
+            if "sample" in metadata_df.columns:
+                metadata_df = metadata_df.unique(subset=["sample"])
+                metadata_cols = [
+                    col for col in metadata_df.columns if col != "sample"
+                ]
+                if metadata_cols:
+                    metadata_subset = metadata_df.select(
+                        ["sample"] + metadata_cols
+                    )
+                    result = result.join(
+                        metadata_subset, on="sample", how="left", coalesce=True
+                    )
+
+        final_columns = ["sample", split_col_name, target_col] + metadata_cols
+        available_columns = [
+            col for col in final_columns if col in result.columns
+        ]
+        return result.select(available_columns)

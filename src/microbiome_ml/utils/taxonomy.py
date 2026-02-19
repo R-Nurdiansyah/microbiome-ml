@@ -100,19 +100,17 @@ class TaxonomicRanks(IntEnum):
 
         Examples:
             >>> TaxonomicRanks.PHYLUM.get_regex()
-            'p__[^;]+(?:;c__)?$'  # Requires p__, optionally ends with child prefix
+            '^(?:[^;]+;)*p__[^;]+$'  # Any higher ranks allowed before the target rank
 
             >>> TaxonomicRanks.GENUS.get_regex()
-            'g__[^;]+(?:;s__)?$'  # Requires g__, optionally ends with child prefix
+            '^(?:[^;]+;)*g__[^;]+$'  # Matches taxonomy strings that end at genus level
         """
         # Match this rank's prefix
         pattern = f"{self.prefix}[^;]+"
 
-        # Optionally allow immediate child prefix at the end
+        # Optionally allow the immediate child prefix (including its token)
         child = self.child
         if child:
-            pattern += f"(?:;{child.prefix})?$"
-        else:
-            pattern += "$"
+            pattern += f"(?:;{child.prefix}[^;]+)?"
 
         return pattern

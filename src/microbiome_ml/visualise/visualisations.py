@@ -1,47 +1,78 @@
-"""Plot CV export history as histogram summaries.
+"""Class to do visualisations.
 
-Loads a results NDJSON file (or a directory containing `results.ndjson`) created
-by `CV_Result.export_result`. It builds three charts that highlight per-fold
-validation R² (flattened), average validation R² per run, and average validation
-MSE per run so you can eyeball stability and spread across combinations.
+Visualiser now owns a user-configured output path and exposes helpers:
+`plot_cv_bars(results=...)` for saving per-combination CV summaries and
+`visualise_model_performance(...)` for the core hexbin/residual diagnostics.
 
 Usage:
-    from visualisations.visualisations import Visualiser
-    vis = Visualiser("path/to/results.ndjson", out="figs.png")
-    vis.plot_cv_bars()
+    from microbiome_ml.visualise.visualisations import Visualiser
+    vis = Visualiser(out="figures")
+    vis.plot_cv_bars(results="path/to/results.ndjson")
+
+    evaluation = trainer.train_and_evaluate()
+    scheme = evaluation.metrics.get("scheme")
+    groups = [scheme] * len(evaluation.targets) if scheme else None
+    vis.visualise_model_performance(
+        evaluation.predictions,
+        evaluation.targets,
+        groups=groups,
+        title="Holdout diagnostics",
+        file_name="holdout.png",
+    )
 """
+
 from __future__ import annotations
 
 import json
 import logging
 import os
 import re
+import warnings
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from textwrap import wrap
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import cmasher as cmr
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import numpy as np
+import polars as pl
+import seaborn as sns
+from pandas import Categorical
+from pandas.errors import PerformanceWarning
+from scipy.stats import pearsonr, zscore
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+warnings.filterwarnings("ignore", category=PerformanceWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 class Visualiser:
-    """Encapsulate loading, extracting and plotting CV results."""
+    """Wrap CV exports and holdout diagnostics around a single output root."""
 
     def __init__(
         self,
-        results: Path,
-        out: Path = Path("visualisations/cv_histograms.png"),
+        out: Path = Path("visualisations"),
     ):
-        self.results = Path(results)
         self.out = Path(out)
+        if self.out.suffix:
+            self.output_dir = self.out.parent
+        else:
+            self.output_dir = self.out
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _load_ndjson(self, path: Path) -> List[Dict[str, Any]]:
         """Load NDJSON or JSON results.
 
         Accepts either a file path to an NDJSON/JSON file or a directory path
-        containing `results.ndjson`.
+        containing `results.ndjson` or `best_result.ndjson`.
         """
         if path.is_dir():
             ndjson = path / "results.ndjson"
+            if not ndjson.exists():
+                ndjson = path / "best_result.ndjson"
         else:
             ndjson = path
 
@@ -118,17 +149,16 @@ class Visualiser:
 
         Order of resolution:
         1. explicit `results` argument
-        2. `self.results` set at construction
-        3. environment variables `MICROBIOME_RESULTS` or `RESULTS`
-        4. interactive prompt asking the user for a path
+        2. environment variables `MICROBIOME_RESULTS` or `RESULTS`
+        3. interactive prompt asking the user for a path
         """
-        # 1 & 2
-        if results is not None:
-            candidate = Path(results)
-        else:
-            candidate = self.results
+        candidate: Optional[Path] = (
+            Path(results) if results is not None else None
+        )
+        if candidate and not candidate.exists():
+            candidate = None
 
-        # 3: env
+        # 2: env
         if not candidate or not candidate.exists():
             for key in ("MICROBIOME_RESULTS", "RESULTS"):
                 val = os.environ.get(key)
@@ -163,11 +193,15 @@ class Visualiser:
         """Plot bar chart (one file per combo, including model information)
         showing validation_r2_per_fold and avg_validation_r2.
 
-        - Groups records by (feature_set, label, scheme).
-        - Each group's file is saved as <feature_set>__<label>__<scheme>__<model>.png in `out_dir`
-          (defaults to `self.out.parent / "per_combo"`).
+                The NDJSON/directory path must be passed through `results` argument or resolved from environment variable or prompt. The expected format is either:
+        - a single NDJSON file containing records with keys like `feature_set`, `label`, `scheme`, `model`, `validation_r2_per_fold`, and `avg_validation_r2`, or
+        - a directory containing `results.ndjson` or `best_result.ndjson` with the same format.
+
+                - Groups records by (feature_set, label, scheme).
+                        - Each group's file is saved as <feature_set>__<label>__<scheme>__<model>.png in `out_dir`
+                            (defaults to `self.output_dir / "cv_results"`).
         """
-        load_path = Path(results) if results is not None else self.results
+        load_path = Path(results) if results is not None else None
         records = self._load_ndjson(self._resolve_results_path(load_path))
 
         # group by tuple key
@@ -183,12 +217,7 @@ class Visualiser:
 
         # prepare output directory
         if out_dir is None:
-            # If the configured `out` looks like a directory (suffixless) use it directly,
-            # otherwise fall back to the previous cv_results parent folder.
-            if self.out.suffix:
-                out_dir = self.out.parent / "cv_results"
-            else:
-                out_dir = self.out
+            out_dir = self.output_dir / "cv_results"
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -324,3 +353,323 @@ class Visualiser:
             fig.savefig(out_path, dpi=150)
             plt.close(fig)
             logging.info("Saved CV results to %s", out_path)
+
+    @staticmethod
+    def _custom_formatter(x: float, pos: int) -> str:
+        if x >= 1000:
+            return f"{float(x * 1e-3):.1f}k"
+        return str(int(x))
+
+    @staticmethod
+    def _remove_outliers_zscore(
+        data: Union[np.ndarray, pl.Series],
+        colours: Optional[pl.Series],
+        threshold: float,
+    ) -> Tuple[np.ndarray, Optional[List[str]]]:
+        data_arr = np.asarray(data)
+        z_scores = zscore(data_arr)
+        mask = (z_scores < threshold) & (z_scores > -threshold)
+        filtered_data = data_arr[mask]
+        if colours is None:
+            return filtered_data, None
+        colours_list = colours.to_list()
+        filtered_colours = [c for c, keep in zip(colours_list, mask) if keep]
+        return filtered_data, filtered_colours
+
+    @staticmethod
+    def _calculate_metrics(
+        predictions: np.ndarray, values: np.ndarray
+    ) -> Tuple[float, float, float, float]:
+        mse = mean_squared_error(values, predictions)
+        r2 = r2_score(values, predictions)
+        mae = mean_absolute_error(values, predictions)
+        pcc, _ = pearsonr(values, predictions)
+        return mse, r2, mae, pcc
+
+    @staticmethod
+    def _create_hexbin_plot(
+        fig: plt.Figure,
+        ax: plt.Axes,
+        values: np.ndarray,
+        predictions: np.ndarray,
+        cmap: str,
+        cax: plt.Axes,
+        lower_bound: float,
+        upper_bound: float,
+    ) -> Tuple[float, float]:
+        cmap = cmr.get_sub_cmap(cmap, 0.2, 0.8)
+        hb = ax.hexbin(
+            values,
+            predictions,
+            cmap=cmap,
+            bins="log",
+            zorder=3,
+            gridsize=50,
+            mincnt=1,
+            linewidths=0.2,
+            extent=(lower_bound, upper_bound, lower_bound, upper_bound),
+        )
+        ax.axline((0, 0), slope=1, color="#7272a1", linestyle="dashed")
+        fig.colorbar(
+            hb,
+            cax=cax,
+            label="Count (log_10)",
+            drawedges=False,
+            orientation="horizontal" if len(fig.axes) == 4 else "vertical",
+        )
+        cax.grid()
+        m, b = np.polyfit(values, predictions, 1)
+        ax.plot(
+            values,
+            m * np.array(values, dtype=np.float32) + b,
+            color="red",
+            alpha=0.75,
+            zorder=2,
+            linewidth=4,
+        )
+        ax.xaxis.set_major_locator(ticker.MaxNLocator(5))
+        return m, b
+
+    @staticmethod
+    def _set_axis_properties(
+        ax: plt.Axes, predictions: np.ndarray, values: np.ndarray, units: str
+    ) -> Tuple[float, float, float]:
+        all_values = np.concatenate((predictions, values))
+        buffer = np.ptp(all_values) * 0.1
+        lower_bound = min(all_values) - buffer
+        upper_bound = max(all_values) + buffer
+        ax.set_xlim((lower_bound, upper_bound))
+        ax.set_ylim((lower_bound, upper_bound))
+        ax.set_xlabel(f"Actual Values ({units})")
+        ax.set_ylabel(f"Predicted Values ({units})")
+        return lower_bound, upper_bound, buffer
+
+    @staticmethod
+    def _generate_hist_cmap(
+        c: Optional[pl.Series], c_list: List[Any], cmap: str
+    ) -> Tuple[Union[dict, list, None], Optional[List[Any]], bool]:
+        palette = cmr.get_sub_cmap(cmap, 0.2, 0.8)
+        legend = False
+        if c is None:
+            return None, None, legend
+        if c.dtype == pl.datatypes.Utf8:
+            legend = True
+            unique_entries = len(set(c_list))
+            if unique_entries > 20:
+                most_common = [
+                    item for item, _ in Counter(c_list).most_common(20)
+                ] + ["Other"]
+                c_list = [
+                    item if item in most_common and item != "NA" else "Other"
+                    for item in c_list
+                ]
+                colors_dict = {
+                    label: palette(idx)
+                    for label, idx in zip(
+                        most_common, np.linspace(0, 1, len(most_common))
+                    )
+                }
+                colors_dict["Other"] = (0.6, 0.6, 0.6, 1.0)
+                cat_list = Categorical(
+                    c_list, categories=most_common, ordered=True
+                )
+                return colors_dict, cat_list.to_list(), legend
+            if unique_entries > 10:
+                palette_list = [
+                    palette(i) for i in np.linspace(0, 1, unique_entries)
+                ]
+                return palette_list, c_list, legend
+            unique = sorted(set(c_list))
+            palette_list = [palette(i) for i in np.linspace(0, 1, len(unique))]
+            return palette_list, c_list, legend
+        c = c.cast(pl.Int64)
+        return palette, c_list, legend
+
+    def _create_histogram(
+        self,
+        fig: plt.Figure,
+        hax: plt.Axes,
+        predictions: np.ndarray,
+        values: np.ndarray,
+        units: str,
+        hist_bins: int,
+        hist_trim: float,
+        cax: plt.Axes,
+        c: Optional[pl.Series],
+        cmap: str,
+        cbar_label: Optional[str],
+    ) -> None:
+        diff = values - predictions
+        c_list: List[Any] = c.to_list() if c is not None else []
+        if hist_trim:
+            diff, trimmed = self._remove_outliers_zscore(diff, c, hist_trim)
+            if trimmed is not None:
+                c_list = trimmed
+        palette, hue, legend = self._generate_hist_cmap(c, c_list, cmap)
+        sns.histplot(
+            x=diff,
+            bins=hist_bins,
+            hue=hue,
+            palette=palette,
+            multiple="stack",
+            zorder=2,
+            ec=None,
+            alpha=1,
+            legend=legend,
+            ax=hax,
+        )
+        hax.axvline(x=0, color="#7272a1", linestyle="dashed", zorder=1)
+        hax.set_xlabel(f"Error [True - Pred] ({units})")
+        hax.set_ylabel("")
+        hax.yaxis.tick_right()
+        hax.xaxis.set_major_locator(ticker.MaxNLocator(5))
+        hax.yaxis.set_major_formatter(
+            ticker.FuncFormatter(self._custom_formatter)
+        )
+        if c is None:
+            cax.axis("off")
+        elif legend:
+            legend_obj = hax.get_legend()
+            if legend_obj is not None:
+                handles = [
+                    h for h in legend_obj.legend_handles if h is not None
+                ]
+                labels = [
+                    "\n".join(wrap(text.get_text(), 20))
+                    for text in legend_obj.texts
+                ]
+                if handles and labels:
+                    hax.legend(handles[: len(labels)], labels[: len(handles)])
+            sns.move_legend(
+                hax,
+                "upper left",
+                bbox_to_anchor=(1.15, 1),
+                title=None,
+                frameon=False,
+            )
+            cax.axis("off")
+        else:
+            if not c_list:
+                c_list = [0, 1]
+            norm = plt.Normalize(float(min(c_list)), float(max(c_list)))
+            cbar_cmap = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            fig.colorbar(
+                cbar_cmap,
+                cax=cax,
+                label=cbar_label,
+                drawedges=False,
+                orientation="horizontal",
+            )
+            cax.xaxis.set_major_formatter(
+                ticker.FuncFormatter(lambda x, pos: f"{int(x)}")
+            )
+            cax.grid()
+
+    @staticmethod
+    def _set_title(
+        fig: plt.Figure,
+        title: str,
+        pcc: float,
+        r2: float,
+        m: float,
+        b: float,
+        mse: float,
+        mae: float,
+        n: int,
+    ) -> None:
+        diagnostics = (
+            f"R2: {r2:.3f} | PCC: {pcc:.3f} | MSE: {mse:.3f} | MAE: {mae:.3f} | "
+            f"m: {m:.3f} | b: {b:.3f} | n: {n}"
+        )
+        fig.suptitle(title, fontsize="large", weight="bold", y=0.95)
+        fig.text(
+            0.5,
+            0.9,
+            diagnostics,
+            ha="center",
+            va="center",
+            fontsize="medium",
+            weight="normal",
+        )
+
+    def visualise_model_performance(
+        self,
+        predictions: Union[np.ndarray, pl.Series, list],
+        values: Union[np.ndarray, pl.Series, list],
+        title: str = "Actual vs. Predicted Values",
+        units: str = "",
+        groups: Union[pl.Series, list, None] = None,
+        hist_cmap: str = "viridis",
+        density_cmap: str = "inferno_r",
+        cbar_label: Optional[str] = None,
+        hist_trim: int = 4,
+        hist_bins: int = 20,
+        file_name: Optional[str] = None,
+    ) -> None:
+        mse, r2, mae, pcc = self._calculate_metrics(
+            np.asarray(predictions), np.asarray(values)
+        )
+        if isinstance(predictions, list):
+            predictions = np.array(predictions)
+        if isinstance(values, list):
+            values = np.array(values)
+        if isinstance(groups, list):
+            groups = pl.Series(groups)
+        if groups is None:
+            figsize = (10, 5.25)
+        elif groups.unique().len() == 1:
+            figsize = (10, 5.25)
+            groups = None
+        elif groups.dtype == pl.datatypes.Utf8:
+            figsize = (12, 6.25)
+            groups = groups.fill_null("NA").str.replace("N/A", "NA")
+        else:
+            figsize = (10, 5.25)
+            groups = groups.fill_null(0)
+        fig = plt.figure(figsize=figsize)
+        axs = gridspec.GridSpec(2, 2, figure=fig, height_ratios=[5, 0.25])
+        ax = plt.subplot(axs[0])
+        hax = plt.subplot(axs[1])
+        cax1 = plt.subplot(axs[2])
+        cax2 = plt.subplot(axs[3])
+        lower_bound, upper_bound, _ = self._set_axis_properties(
+            ax, np.asarray(predictions), np.asarray(values), units
+        )
+        m, b = self._create_hexbin_plot(
+            fig,
+            ax,
+            np.asarray(values),
+            np.asarray(predictions),
+            density_cmap,
+            cax1,
+            lower_bound,
+            upper_bound,
+        )
+        self._create_histogram(
+            fig,
+            hax,
+            np.asarray(predictions),
+            np.asarray(values),
+            units,
+            hist_bins,
+            hist_trim,
+            cax2,
+            groups,
+            hist_cmap,
+            cbar_label,
+        )
+        self._set_title(
+            fig, title, pcc, r2, m, b, mse, mae, len(np.asarray(values))
+        )
+        if file_name:
+            file_path = Path(file_name)
+            if (
+                file_path.parent in (Path(""), Path("."))
+                and not file_path.is_absolute()
+            ):
+                file_path = self.output_dir / file_path.name
+            else:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.tight_layout(rect=(0, 0, 1, 0.95))
+            plt.savefig(file_path, dpi=300)
+        plt.show()
