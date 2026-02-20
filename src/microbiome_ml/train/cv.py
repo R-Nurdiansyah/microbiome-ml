@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import polars as pl
 import yaml  # type: ignore[import]
+from joblib import Parallel, delayed
 from sklearn.base import clone
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import make_scorer, mean_squared_error
@@ -75,6 +76,18 @@ _MODEL_ALIASES = {
 }
 
 
+def _coerce_param_grid(raw: Optional[object]) -> object:
+    """Ensure ParameterGrid input is valid; fall back to [{}] when empty."""
+
+    if raw is None:
+        return [{}]
+    if isinstance(raw, (list, tuple)) and not raw:
+        return [{}]
+    if isinstance(raw, dict) and not raw:
+        return [{}]
+    return raw
+
+
 def _normalize_alias(name: str) -> str:
     # Normalize a model alias by lowercasing and removing non-alphanumeric
     # characters (except spaces), collapsing multiple spaces.
@@ -121,6 +134,7 @@ class CrossValidator:
         cv_folds: int = 5,
         label: Optional[Union[str, List[str]]] = None,
         scheme: Optional[Union[str, List[str]]] = None,
+        feature_set: Optional[Union[str, List[str]]] = None,
     ) -> None:
         if isinstance(dataset, Dataset):
             self.dataset = dataset
@@ -141,6 +155,7 @@ class CrossValidator:
         self.cv_folds = cv_folds
         self.label: Optional[Union[str, List[str]]] = label
         self.scheme: Optional[Union[str, List[str]]] = scheme
+        self.feature_set: Optional[Union[str, List[str]]] = feature_set
         self._best_validation_r2: float = float("-inf")
         self.best_result_key: Optional[str] = None
         self.best_result: Optional[CV_Result] = None
@@ -190,7 +205,8 @@ class CrossValidator:
 
     def run(
         self,
-        param_path: str = "hyperparameters.yaml",
+        param_path: str = "parameters.yaml",
+        n_jobs: Optional[int] = None,
     ) -> dict:
         """Manages the cross-validation process across different feature sets,
         labels, schemes, models, and hyperparameter combinations.
@@ -201,11 +217,11 @@ class CrossValidator:
             label: Union[str, List[str]] = None (specific label(s) to use; defaults to self.label or all label attributes in dataset)
             scheme: Union[str, List[str]] = None (specific CV scheme(s) to use; defaults to all schemes in dataset)
             param_path: str = "hyperparameters.yaml" (path to YAML file with hyperparameter grids)
+            n_jobs: Optional[int] = None (number of cross-validation combinations to evaluate in parallel; defaults to detected CPU cores)
         Outputs:
             Dict[str, CV_Result]: A dictionary mapping each unique combination of feature set, label, scheme, model, and hyperparameters to its CV_Result.
         """
 
-        # Initialize results dictionary and needed inputs
         results: Dict[str, CV_Result] = {}
 
         # Determine label and scheme to use
@@ -223,13 +239,35 @@ class CrossValidator:
             schemes = [s for _, s, _ in self.dataset.iter_cv_folds()]
             unique_schemes = list(dict.fromkeys(schemes))
             scheme_to_use = unique_schemes
+
         mapping = self._prepare_inputs(
-            self.dataset, fillna=0.0, label=label_to_use, scheme=scheme_to_use
+            self.dataset,
+            fillna=0.0,
+            label=label_to_use,
+            scheme=scheme_to_use,
+            feature_set=self.feature_set,
         )
         params_grid = self.load_param_grids(param_path)
         logger.info(
             f"Starting cross-validation with {len(mapping)} feature/label/scheme combinations and models: {self.models}"
         )
+
+        scorers = {
+            "r2": "r2",
+            "mse": make_scorer(mean_squared_error, greater_is_better=False),
+        }
+
+        combo_payloads: List[
+            Tuple[
+                str,
+                Optional[str],
+                Optional[str],
+                Optional[str],
+                np.ndarray,
+                np.ndarray,
+                PredefinedSplit,
+            ]
+        ] = []
 
         for key, (X_np, y_np, joined) in mapping.items():
             try:
@@ -276,99 +314,167 @@ class CrossValidator:
                 )
                 continue
 
-            ps = PredefinedSplit(test_fold=fold_arr)  # uses your exact folds
-
-            # scorers: r2 (higher better) and mse (we use neg mse and will negate back)
-            scorers = {
-                "r2": "r2",
-                "mse": make_scorer(
-                    mean_squared_error, greater_is_better=False
-                ),
-            }
-
+            ps = PredefinedSplit(test_fold=fold_arr)
             X_arr = np.asarray(X_np)
             y_arr = np.asarray(y_np, dtype=float)
 
-            for model in self.models:
-                if isinstance(model, str):
-                    model_key = _resolve_model_alias(model)
-                    grid = params_grid.get(model_key, [{}])
-                    for params in ParameterGrid(grid):
-                        base_model = _MODEL_CONSTRUCTORS[model_key]()
-                        base_model.set_params(**params)
-                        cvres = cross_validate(
-                            base_model,
-                            X_arr,
-                            y_arr,
-                            cv=ps,
-                            scoring=scorers,
-                            return_train_score=False,
-                            n_jobs=-1,
-                        )
-                        per_r2 = list(cvres["test_r2"])
-                        per_mse = [
-                            -m for m in cvres["test_mse"]
-                        ]  # negate because scorer is neg MSE
-                        result_key = (
-                            f"{key}::{base_model.__class__.__name__}::{params}"
-                        )
-                        base_model.fit(X_arr, y_arr)
-                        cv_result = CV_Result(
-                            feature_set=feature_name,
-                            label=label_name,
-                            scheme=scheme_name,
-                            cross_val_scores=per_r2,
-                            validation_r2_per_fold=per_r2,
-                            validation_mse_per_fold=per_mse,
-                            best_params=dict(params),
-                            trained_model=base_model,
-                        )
-                        results[result_key] = cv_result
-                        self._update_best_model(
-                            result_key, cv_result, estimator=base_model
-                        )
-                    continue  # skip to next model after processing all param combos
-                else:
-                    # estimator instance provided by user
-                    est_name = model.__class__.__name__.lower()
-                    grid = params_grid.get(est_name, [{}])
-                    for params in ParameterGrid(grid):
-                        est = clone(model)
-                        est.set_params(**params)
-                        cvres = cross_validate(
-                            est,
-                            X_arr,
-                            y_arr,
-                            cv=ps,
-                            scoring=scorers,
-                            return_train_score=False,
-                            n_jobs=-1,
-                        )
-                        per_r2 = list(cvres["test_r2"])
-                        per_mse = [-v for v in cvres["test_mse"]]
-                        result_key = (
-                            f"{key}::{est.__class__.__name__}::{params}"
-                        )
-                        est.fit(X_arr, y_arr)
-                        cv_result = CV_Result(
-                            feature_set=feature_name,
-                            label=label_name,
-                            scheme=scheme_name,
-                            cross_val_scores=per_r2,
-                            validation_r2_per_fold=per_r2,
-                            validation_mse_per_fold=per_mse,
-                            best_params=dict(params),
-                            trained_model=est,
-                        )
-                        results[result_key] = cv_result
-                        self._update_best_model(
-                            result_key, cv_result, estimator=est
-                        )
-                        logger.info(
-                            f"Completed CV for {result_key} with params {params}"
-                        )
+            combo_payloads.append(
+                (key, feature_name, label_name, scheme_name, X_arr, y_arr, ps)
+            )
+
+        if not combo_payloads:
+            return results
+
+        cpu_total = os.cpu_count() or 1
+        if n_jobs is None:
+            parallel_jobs = min(cpu_total, len(combo_payloads))
+        else:
+            parallel_jobs = max(1, min(int(n_jobs), len(combo_payloads)))
+        parallel_jobs = max(1, parallel_jobs)
+
+        # Avoid nested over-subscription: only fan-out inside cross_validate when sequential
+        inner_cv_jobs = -1 if parallel_jobs == 1 else 1
+
+        logger.info(
+            "Dispatching %d CV combinations across %d worker(s) (inner_cv_jobs=%d)",
+            len(combo_payloads),
+            parallel_jobs,
+            inner_cv_jobs,
+        )
+
+        parallel = Parallel(n_jobs=parallel_jobs)
+        job_outputs = parallel(
+            delayed(CrossValidator._process_combo)(
+                payload,
+                self.models,
+                params_grid,
+                scorers,
+                inner_cv_jobs,
+            )
+            for payload in combo_payloads
+        )
+
+        for combo_key, partial_results, best_info in job_outputs:
+            results.update(partial_results)
+            logger.info(
+                "Finished combination %s with %d trained model(s)",
+                combo_key,
+                len(partial_results),
+            )
+            if best_info is not None:
+                best_key, best_cv_result, best_estimator, _ = best_info
+                self._update_best_model(
+                    best_key, best_cv_result, estimator=best_estimator
+                )
 
         return results
+
+    @staticmethod
+    def _process_combo(
+        payload: Tuple[
+            str,
+            Optional[str],
+            Optional[str],
+            Optional[str],
+            np.ndarray,
+            np.ndarray,
+            PredefinedSplit,
+        ],
+        models: List[object],
+        params_grid: Dict[str, Any],
+        scorers: Dict[str, Any],
+        inner_cv_jobs: int,
+    ) -> Tuple[
+        str,
+        Dict[str, CV_Result],
+        Optional[Tuple[str, CV_Result, Any, float]],
+    ]:
+        key, feature_name, label_name, scheme_name, X_arr, y_arr, ps = payload
+        results: Dict[str, CV_Result] = {}
+        best_info: Optional[Tuple[str, CV_Result, Any, float]] = None
+
+        for model in models:
+            if isinstance(model, str):
+                model_key = _resolve_model_alias(model)
+                grid = _coerce_param_grid(params_grid.get(model_key, [{}]))
+                for params in ParameterGrid(grid):
+                    estimator = _MODEL_CONSTRUCTORS[model_key]()
+                    estimator.set_params(**params)
+                    cvres = cross_validate(
+                        estimator,
+                        X_arr,
+                        y_arr,
+                        cv=ps,
+                        scoring=scorers,
+                        return_train_score=False,
+                        n_jobs=inner_cv_jobs,
+                    )
+                    per_r2 = list(cvres["test_r2"])
+                    per_mse = [-m for m in cvres["test_mse"]]
+                    result_key = (
+                        f"{key}::{estimator.__class__.__name__}::{params}"
+                    )
+                    estimator.fit(X_arr, y_arr)
+                    cv_result = CV_Result(
+                        feature_set=feature_name,
+                        label=label_name,
+                        scheme=scheme_name,
+                        cross_val_scores=per_r2,
+                        validation_r2_per_fold=per_r2,
+                        validation_mse_per_fold=per_mse,
+                        best_params=dict(params),
+                        trained_model=estimator,
+                    )
+                    results[result_key] = cv_result
+                    avg_r2 = cv_result.avg_validation_r2
+                    if avg_r2 is not None and (
+                        best_info is None or avg_r2 > best_info[3]
+                    ):
+                        best_info = (result_key, cv_result, estimator, avg_r2)
+                    logger.info(
+                        f"Completed CV for {result_key} with params {params}"
+                    )
+                continue
+
+            est_name = model.__class__.__name__.lower()
+            grid = _coerce_param_grid(params_grid.get(est_name, [{}]))
+            for params in ParameterGrid(grid):
+                estimator = clone(model)
+                estimator.set_params(**params)
+                cvres = cross_validate(
+                    estimator,
+                    X_arr,
+                    y_arr,
+                    cv=ps,
+                    scoring=scorers,
+                    return_train_score=False,
+                    n_jobs=inner_cv_jobs,
+                )
+                per_r2 = list(cvres["test_r2"])
+                per_mse = [-v for v in cvres["test_mse"]]
+                result_key = f"{key}::{estimator.__class__.__name__}::{params}"
+                estimator.fit(X_arr, y_arr)
+                cv_result = CV_Result(
+                    feature_set=feature_name,
+                    label=label_name,
+                    scheme=scheme_name,
+                    cross_val_scores=per_r2,
+                    validation_r2_per_fold=per_r2,
+                    validation_mse_per_fold=per_mse,
+                    best_params=dict(params),
+                    trained_model=estimator,
+                )
+                results[result_key] = cv_result
+                avg_r2 = cv_result.avg_validation_r2
+                if avg_r2 is not None and (
+                    best_info is None or avg_r2 > best_info[3]
+                ):
+                    best_info = (result_key, cv_result, estimator, avg_r2)
+                logger.info(
+                    f"Completed CV for {result_key} with params {params}"
+                )
+
+        return key, results, best_info
 
     def run_grid(
         self,
@@ -381,6 +487,7 @@ class CrossValidator:
         Inputs:
             label: Union[str, List[str]] = None (specific label(s) to use; defaults to self.label or all label attributes in dataset)
             scheme: Union[str, List[str]] = None (specific CV scheme(s) to use; defaults to all schemes in dataset)
+            feature_set: Union[str, List[str]] = None (specific feature set(s) to use; defaults to all feature sets in dataset)
             param_path: str = "hyperparameters.yaml" (path to YAML file with hyperparameter grids)
             n_jobs: Optional[int] = None (number of parallel jobs for GridSearchCV; if None, auto-determined)
             params_per_job: int = 2 (used if n_jobs is None; number of hyperparameter combinations per job to estimate n_jobs)
@@ -405,7 +512,11 @@ class CrossValidator:
 
         results: Dict[str, CV_Result] = {}
         mapping = self._prepare_inputs(
-            self.dataset, fillna=0.0, label=label_to_use, scheme=scheme_to_use
+            self.dataset,
+            fillna=0.0,
+            label=label_to_use,
+            scheme=scheme_to_use,
+            feature_set=self.feature_set,
         )
         param_grids = self.load_param_grids(param_path)
         scorers = {
@@ -463,13 +574,13 @@ class CrossValidator:
             for model in self.models:
                 if isinstance(model, str):
                     model_key = _resolve_model_alias(model)
-                    grid = param_grids.get(model_key, [{}])
+                    grid = _coerce_param_grid(param_grids.get(model_key, [{}]))
                     estimator = _MODEL_CONSTRUCTORS[model_key]()
                 else:
                     # estimator instance: prefer class-name key, then canonical short keys
                     est_name = model.__class__.__name__.lower()
-                    grid = param_grids.get(est_name, None)
-                    if grid is None:
+                    raw_grid = param_grids.get(est_name, None)
+                    if raw_grid is None:
                         canon = None
                         for k, ctor in _MODEL_CONSTRUCTORS.items():
                             try:
@@ -479,11 +590,13 @@ class CrossValidator:
                             except Exception:
                                 continue
                         grid = (
-                            param_grids.get(canon, [{}])
+                            _coerce_param_grid(param_grids.get(canon, [{}]))
                             if canon is not None
                             else [{}]
                         )
                     estimator = model
+                    if raw_grid is not None:
+                        grid = _coerce_param_grid(raw_grid)
                 n_jobs_use = self._select_n_jobs(grid, n_jobs, params_per_job)
                 gs = GridSearchCV(
                     estimator=estimator,
@@ -534,6 +647,7 @@ class CrossValidator:
         fillna: float = 0.0,
         label: Optional[Union[str, List[str]]] = None,
         scheme: Optional[Union[str, List[str]]] = None,
+        feature_set: Optional[Union[str, List[str]]] = None,
     ) -> Dict[str, Tuple[np.ndarray, np.ndarray, Any]]:
         """Prepares the input data for cross-validation by aligning feature
         sets, labels, and CV schemes.
@@ -557,8 +671,31 @@ class CrossValidator:
                 "dataset has no 'splits' attribute; cannot find cv_schemes"
             )
 
+        if feature_set is not None:
+            if isinstance(feature_set, (list, tuple, set)):
+                requested_features = list(feature_set)
+            else:
+                requested_features = [feature_set]
+            feature_names: List[str] = []
+            for req in requested_features:
+                if req in feature_sets:
+                    feature_names.append(req)
+                else:
+                    logger.warning(
+                        "Requested feature set '%s' not found on dataset; skipping.",
+                        req,
+                    )
+                    logger.warning(
+                        "Available feature sets: %s", list(feature_sets.keys())
+                    )
+            if not feature_names:
+                return results
+        else:
+            feature_names = list(feature_sets.keys())
+
         # 2. Materialize feature sets and labels into DataFrames
-        for feat_name, feat_obj in list(feature_sets.items()):
+        for feat_name in feature_names:
+            feat_obj = feature_sets[feat_name]
             feat_df = feat_obj.to_df()
             acc_col = next(
                 (c for c in ("sample", "acc") if c in feat_df.columns), None
@@ -588,6 +725,7 @@ class CrossValidator:
                             "Requested label '%s' not found on dataset; skipping.",
                             req,
                         )
+                        logger.warning("Available labels: %s", available_names)
                 # nothing found -> continue to next feature set
                 if not label_keys:
                     continue
@@ -664,6 +802,10 @@ class CrossValidator:
                                     "Requested scheme '%s' not found for label '%s'.",
                                     req,
                                     label_name,
+                                )
+                                logger.warning(
+                                    "Available schemes: %s",
+                                    list(available_cv_schemes.keys()),
                                 )
                     else:
                         # Fallback: build available schemes from dataset.iter_cv_folds
