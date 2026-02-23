@@ -150,11 +150,11 @@ cv = CrossValidator(
     scheme=["bioproject","ecoregion"]
     )
 
-# Cross validation run; parameters is required
-results = cv.run(param_path="parameters.yaml")
+# Cross validation run; parameters is required and n_jobs is number of CV done in parallel. Default will detect CPU core
+results = cv.run(param_path="parameters.yaml", n_jobs = 8)
 
 # Grid Cross validation run -> using GridCV from sklearn
-# Add n_jobs to specify parallezition in GridCV (None will dynamically determine based on CPU and hyperparams combos)
+# Add n_jobs to specify parallelization in GridCV (None will dynamically determine based on CPU and hyperparams combos)
 results_grid = cv.run_grid(param_path="hyperparameters.yaml")
 ```
 
