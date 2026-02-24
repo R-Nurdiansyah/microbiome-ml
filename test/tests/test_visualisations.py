@@ -3,7 +3,9 @@ from pathlib import Path
 
 import matplotlib
 import numpy as np
+from sklearn.ensemble import RandomForestRegressor
 
+from microbiome_ml.train.results import CV_Result, HoldoutEvaluation
 from microbiome_ml.visualise.visualisations import Visualiser
 
 matplotlib.use("Agg")
@@ -60,3 +62,43 @@ def test_visualise_model_performance_saves_holdout(tmp_path):
     )
 
     assert (tmp_path / "figs" / "holdout.png").exists()
+
+
+def test_plot_feature_importances_accepts_result_objects(tmp_path):
+    X = np.array(
+        [
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 0.0],
+            [1.0, 1.0],
+        ]
+    )
+    y = np.array([0.0, 1.0, 0.0, 1.0])
+    model = RandomForestRegressor(n_estimators=8, random_state=0)
+    model.fit(X, y)
+
+    cv_result = CV_Result(
+        feature_set="fset",
+        label="target",
+        scheme="schemeA",
+        trained_model=model,
+        feature_names=["f1", "f2"],
+    )
+    holdout_eval = HoldoutEvaluation(
+        metrics={
+            "feature_set": "fset",
+            "label": "target",
+            "scheme": "holdout",
+        },
+        estimator=model,
+        predictions=np.array([0.1, 0.8]),
+        targets=np.array([0.0, 1.0]),
+        feature_names=["f1", "f2"],
+    )
+
+    vis = Visualiser(out=tmp_path / "figs")
+    vis.plot_feature_importances(cv_result, output="fi_cv.png")
+    vis.plot_feature_importances(holdout_eval, output="fi_holdout.png")
+
+    assert (tmp_path / "figs" / "fi_cv.png").exists()
+    assert (tmp_path / "figs" / "fi_holdout.png").exists()

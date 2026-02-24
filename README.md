@@ -156,49 +156,174 @@ results = cv.run(param_path="parameters.yaml", n_jobs = 8)
 # Grid Cross validation run -> using GridCV from sklearn
 # Add n_jobs to specify parallelization in GridCV (None will dynamically determine based on CPU and hyperparams combos)
 results_grid = cv.run_grid(param_path="hyperparameters.yaml")
+
+# Export CV result package (will save everything but not the best model)
+CV_Result.export_result(results, "out/cv_results")
+
+# OR just save the best model
+if cv_temp.best_model_estimator is not None and cv_temp.best_result is not None:
+    # full export package (model, ndjson, feature_importance)
+    CV_Result.export_result({"best": cv_temp.best_result}, out_best)
+
 ```
 
 ## Final Holdout-Evaluation
 
-
-## Save and load dataset (human-readable directory structure) and visualization
+After selecting the best CV configuration (`cv.best_result`), retrain it on the
+holdout-train split and evaluate on holdout-test:
 
 ```python
-# Save and load dataset
-dataset.save("path/to/save/dataset", compress=True)  # .tar.gz
-dataset.save("path/to/save/dataset") # saved in directory
-dataset = Dataset.load("path/to/save/dataset.tar.gz")
-dataset = Dataset.load("path/to/save/dataset") #load from directory
+from microbiome_ml.train.trainer import ModelTrainer
+from microbiome_ml import Visualiser
 
-# Save model and result
+if cv.best_result is None:
+    raise RuntimeError("Run CV first so best_result is available")
+
+# trainer will export whole data to the output_model_path (model.pkl, result, feature importance)
+trainer = ModelTrainer(
+    dataset=dataset,
+    best_result=cv.best_result,
+    output_model_path="out/holdout",
+)
+evaluation = trainer.train_and_evaluate()
+
+print(evaluation.metrics)
+# keys include: mae, mse, r2, q2, pcc, pval, feature_set, label, scheme, n_test
+
+# Optional holdout diagnostics plot
+vis = Visualiser(out="out/figures")
+scheme = evaluation.metrics.get("scheme")
+groups = [scheme] * len(evaluation.targets) if scheme else None
+vis.visualise_model_performance(
+    evaluation.predictions,
+    evaluation.targets,
+    groups=groups,
+    title="Holdout diagnostics",
+    file_name="holdout_diagnostics.png",
+)
+```
+
+Outputs:
+- Trained holdout model persisted to `output_model_path`
+- `HoldoutEvaluation` object with predictions, targets, metrics, and feature names
+
+## Feature Importance Workflow
+
+Use this workflow to inspect feature importance at both stages:
+
+1. **CV stage**: use feature importance from the best CV model for stability checks.
+2. **Holdout stage**: retrain on holdout-train and use holdout feature importance for final reporting.
+3. **Export stage**: save all CV outputs, including `feature_importances.csv`.
+
+```python
+from microbiome_ml import Visualiser
+from microbiome_ml.train.trainer import ModelTrainer
 from microbiome_ml.train.results import CV_Result
 
-# Persist all CV outputs: manifest, results.ndjson, a summary CSV and per-combo
-# model pickles under models/<feature_set>;<label>;<scheme>
+# 1) Run CV
+results = cv.run(param_path="parameters.yaml", n_jobs=8)
+
+# 2) Export CV package (includes feature_importances.csv)
+CV_Result.export_result(results, "out/cv_results")
+
+# 3) Plot feature importance directly from best CV result
+vis = Visualiser(out="out/figures")
+if cv.best_result is not None:
+    vis.plot_feature_importances(
+        cv.best_result,
+        output="cv_feature_importance.png",
+    )
+
+# 4) Train final holdout model and plot final feature importance
+trainer = ModelTrainer(
+    dataset=dataset,
+    best_result=cv.best_result,
+    output_model_path="out/holdout",
+)
+evaluation = trainer.train_and_evaluate()
+vis.plot_feature_importances(
+    evaluation,
+    output="holdout_feature_importance.png",
+)
+```
+
+Notes:
+- `plot_feature_importances(...)` accepts `CV_Result`, `HoldoutEvaluation`, estimator objects, dict payloads with `{"model": ...}`, or a pickle model path.
+- If feature names are not passed explicitly, the function uses result metadata, then estimator metadata (`feature_names_in_`), then fallback names like `feature_0`.
+
+
+## Save, Load, and Visualize
+
+### Save and load dataset
+
+```python
+# Save as compressed archive (.tar.gz)
+dataset.save("path/to/save/dataset", compress=True)
+
+# Save as directory structure
+dataset.save("path/to/save/dataset")
+
+# Load from archive or directory
+dataset = Dataset.load("path/to/save/dataset.tar.gz")
+dataset = Dataset.load("path/to/save/dataset")
+```
+
+### Save model and CV results
+
+```python
+from microbiome_ml.train.results import CV_Result
+
+# Export CV package: manifest + ndjson/csv tables + model pickles
 CV_Result.export_result(results, "out/results")
 CV_Result.export_result(results_grid, "out/grid-results")
 
+# Optionally persist the single best estimator/result
 if cv.best_model_estimator is not None and cv.best_result is not None:
-    # Save the best estimator (gzip recommended, .pkl.gz) and its CV record alone
     CV_Result.save_model(
-        cv.best_model_estimator, "out/best_model.pkl.gz", compress=True
+        cv.best_model_estimator,
+        "out/best_model.pkl.gz",
+        compress=True,
     )
     CV_Result.save_cv_result(cv.best_result, "out/best_result.ndjson")
-
-## Visualization
-
-visualiser = Visualiser(results, out_dir="path/to/save/visualization")
-visualiser.plot_performance_metrics()
-visualiser.plot_feature_importances()
-
-# Plot CV result in barplot
-visualiser.plot_cv_bars('path to cv result directory', 'output dir')  # creates bar plots per CV combo
-
-# Plot
-
-plot_cv_bars consumes the result NDJSON (or directory) and writes one PNG per feature set / label / scheme / model
-combination. Filenames embed each dimension (e.g., Feature_Set__label__scheme__model.png).
 ```
+
+### Visualization
+
+```python
+from microbiome_ml import Visualiser
+
+vis = Visualiser(out="out/figures")
+
+# CV bar plots: one PNG per feature_set / label / scheme / model
+vis.plot_cv_bars(results="out/results")
+
+# Feature importance from best CV result
+if cv.best_result is not None:
+    vis.plot_feature_importances(
+        cv.best_result,
+        output="cv_feature_importance.png",
+    )
+
+# Feature importance from holdout evaluation
+vis.plot_feature_importances(
+    evaluation,
+    output="holdout_feature_importance.png",
+)
+
+# Holdout diagnostics: actual vs predicted + residual histogram
+scheme = evaluation.metrics.get("scheme")
+groups = [scheme] * len(evaluation.targets) if scheme else None
+vis.visualise_model_performance(
+    evaluation.predictions,
+    evaluation.targets,
+    groups=groups,
+    title="Holdout diagnostics",
+    file_name="holdout_diagnostics.png",
+)
+```
+
+`plot_cv_bars` consumes a results NDJSON file or a directory containing
+`results.ndjson` / `best_result.ndjson` and writes one file per combination.
 
 ## Development
 

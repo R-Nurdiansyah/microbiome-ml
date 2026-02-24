@@ -85,4 +85,26 @@ def test_train_and_evaluate_returns_holdout_evaluation(tmp_path):
     assert evaluation.metrics["label"] == "target"
     assert evaluation.metrics["n_test"] == 2
     assert evaluation.metrics["r2"] is not None
+    assert evaluation.feature_names == ["f1"]
     assert (tmp_path / "model.pkl").exists()
+
+
+def test_train_and_evaluate_exports_package_for_directory_output(tmp_path):
+    dataset = _build_simple_dataset()
+    result = _build_result()
+    out_dir = tmp_path / "holdout_export"
+    trainer = ModelTrainer(
+        dataset=dataset,
+        best_result=result,
+        output_model_path=out_dir,
+    )
+
+    evaluation = trainer.train_and_evaluate()
+
+    assert isinstance(evaluation, HoldoutEvaluation)
+    assert (out_dir / "manifest.json").exists()
+    assert (out_dir / "results.ndjson").exists()
+    assert (out_dir / "results_summary.csv").exists()
+    assert (out_dir / "results_folds.csv").exists()
+    assert (out_dir / "feature_importances.csv").exists()
+    assert list((out_dir / "models").rglob("*.pkl"))

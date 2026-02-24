@@ -263,6 +263,7 @@ class CrossValidator:
                 Optional[str],
                 Optional[str],
                 Optional[str],
+                List[str],
                 np.ndarray,
                 np.ndarray,
                 PredefinedSplit,
@@ -317,9 +318,22 @@ class CrossValidator:
             ps = PredefinedSplit(test_fold=fold_arr)
             X_arr = np.asarray(X_np)
             y_arr = np.asarray(y_np, dtype=float)
+            drop_cols = {"sample", "fold"}
+            if label_name:
+                drop_cols.add(label_name)
+            feature_columns = [c for c in joined.columns if c not in drop_cols]
 
             combo_payloads.append(
-                (key, feature_name, label_name, scheme_name, X_arr, y_arr, ps)
+                (
+                    key,
+                    feature_name,
+                    label_name,
+                    scheme_name,
+                    feature_columns,
+                    X_arr,
+                    y_arr,
+                    ps,
+                )
             )
 
         if not combo_payloads:
@@ -376,6 +390,7 @@ class CrossValidator:
             Optional[str],
             Optional[str],
             Optional[str],
+            List[str],
             np.ndarray,
             np.ndarray,
             PredefinedSplit,
@@ -389,7 +404,16 @@ class CrossValidator:
         Dict[str, CV_Result],
         Optional[Tuple[str, CV_Result, Any, float]],
     ]:
-        key, feature_name, label_name, scheme_name, X_arr, y_arr, ps = payload
+        (
+            key,
+            feature_name,
+            label_name,
+            scheme_name,
+            feature_names,
+            X_arr,
+            y_arr,
+            ps,
+        ) = payload
         results: Dict[str, CV_Result] = {}
         best_info: Optional[Tuple[str, CV_Result, Any, float]] = None
 
@@ -424,6 +448,7 @@ class CrossValidator:
                         validation_mse_per_fold=per_mse,
                         best_params=dict(params),
                         trained_model=estimator,
+                        feature_names=feature_names,
                     )
                     results[result_key] = cv_result
                     avg_r2 = cv_result.avg_validation_r2
@@ -463,6 +488,7 @@ class CrossValidator:
                     validation_mse_per_fold=per_mse,
                     best_params=dict(params),
                     trained_model=estimator,
+                    feature_names=feature_names,
                 )
                 results[result_key] = cv_result
                 avg_r2 = cv_result.avg_validation_r2
@@ -570,6 +596,10 @@ class CrossValidator:
             ps = PredefinedSplit(test_fold=fold_arr)
             X_arr = np.asarray(X_np)
             y_arr = np.asarray(y_np, dtype=float)
+            drop_cols = {"sample", "fold"}
+            if label_name:
+                drop_cols.add(label_name)
+            feature_columns = [c for c in joined.columns if c not in drop_cols]
 
             for model in self.models:
                 if isinstance(model, str):
@@ -630,6 +660,7 @@ class CrossValidator:
                     validation_mse_per_fold=per_mse,
                     best_params=best_params,
                     trained_model=gs.best_estimator_,
+                    feature_names=feature_columns,
                 )
                 results[result_key] = cv_result
                 self._update_best_model(

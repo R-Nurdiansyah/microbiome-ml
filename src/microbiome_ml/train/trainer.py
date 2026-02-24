@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import polars as pl
@@ -53,6 +53,7 @@ class ModelTrainer:
         if provided_path.exists() and provided_path.is_file():
             self.output_model_dir = provided_path.parent
             self.output_model_path = provided_path
+            self._save_as_package = False
         elif provided_path.suffix and not provided_path.exists():
             # treat as explicit file path even if parent directory missing
             self.output_model_dir = (
@@ -61,6 +62,7 @@ class ModelTrainer:
                 else Path(".")
             )
             self.output_model_path = provided_path
+            self._save_as_package = False
         else:
             self.output_model_dir = provided_path
             default_name = "holdout model"
@@ -69,6 +71,7 @@ class ModelTrainer:
             if not file_name.lower().endswith(".pkl"):
                 file_name = f"{file_name}.pkl"
             self.output_model_path = self.output_model_dir / file_name
+            self._save_as_package = True
 
     def train_and_evaluate(self) -> HoldoutEvaluation:
         """Train/re-evaluate the CV winner on the holdout train/test split.
@@ -79,8 +82,10 @@ class ModelTrainer:
               values with `fillna`.
             3. Clone and configure the estimator stored on `best_result`, retrain it on
               the holdout training samples, and evaluate on the holdout test samples.
-            4. Save the retrained estimator via `CV_Result.save_model` inside the provided output directory
-              and return the regression metrics plus the estimator instance.
+            4. Persist the retrained estimator. If `output_model_path` is file-like,
+                save a single pickle model. If directory-like, export a full results
+                package via `CV_Result.export_result`.
+            5. Return regression metrics plus the estimator instance.
         """
         feature_set_name = self._require_feature_set()
         label_name = self._require_label()
@@ -94,10 +99,12 @@ class ModelTrainer:
 
         feature_df = self._materialize_feature_set(feature_set_name)
 
-        X_train, y_train = self._assemble_split(
+        X_train, y_train, feature_cols = self._assemble_split(
             feature_df, train_df, label_name
         )
-        X_test, y_test = self._assemble_split(feature_df, test_df, label_name)
+        X_test, y_test, _ = self._assemble_split(
+            feature_df, test_df, label_name
+        )
 
         estimator = self._clone_estimator()
         estimator.fit(X_train, y_train)
@@ -117,13 +124,37 @@ class ModelTrainer:
         )
 
         self.output_model_dir.mkdir(parents=True, exist_ok=True)
-        CV_Result.save_model(estimator, self.output_model_path)
+        if self._save_as_package:
+            holdout_result = CV_Result(
+                feature_set=feature_set_name,
+                label=label_name,
+                scheme=self.best_result.scheme,
+                cross_val_scores=[float(result_metrics["r2"])]
+                if result_metrics.get("r2") is not None
+                else [],
+                validation_r2_per_fold=[float(result_metrics["r2"])]
+                if result_metrics.get("r2") is not None
+                else [],
+                validation_mse_per_fold=[float(result_metrics["mse"])]
+                if result_metrics.get("mse") is not None
+                else [],
+                best_params=self.best_result.best_params,
+                trained_model=estimator,
+                feature_names=feature_cols,
+            )
+            CV_Result.export_result(
+                {"holdout_final_model": holdout_result},
+                self.output_model_dir,
+            )
+        else:
+            CV_Result.save_model(estimator, self.output_model_path)
 
         return HoldoutEvaluation(
             metrics=result_metrics,
             estimator=estimator,
             predictions=np.asarray(predictions),
             targets=np.asarray(y_test),
+            feature_names=feature_cols,
         )
 
     def _clone_estimator(self) -> Any:
@@ -160,7 +191,7 @@ class ModelTrainer:
 
     def _assemble_split(
         self, feature_df: pl.DataFrame, split_df: pl.DataFrame, label: str
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """Produce the feature matrix and target array for a specific split."""
         feature_cols = [col for col in feature_df.columns if col != "sample"]
         if not feature_cols:
@@ -182,7 +213,7 @@ class ModelTrainer:
         y = np.asarray(
             joined.select(pl.col(label)).to_numpy().ravel(), dtype=float
         )
-        return X, y
+        return X, y, feature_cols
 
     def _require_feature_set(self) -> str:
         feature_set = self.best_result.feature_set

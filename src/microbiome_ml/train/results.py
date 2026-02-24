@@ -6,6 +6,12 @@ Typical workflow:
     # flush out manifests, ndjson/csv and per-combo model pickles
     CV_Result.export_result(results, "out/cv_results")
 
+`export_result(...)` now writes these tabular artifacts side-by-side:
+- `results.ndjson`
+- `results_summary.csv`
+- `results_folds.csv`
+- `feature_importances.csv` (when model exposes `feature_importances_`)
+
 Use `CV_Result.save_cv_result(result, path)` when you just need the
 metadata for a single combo, and `CV_Result.save_model(estimator, path)` for
 pickling models on demand.  `load_model` can restore those pickles later.
@@ -27,12 +33,17 @@ import numpy as np
 
 @dataclass
 class HoldoutEvaluation:
-    """Slice of holdout/final test results suitable for plotting/reporting."""
+    """Slice of holdout/final test results suitable for plotting/reporting.
+
+    `feature_names` stores the holdout feature matrix column order so
+    visualisation/export utilities can map model importances to names.
+    """
 
     metrics: Dict[str, Any]
     estimator: Any
     predictions: np.ndarray
     targets: np.ndarray
+    feature_names: Optional[List[str]] = None
 
 
 class CV_Result:
@@ -52,6 +63,7 @@ class CV_Result:
         validation_mse_per_fold: Optional[List[float]] = None,
         best_params: Optional[Dict[str, Any]] = None,
         trained_model: Optional[Any] = None,
+        feature_names: Optional[List[str]] = None,
     ) -> None:
         self.feature_set = feature_set
         self.label = label
@@ -75,6 +87,9 @@ class CV_Result:
 
         # optional: trained estimator associated with this result
         self.model: Optional[Any] = trained_model
+        self.feature_names: List[str] = (
+            list(feature_names) if feature_names is not None else []
+        )
 
         # derived values
         self.avg_validation_r2: Optional[float] = None
@@ -145,6 +160,7 @@ class CV_Result:
             "avg_validation_mse": self._serialize_value(
                 self.avg_validation_mse
             ),
+            "feature_names": self._serialize_value(self.feature_names),
         }
 
     # ----- Export helpers -----
@@ -227,6 +243,15 @@ class CV_Result:
         path: Union[str, Path],
         indent: int = 2,
     ) -> None:
+        """Export CV results tables, models, and manifest under `path`.
+
+        Generated files in the output directory:
+        - `results.ndjson`: one JSON record per model/parameter combination
+        - `results_summary.csv`: one row per combination
+        - `results_folds.csv`: one row per fold
+        - `feature_importances.csv`: one row per feature/rank (if supported)
+        - `manifest.json`: export metadata and file inventory
+        """
         results_map = CV_Result._normalize_results_input(results)
         out_dir = Path(path)
         if out_dir.exists() and out_dir.is_file():
@@ -234,6 +259,9 @@ class CV_Result:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         CV_Result.results_dict_to_streaming_files(results_map, out_dir)
+        n_feature_rows = CV_Result.export_feature_importances(
+            results_map, out_dir / "feature_importances.csv"
+        )
 
         models_dir = out_dir / "models"
         model_files: List[str] = []
@@ -259,8 +287,10 @@ class CV_Result:
                         "results.ndjson",
                         "results_summary.csv",
                         "results_folds.csv",
+                        "feature_importances.csv",
                     ],
                     "n_results": len(results_map),
+                    "n_feature_importance_rows": n_feature_rows,
                 },
                 "models": {
                     "path": "models",
@@ -377,6 +407,84 @@ class CV_Result:
                         ),
                     ]
                 )
+
+    @staticmethod
+    def _resolve_feature_names(
+        result: "CV_Result", n_features: int
+    ) -> List[str]:
+        if result.feature_names and len(result.feature_names) == n_features:
+            return [str(name) for name in result.feature_names]
+
+        model_obj = getattr(result, "model", None)
+        model_feature_names = getattr(model_obj, "feature_names_in_", None)
+        if model_feature_names is not None:
+            names = [str(name) for name in list(model_feature_names)]
+            if len(names) == n_features:
+                return names
+
+        return [f"feature_{i}" for i in range(n_features)]
+
+    @staticmethod
+    def export_feature_importances(
+        results_map: Dict[str, "CV_Result"],
+        path: Union[str, Path],
+    ) -> int:
+        outp = Path(path)
+        outp.parent.mkdir(parents=True, exist_ok=True)
+
+        row_count = 0
+        with outp.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(
+                [
+                    "feature_set",
+                    "label",
+                    "scheme",
+                    "model",
+                    "feature",
+                    "importance",
+                    "rank",
+                ]
+            )
+
+            for key, result in results_map.items():
+                model_obj = getattr(result, "model", None)
+                if model_obj is None or not hasattr(
+                    model_obj, "feature_importances_"
+                ):
+                    continue
+
+                importances = np.asarray(
+                    model_obj.feature_importances_, dtype=float
+                )
+                if importances.size == 0:
+                    continue
+
+                (
+                    feat_name,
+                    label_name,
+                    scheme_name,
+                    model_name,
+                ) = CV_Result._extract_metadata(key, result)
+                feature_names = CV_Result._resolve_feature_names(
+                    result, importances.size
+                )
+                order = np.argsort(importances)[::-1]
+                for rank, idx in enumerate(order, start=1):
+                    writer.writerow(
+                        [
+                            feat_name,
+                            label_name,
+                            scheme_name,
+                            model_name,
+                            feature_names[int(idx)],
+                            float(importances[int(idx)]),
+                            rank,
+                        ]
+                    )
+                    row_count += 1
+
+        return row_count
 
     @staticmethod
     def save_model(

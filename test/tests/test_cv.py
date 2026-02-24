@@ -339,6 +339,7 @@ def test_export_result_writes_manifest_and_models(tmp_path):
     assert (out_dir / "manifest.json").exists()
     assert (out_dir / "results.ndjson").exists()
     assert (out_dir / "results_summary.csv").exists()
+    assert (out_dir / "feature_importances.csv").exists()
     models = list((out_dir / "models").rglob("*.pkl"))
     assert models
 
