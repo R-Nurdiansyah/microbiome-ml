@@ -69,7 +69,8 @@
   - `plot_feature_importances()` - across models
   - `plot_predictions()` - actual vs predicted
   - `plot_splits_distribution()` - verify stratification
-- [ ] Export plots to publication-ready formats
+- [x] Export plots to publication-ready formats
+  - SVG and EPS support via `formats` parameter on `Visualiser`
 
 ## Testing
 - [x] Unit tests for `Dataset` splitting logic

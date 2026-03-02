@@ -49,12 +49,16 @@ warnings.filterwarnings("ignore", category=PerformanceWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
+_VALID_FORMATS = {"png", "svg", "eps", "pdf"}
+
+
 class Visualiser:
     """Wrap CV exports and holdout diagnostics around a single output root."""
 
     def __init__(
         self,
         out: Path = Path("visualisations"),
+        formats: Optional[List[str]] = None,
     ):
         self.out = Path(out)
         if self.out.suffix:
@@ -62,6 +66,23 @@ class Visualiser:
         else:
             self.output_dir = self.out
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.formats: List[str] = list(formats) if formats is not None else ["png"]
+        invalid = set(self.formats) - _VALID_FORMATS
+        if invalid:
+            raise ValueError(
+                f"Unsupported format(s): {invalid}. Valid: {_VALID_FORMATS}"
+            )
+
+    def _save_fig(self, fig: plt.Figure, path_stem: Path, dpi: int = 150) -> None:
+        """Save *fig* in every format listed in ``self.formats``.
+
+        *path_stem* must be a path **without** an extension; the appropriate
+        suffix is appended for each format.
+        """
+        for fmt in self.formats:
+            out = path_stem.with_suffix(f".{fmt}")
+            fig.savefig(out, dpi=dpi)
+            logging.info("Saved figure to %s", out)
 
     def _load_ndjson(self, path: Path) -> List[Dict[str, Any]]:
         """Load NDJSON or JSON results.
@@ -347,12 +368,10 @@ class Visualiser:
                     )
                 except Exception:
                     pass
-            out_name = f"{_safe_name(feature_set)}__{_safe_name(label)}__{_safe_name(scheme)}__{_safe_name(model)}.png"
-            out_path = out_dir / out_name
+            stem = f"{_safe_name(feature_set)}__{_safe_name(label)}__{_safe_name(scheme)}__{_safe_name(model)}"
             fig.tight_layout(rect=(0, 0.05, 1, 0.95))
-            fig.savefig(out_path, dpi=150)
+            self._save_fig(fig, out_dir / stem, dpi=150)
             plt.close(fig)
-            logging.info("Saved CV results to %s", out_path)
 
     @staticmethod
     def _custom_formatter(x: float, pos: int) -> str:
@@ -667,9 +686,10 @@ class Visualiser:
                 file_path.parent in (Path(""), Path("."))
                 and not file_path.is_absolute()
             ):
-                file_path = self.output_dir / file_path.name
+                file_path = self.output_dir / file_path.stem
             else:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path = file_path.with_suffix("")
             plt.tight_layout(rect=(0, 0, 1, 0.95))
-            plt.savefig(file_path, dpi=300)
+            self._save_fig(fig, file_path, dpi=300)
         plt.show()
