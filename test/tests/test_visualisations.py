@@ -102,6 +102,8 @@ def test_plot_feature_importances_accepts_result_objects(tmp_path):
 
     assert (tmp_path / "figs" / "fi_cv.png").exists()
     assert (tmp_path / "figs" / "fi_holdout.png").exists()
+
+
 def test_plot_cv_bars_svg_eps_formats(tmp_path):
     records = [
         {
