@@ -1045,18 +1045,23 @@ class Dataset:
         self,
         ranks: Optional[List[Union[str, TaxonomicRanks]]] = None,
         prefix: str = "tax",
+        all: bool = False,
     ) -> "Dataset":
         """Generate FeatureSets from TaxonomicProfiles at specified ranks.
 
         Args:
-            ranks: List of taxonomic ranks (defaults to all standard ranks)
+            ranks: List of taxonomic ranks. Defaults to [TaxonomicRanks.CLASS] when
+                   neither ``ranks`` nor ``all`` is specified.
             prefix: Prefix for generated feature set names (default: "tax")
+            all: If True, run all standard ranks (phylum to species), ignoring
+                 the ``ranks`` argument. Defaults to False.
 
         Returns:
             Self for chaining
 
         Examples:
-            .add_taxonomic_features()  # All ranks (phylum to species)
+            .add_taxonomic_features()  # Defaults to class rank
+            .add_taxonomic_features(all=True)  # All ranks (phylum to species)
             .add_taxonomic_features(ranks=["genus", "family"])
             .add_taxonomic_features(ranks=[TaxonomicRanks.GENUS], prefix="rel")
         """
@@ -1066,10 +1071,19 @@ class Dataset:
             )
 
         # Normalize ranks to a concrete list for logging/reuse
-        if ranks is None:
+        if all:
+            logger.info(
+                "add_taxonomic_features: 'all=True' — running all standard ranks "
+                "(phylum to species)"
+            )
             ranks_list: List[TaxonomicRanks] = list(
                 TaxonomicRanks.PHYLUM.iter_down()
             )
+        elif ranks is None:
+            logger.info(
+                "add_taxonomic_features: no ranks provided — defaulting to class rank"
+            )
+            ranks_list = [TaxonomicRanks.CLASS]
         else:
             ranks_list = [
                 TaxonomicRanks.from_name(rank)
@@ -1398,6 +1412,7 @@ class Dataset:
         random_state: int = 42,
         use_holdout: bool = False,
         force: bool = False,
+        strict: bool = False,
     ) -> "Dataset":
         """Create k-fold cross-validation splits for one or all labels.
 
@@ -1415,6 +1430,10 @@ class Dataset:
                 - None: Same as "random" (backward compatibility)
             random_state: Random seed for reproducibility
             force: If True, overwrite existing CV schemes
+            strict: If True, skip and log a warning for any scheme where the data
+                    produces fewer populated folds than ``n_folds``. If False
+                    (default), the scheme is created with however many folds
+                    have data.
 
         Returns:
             Self for chaining
@@ -1559,6 +1578,7 @@ class Dataset:
                     random_state=random_state,
                     scheme_name=scheme_name,
                     use_holdout=use_holdout,
+                    strict=strict,
                 )
 
         return self

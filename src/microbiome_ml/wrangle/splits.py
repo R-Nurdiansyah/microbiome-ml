@@ -70,6 +70,7 @@ class SplitManager:
         random_state: int = 42,
         scheme_name: Optional[str] = None,
         use_holdout: bool = False,
+        strict: bool = False,
     ) -> None:
         """Create k-fold cross-validation splits.
 
@@ -81,6 +82,8 @@ class SplitManager:
             random_state: Random seed for reproducibility
             scheme_name: Name for this CV scheme (defaults to grouping value or "random")
             use_holdout: If True, only use training samples from holdout split, must be created first with create_holdout_split()
+            strict: If True, skip creating the scheme when fewer than n_folds
+                    folds contain samples, and log a warning instead.
         """
         # Default scheme_name based on grouping
         if scheme_name is None:
@@ -190,20 +193,33 @@ class SplitManager:
 
         cv_df = pl.concat(fold_dfs)
 
-        # Warn if fewer folds than requested contain samples (can happen when
+        # Check if fewer folds than requested contain samples (can happen when
         # data/grouping diversity is limited and some folds remain empty).
         try:
             present_folds = set(cv_df.select("fold").to_series().to_list())
-            if len(present_folds) < n_folds:
-                logger.warning(
-                    f"Requested n_folds={n_folds}, but only {len(present_folds)} "
-                    f"fold(s) contain samples (this can occur with limited data or grouping)."
-                )
+            n_present = len(present_folds)
         except Exception:
-            # If cv_df is empty or selection fails, still warn
-            if cv_df.height == 0:
+            present_folds = set()
+            n_present = 0
+
+        if n_present < n_folds:
+            if strict:
                 logger.warning(
-                    f"No samples assigned to CV folds (n_folds={n_folds})."
+                    "Skipping CV scheme '%s': requested n_folds=%d but only %d fold(s) "
+                    "would contain samples (strict=True). Use strict=False to allow "
+                    "schemes with fewer folds.",
+                    scheme_name,
+                    n_folds,
+                    n_present,
+                )
+                return
+            else:
+                logger.warning(
+                    "CV scheme '%s': requested n_folds=%d but only %d fold(s) contain "
+                    "samples (this can occur with limited data or grouping).",
+                    scheme_name,
+                    n_folds,
+                    n_present,
                 )
 
         # Store CV scheme

@@ -84,7 +84,7 @@ dataset = (
         custom_groupings="path/to/custom_groupings.csv"                             # Optional
     )
     .apply_preprocessing()
-    .add_taxonomic_features()  # Generate abundance features at different ranks
+    .add_taxonomic_features()          # Defaults to class rank; use all=True for all ranks
     .aggregate_species_to_samples(  # Convert species features to sample features
         species_feature_name="gene_features",
         method="arithmetic_mean",
@@ -108,7 +108,8 @@ dataset.create_holdout_split(
 # Create k-fold cross-validation folds (multiple schemes per label)
 dataset.create_cv_folds(
     n_folds=5,
-    use_holdout=True        # To use previous holdout test/train and create fold based on train data only
+    use_holdout=True,       # To use previous holdout test/train and create fold based on train data only
+    strict=False,           # If True, skip schemes where data produces fewer than n_folds populated folds
 )
 
 # Iterate over all CV folds
@@ -119,6 +120,12 @@ for label, scheme, cv_df in dataset.iter_cv_folds():
 ## Feature Engineering Examples
 
 ```python
+# Default: generate taxonomic features at class rank only
+dataset.add_taxonomic_features()  # Creates tax_class
+
+# Generate features at all standard ranks (phylum → species)
+dataset.add_taxonomic_features(all=True)  # Creates tax_phylum, tax_class, tax_order, …
+
 # Generate taxonomic features at specific ranks
 dataset.add_taxonomic_features(
     ranks=["genus", "species"],  # Only genus and species
