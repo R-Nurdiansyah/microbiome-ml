@@ -1,0 +1,68 @@
+data:
+  metadata: /path/to/metadata.csv
+  attributes: /path/to/attributes.csv
+  study_titles: null
+  profiles: /path/to/profiles.csv
+  root: null
+  labels:
+    temperature: /path/to/temperature_labels.csv
+    ph: /path/to/ph_labels.csv
+  groupings: null
+
+features:
+  create_default_groupings: true
+  add_taxonomic_features: true
+  all: true
+  ranks: null
+  prefix: tax
+
+preprocessing:
+  enabled: false
+  metadata_qc: true
+  profiles_qc: true
+  sync_after: true
+  metadata_mbp_cutoff: 15
+  profiles_cov_cutoff: 0
+  profiles_dominated_cutoff: 0.99
+  profiles_rank: order
+
+split:
+  holdout:
+    label: null
+    test_size: 0.2
+    n_bins: 5
+    grouping: null
+    random_state: 42
+    force: true
+  cv:
+    label: null
+    n_folds: 5
+    n_bins: 5
+    grouping: all
+    random_state: 42
+    use_holdout: true
+    force: true
+    strict: true
+
+cv:
+  models:
+    - rf
+    - xgboost
+  mode: run
+  param_path: parameters.yaml
+  n_jobs: null
+  params_per_job: 2
+  label: null
+  scheme: null
+  feature_set: null
+
+outputs:
+  base_dir: out/pipeline
+  save_dataset_path: null
+  save_dataset_compress: false
+
+visualise:
+  enabled: false
+  formats:
+    - png
+  top_n: 20

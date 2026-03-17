@@ -108,3 +108,90 @@ def test_train_and_evaluate_exports_package_for_directory_output(tmp_path):
     assert (out_dir / "results_folds.csv").exists()
     assert (out_dir / "feature_importances.csv").exists()
     assert list((out_dir / "models").rglob("*.pkl"))
+
+
+def test_train_and_evaluate_handles_multi_label_best_results(tmp_path):
+    class MultiLabelDummyDataset(DummyDataset):
+        def get_train_samples(
+            self, label: str, fold: None = None, metadata: bool = True
+        ) -> pl.DataFrame:
+            if label == "target2":
+                return pl.DataFrame(
+                    {
+                        "sample": ["s1", "s2"],
+                        "target2": [3.0, 5.0],
+                    }
+                )
+            return super().get_train_samples(
+                label=label, fold=fold, metadata=metadata
+            )
+
+        def get_test_samples(
+            self, label: str, fold: None = None, metadata: bool = True
+        ) -> pl.DataFrame:
+            if label == "target2":
+                return pl.DataFrame(
+                    {
+                        "sample": ["s3", "s4"],
+                        "target2": [7.0, 9.0],
+                    }
+                )
+            return super().get_test_samples(
+                label=label, fold=fold, metadata=metadata
+            )
+
+    dataset = MultiLabelDummyDataset(
+        feature_df=pl.DataFrame(
+            {
+                "sample": ["s1", "s2", "s3", "s4"],
+                "f1": [1.0, 2.0, 3.0, 4.0],
+            }
+        ),
+        train_df=pl.DataFrame(
+            {
+                "sample": ["s1", "s2"],
+                "target": [2.0, 4.0],
+            }
+        ),
+        test_df=pl.DataFrame(
+            {
+                "sample": ["s3", "s4"],
+                "target": [6.0, 8.0],
+            }
+        ),
+    )
+
+    best_result_target = CV_Result(
+        feature_set="features",
+        label="target",
+        scheme="holdout",
+        trained_model=LinearRegression(),
+    )
+    best_result_target2 = CV_Result(
+        feature_set="features",
+        label="target2",
+        scheme="holdout",
+        trained_model=LinearRegression(),
+    )
+
+    out_dir = tmp_path / "multi_label_holdout"
+    trainer = ModelTrainer(
+        dataset=dataset,
+        best_result={
+            "target": best_result_target,
+            "target2": best_result_target2,
+        },
+        output_model_path=out_dir,
+    )
+
+    evaluations = trainer.train_and_evaluate()
+
+    assert isinstance(evaluations, dict)
+    assert "target" in evaluations
+    assert "target2" in evaluations
+    assert isinstance(evaluations["target"], HoldoutEvaluation)
+    assert isinstance(evaluations["target2"], HoldoutEvaluation)
+    assert (out_dir / "target" / "manifest.json").exists()
+    assert (out_dir / "target2" / "manifest.json").exists()
+    assert list((out_dir / "target" / "models").rglob("*.pkl"))
+    assert list((out_dir / "target2" / "models").rglob("*.pkl"))

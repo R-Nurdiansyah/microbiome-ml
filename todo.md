@@ -78,8 +78,11 @@
 - [x] Test file organization and cleanup
 - [x] Type-safe testing configuration (tests excluded from mypy)
 - [ ] Integration tests for full workflows
-- [ ] Tests for `CrossValidator`
-- [ ] Tests for `Visualiser`
+- [x] Tests for `CrossValidator`
+- [x] Tests for `Visualiser`
+
+## Scripts (scripts/)
+- [ ] Script to run the module as one liner API or HPC
 
 ## Code Quality & Type Safety
 - [x] Full mypy type checking with strict configuration

@@ -315,6 +315,58 @@ def test_run_parallel_uses_outer_jobs(monkeypatch, tmp_path):
     assert inner_jobs_seen == [1, 1]  # inner CV forced to sequential
 
 
+def test_best_result_is_tracked_per_label(tmp_path):
+    class TwoLabelDataset(DummyDataset):
+        def __init__(self, samples, X, y):
+            self.feature_sets = {"feat": DummyFeatureSet(samples, X)}
+            self.labels = pl.DataFrame(
+                {
+                    "sample": samples,
+                    "target": list(y),
+                    "target2": list(y * 2.0 + 1.0),
+                }
+            )
+            fold_map = {s: int(i % 2) for i, s in enumerate(samples)}
+            self.splits = {
+                "target": {"schemeA": fold_map},
+                "target2": {"schemeA": fold_map},
+            }
+
+        def iter_labels(self):
+            yield ("target", self.labels.select(["sample", "target"]))
+            yield ("target2", self.labels.select(["sample", "target2"]))
+
+        def iter_cv_folds(self, label=None):
+            if label in (None, "target"):
+                yield ("target", "schemeA", None)
+            if label in (None, "target2"):
+                yield ("target2", "schemeA", None)
+
+    samples = [f"s{i}" for i in range(8)]
+    X = np.arange(16).reshape(8, 2).astype(float)
+    y = X[:, 0] + np.random.RandomState(7).randn(8) * 0.01
+    ds = TwoLabelDataset(samples, X, y)
+
+    p = tmp_path / "params.json"
+    write_param_yaml(p)
+
+    cv = CrossValidator(
+        ds,
+        models=LinearRegression(),
+        cv_folds=2,
+        scheme="schemeA",
+    )
+    res = cv.run(param_path=str(p))
+
+    assert isinstance(res, dict)
+    assert len(res) >= 2
+    assert cv.best_result is not None
+    assert "target" in cv.best_result_by_label
+    assert "target2" in cv.best_result_by_label
+    assert cv.best_result_by_label["target"].label == "target"
+    assert cv.best_result_by_label["target2"].label == "target2"
+
+
 def test_export_result_writes_manifest_and_models(tmp_path):
     samples = [f"s{i}" for i in range(6)]
     X = np.arange(12).reshape(6, 2).astype(float)
@@ -348,3 +400,150 @@ def test_export_result_writes_manifest_and_models(tmp_path):
     single_dir.mkdir(parents=True, exist_ok=True)
     CV_Result.save_cv_result(first_result, single_dir)
     assert (single_dir / "results.ndjson").exists()
+
+
+def test_export_best_models_multi_label_creates_label_directories(tmp_path):
+    class TwoLabelDataset(DummyDataset):
+        def __init__(self, samples, X, y):
+            self.feature_sets = {"feat": DummyFeatureSet(samples, X)}
+            self.labels = pl.DataFrame(
+                {
+                    "sample": samples,
+                    "target": list(y),
+                    "target2": list(y * 2.0 + 1.0),
+                }
+            )
+            fold_map = {s: int(i % 2) for i, s in enumerate(samples)}
+            self.splits = {
+                "target": {"schemeA": fold_map},
+                "target2": {"schemeA": fold_map},
+            }
+
+        def iter_labels(self):
+            yield ("target", self.labels.select(["sample", "target"]))
+            yield ("target2", self.labels.select(["sample", "target2"]))
+
+        def iter_cv_folds(self, label=None):
+            if label in (None, "target"):
+                yield ("target", "schemeA", None)
+            if label in (None, "target2"):
+                yield ("target2", "schemeA", None)
+
+    samples = [f"s{i}" for i in range(8)]
+    X = np.arange(16).reshape(8, 2).astype(float)
+    y = X[:, 0] + np.random.RandomState(8).randn(8) * 0.01
+    ds = TwoLabelDataset(samples, X, y)
+
+    p = tmp_path / "params.json"
+    write_param_yaml(p)
+
+    cv = CrossValidator(
+        ds,
+        models=LinearRegression(),
+        cv_folds=2,
+        scheme="schemeA",
+    )
+    cv.run(param_path=str(p))
+
+    out_dir = tmp_path / "best_by_label"
+    CV_Result.export_best_results(
+        cv.best_result_by_label,
+        out_dir,
+        best_result_key_by_label=cv.best_result_key_by_label,
+        fallback_best_result=cv.best_result,
+        fallback_best_key=cv.best_result_key or "best_result",
+    )
+
+    assert (out_dir / "target" / "manifest.json").exists()
+    assert (out_dir / "target2" / "manifest.json").exists()
+    assert list((out_dir / "target" / "models").rglob("*.pkl"))
+    assert list((out_dir / "target2" / "models").rglob("*.pkl"))
+
+
+def test_export_best_models_single_label_exports_in_place(tmp_path):
+    samples = [f"s{i}" for i in range(6)]
+    X = np.arange(12).reshape(6, 2).astype(float)
+    y = X[:, 0] * 1.0 + np.random.RandomState(9).randn(6) * 0.01
+    ds = DummyDataset(samples, X, y)
+
+    p = tmp_path / "params.json"
+    write_param_yaml(p)
+
+    cv = CrossValidator(
+        ds,
+        models=LinearRegression(),
+        cv_folds=2,
+        label="target",
+        scheme="schemeA",
+    )
+    cv.run(param_path=str(p))
+
+    out_dir = tmp_path / "best_single"
+    CV_Result.export_best_results(
+        cv.best_result_by_label,
+        out_dir,
+        best_result_key_by_label=cv.best_result_key_by_label,
+        fallback_best_result=cv.best_result,
+        fallback_best_key=cv.best_result_key or "best_result",
+    )
+
+    assert (out_dir / "manifest.json").exists()
+    assert (out_dir / "results.ndjson").exists()
+    assert list((out_dir / "models").rglob("*.pkl"))
+
+
+def test_export_best_models_from_full_results_keeps_one_per_label(tmp_path):
+    class TwoLabelDataset(DummyDataset):
+        def __init__(self, samples, X, y):
+            self.feature_sets = {"feat": DummyFeatureSet(samples, X)}
+            self.labels = pl.DataFrame(
+                {
+                    "sample": samples,
+                    "target": list(y),
+                    "target2": list(y * 2.0 + 1.0),
+                }
+            )
+            fold_map = {s: int(i % 2) for i, s in enumerate(samples)}
+            self.splits = {
+                "target": {"schemeA": fold_map},
+                "target2": {"schemeA": fold_map},
+            }
+
+        def iter_labels(self):
+            yield ("target", self.labels.select(["sample", "target"]))
+            yield ("target2", self.labels.select(["sample", "target2"]))
+
+        def iter_cv_folds(self, label=None):
+            if label in (None, "target"):
+                yield ("target", "schemeA", None)
+            if label in (None, "target2"):
+                yield ("target2", "schemeA", None)
+
+    samples = [f"s{i}" for i in range(8)]
+    X = np.arange(16).reshape(8, 2).astype(float)
+    y = X[:, 0] + np.random.RandomState(10).randn(8) * 0.01
+    ds = TwoLabelDataset(samples, X, y)
+
+    p = tmp_path / "params.json"
+    # two param combos per label to ensure full results contains >1 per label
+    payload = {"linearregression": {"fit_intercept": [True, False]}}
+    p.write_text(json.dumps(payload))
+
+    cv = CrossValidator(
+        ds,
+        models=LinearRegression(),
+        cv_folds=2,
+        scheme="schemeA",
+    )
+    full_results = cv.run(param_path=str(p))
+
+    out_dir = tmp_path / "best_from_full_results"
+    CV_Result.export_best_results(full_results, out_dir)
+
+    assert (out_dir / "target" / "manifest.json").exists()
+    assert (out_dir / "target2" / "manifest.json").exists()
+
+    target_models = list((out_dir / "target" / "models").rglob("*.pkl"))
+    target2_models = list((out_dir / "target2" / "models").rglob("*.pkl"))
+    assert len(target_models) == 1
+    assert len(target2_models) == 1

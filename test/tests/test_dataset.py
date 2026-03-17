@@ -165,7 +165,7 @@ class TestDatasetTaxonomicFeatures:
 
     def test_add_taxonomic_features_all_ranks(self, sample_dataset):
         """Test generating features for all standard ranks."""
-        result = sample_dataset.add_taxonomic_features()
+        result = sample_dataset.add_taxonomic_features(all=True)
 
         assert result is sample_dataset
         # Should have 6 standard ranks (phyla to species)

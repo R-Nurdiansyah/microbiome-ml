@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 import polars as pl
@@ -35,19 +35,17 @@ class ModelTrainer:
     def __init__(
         self,
         dataset: Dataset,
-        best_result: CV_Result,
+        best_result: Union[CV_Result, Dict[Optional[str], CV_Result]],
         output_model_path: Union[str, Path],
         model_name: Optional[str] = None,
         fillna: float = 0.0,
     ) -> None:
         """Initialize the trainer with the best CV result and dataset."""
-        if not isinstance(best_result, CV_Result):
-            raise TypeError(
-                "best_result must be a CV_Result instance (pass cross_validator.best_result)"
-            )
         self.dataset = dataset
-        self.best_result = best_result
         self.fillna = fillna
+        self.best_results_by_label = self._normalize_best_results(best_result)
+        # Backward-compatible handle for single-label usage.
+        self.best_result = next(iter(self.best_results_by_label.values()))
 
         provided_path = Path(output_model_path)
         if provided_path.exists() and provided_path.is_file():
@@ -73,7 +71,9 @@ class ModelTrainer:
             self.output_model_path = self.output_model_dir / file_name
             self._save_as_package = True
 
-    def train_and_evaluate(self) -> HoldoutEvaluation:
+    def train_and_evaluate(
+        self,
+    ) -> Union[HoldoutEvaluation, Dict[str, HoldoutEvaluation]]:
         """Train/re-evaluate the CV winner on the holdout train/test split.
 
         Steps:
@@ -87,8 +87,87 @@ class ModelTrainer:
                 package via `CV_Result.export_result`.
             5. Return regression metrics plus the estimator instance.
         """
-        feature_set_name = self._require_feature_set()
-        label_name = self._require_label()
+        if len(self.best_results_by_label) == 1:
+            only_result = next(iter(self.best_results_by_label.values()))
+            return self._train_and_evaluate_single(
+                best_result=only_result,
+                output_dir=self.output_model_dir,
+                output_file=self.output_model_path,
+                save_as_package=self._save_as_package,
+            )
+
+        evaluations: Dict[str, HoldoutEvaluation] = {}
+        model_file_name = self.output_model_path.name
+        for label, result in sorted(
+            self.best_results_by_label.items(),
+            key=lambda item: "" if item[0] is None else str(item[0]),
+        ):
+            label_name = CV_Result._sanitize_segment(
+                None if label is None else str(label), "label"
+            )
+            label_dir = self.output_model_dir / label_name
+            eval_result = self._train_and_evaluate_single(
+                best_result=result,
+                output_dir=label_dir,
+                output_file=label_dir / model_file_name,
+                save_as_package=True,
+            )
+            evaluations[label_name] = eval_result
+
+        return evaluations
+
+    @staticmethod
+    def _is_cv_result_like(obj: Any) -> bool:
+        """Return True for CV_Result or compatible objects across reloads."""
+        required_attrs = (
+            "feature_set",
+            "label",
+            "scheme",
+            "best_params",
+            "model",
+        )
+        return all(hasattr(obj, attr) for attr in required_attrs)
+
+    @staticmethod
+    def _normalize_best_results(
+        best_result: Union[CV_Result, Dict[Optional[str], CV_Result]],
+    ) -> Dict[Optional[str], CV_Result]:
+        if isinstance(
+            best_result, CV_Result
+        ) or ModelTrainer._is_cv_result_like(best_result):
+            single_result = cast(CV_Result, best_result)
+            return {single_result.label: single_result}
+        if isinstance(best_result, dict):
+            if not best_result:
+                raise TypeError("best_result dictionary cannot be empty")
+            if not all(
+                isinstance(v, CV_Result) or ModelTrainer._is_cv_result_like(v)
+                for v in best_result.values()
+            ):
+                raise TypeError(
+                    "best_result dictionary values must be CV_Result-like instances"
+                )
+            normalized: Dict[Optional[str], CV_Result] = {}
+            for key, value in best_result.items():
+                cast_value = cast(CV_Result, value)
+                label_key = (
+                    cast_value.label if cast_value.label is not None else key
+                )
+                normalized[label_key] = cast_value
+            return normalized
+        raise TypeError(
+            "best_result must be a CV_Result or dict of label -> CV_Result"
+        )
+
+    def _train_and_evaluate_single(
+        self,
+        best_result: CV_Result,
+        output_dir: Path,
+        output_file: Path,
+        save_as_package: bool,
+    ) -> HoldoutEvaluation:
+        feature_set_name = self._require_feature_set(best_result)
+        label_name = self._require_label(best_result)
 
         train_df = self.dataset.get_train_samples(
             label=label_name, metadata=False
@@ -106,7 +185,7 @@ class ModelTrainer:
             feature_df, test_df, label_name
         )
 
-        estimator = self._clone_estimator()
+        estimator = self._clone_estimator(best_result)
         estimator.fit(X_train, y_train)
 
         predictions = estimator.predict(X_test)
@@ -118,17 +197,17 @@ class ModelTrainer:
             {
                 "feature_set": feature_set_name,
                 "label": label_name,
-                "scheme": self.best_result.scheme,
+                "scheme": best_result.scheme,
                 "n_test": len(y_test),
             }
         )
 
-        self.output_model_dir.mkdir(parents=True, exist_ok=True)
-        if self._save_as_package:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if save_as_package:
             holdout_result = CV_Result(
                 feature_set=feature_set_name,
                 label=label_name,
-                scheme=self.best_result.scheme,
+                scheme=best_result.scheme,
                 cross_val_scores=[float(result_metrics["r2"])]
                 if result_metrics.get("r2") is not None
                 else [],
@@ -138,16 +217,16 @@ class ModelTrainer:
                 validation_mse_per_fold=[float(result_metrics["mse"])]
                 if result_metrics.get("mse") is not None
                 else [],
-                best_params=self.best_result.best_params,
+                best_params=best_result.best_params,
                 trained_model=estimator,
                 feature_names=feature_cols,
             )
             CV_Result.export_result(
                 {"holdout_final_model": holdout_result},
-                self.output_model_dir,
+                output_dir,
             )
         else:
-            CV_Result.save_model(estimator, self.output_model_path)
+            CV_Result.save_model(estimator, output_file)
 
         return HoldoutEvaluation(
             metrics=result_metrics,
@@ -157,17 +236,17 @@ class ModelTrainer:
             feature_names=feature_cols,
         )
 
-    def _clone_estimator(self) -> Any:
+    def _clone_estimator(self, best_result: CV_Result) -> Any:
         """Make a fresh estimator using the best CV-trained estimator +
         params."""
-        model = self.best_result.model
+        model = best_result.model
         if model is None:
             raise ValueError(
                 "Best CV result does not expose a trained estimator"
             )
         estimator = clone(model)
-        if self.best_result.best_params:
-            estimator.set_params(**self.best_result.best_params)
+        if best_result.best_params:
+            estimator.set_params(**best_result.best_params)
         return estimator
 
     def _materialize_feature_set(self, name: str) -> pl.DataFrame:
@@ -215,14 +294,14 @@ class ModelTrainer:
         )
         return X, y, feature_cols
 
-    def _require_feature_set(self) -> str:
-        feature_set = self.best_result.feature_set
+    def _require_feature_set(self, best_result: CV_Result) -> str:
+        feature_set = best_result.feature_set
         if not feature_set:
             raise ValueError("Best CV result did not record a feature set")
         return feature_set
 
-    def _require_label(self) -> str:
-        label = self.best_result.label
+    def _require_label(self, best_result: CV_Result) -> str:
+        label = best_result.label
         if not label:
             raise ValueError("Best CV result did not record a label")
         return label

@@ -21,14 +21,17 @@ import csv
 import gzip
 import hashlib
 import json
+import logging
 import pickle
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union, cast
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -166,6 +169,21 @@ class CV_Result:
     # ----- Export helpers -----
 
     @staticmethod
+    def _is_cv_result_like(obj: Any) -> bool:
+        """Return True for CV_Result or compatible objects across reloads."""
+        required_attrs = (
+            "feature_set",
+            "label",
+            "scheme",
+            "best_params",
+            "model",
+            "validation_r2_per_fold",
+            "validation_mse_per_fold",
+            "cross_val_scores",
+        )
+        return all(hasattr(obj, attr) for attr in required_attrs)
+
+    @staticmethod
     def _sanitize_segment(value: Optional[str], fallback: str) -> str:
         text = str(value) if value else fallback
         sanitized = re.sub(r"[^A-Za-z0-9_\-\.]+", "_", text)
@@ -188,22 +206,32 @@ class CV_Result:
             "CV_Result", Sequence["CV_Result"], Dict[str, "CV_Result"]
         ],
     ) -> Dict[str, "CV_Result"]:
-        if isinstance(values, CV_Result):
-            return {"result": values}
+        if isinstance(values, CV_Result) or CV_Result._is_cv_result_like(
+            values
+        ):
+            return {"result": cast("CV_Result", values)}
         if isinstance(values, dict):
-            if not all(isinstance(v, CV_Result) for v in values.values()):
-                raise TypeError("All values must be CV_Result instances")
-            return values
+            if not all(
+                isinstance(v, CV_Result) or CV_Result._is_cv_result_like(v)
+                for v in values.values()
+            ):
+                raise TypeError(
+                    "All values must be CV_Result or CV_Result-like instances"
+                )
+            return {str(k): cast("CV_Result", v) for k, v in values.items()}
         if isinstance(values, Sequence) and not isinstance(
             values, (str, bytes)
         ):
             normalized: Dict[str, "CV_Result"] = {}
             for idx, item in enumerate(values):
-                if not isinstance(item, CV_Result):
+                if not (
+                    isinstance(item, CV_Result)
+                    or CV_Result._is_cv_result_like(item)
+                ):
                     raise TypeError(
-                        "Sequence items must be CV_Result instances"
+                        "Sequence items must be CV_Result or CV_Result-like instances"
                     )
-                normalized[f"result_{idx}"] = item
+                normalized[f"result_{idx}"] = cast("CV_Result", item)
             return normalized
         raise TypeError("Unsupported results payload passed to export_result")
 
@@ -236,6 +264,105 @@ class CV_Result:
         return f"{feat};{label};{scheme}"
 
     @staticmethod
+    def export_best_results(
+        best_result_by_label: Dict[Optional[str], "CV_Result"],
+        path: Union[str, Path],
+        best_result_key_by_label: Optional[Dict[Optional[str], str]] = None,
+        fallback_best_result: Optional["CV_Result"] = None,
+        fallback_best_key: str = "best_result",
+        indent: int = 2,
+    ) -> None:
+        """Export best CV result(s), splitting by label when multiple labels exist.
+
+        If more than one label has a tracked best result, this creates one
+        subdirectory per label under `path` and exports that label's winner.
+        If exactly one label exists, export directly into `path`.
+        """
+        base_dir = Path(path)
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        raw_map = dict(best_result_by_label or {})
+        key_by_label = dict(best_result_key_by_label or {})
+
+        # Accept either:
+        # 1) label -> CV_Result
+        # 2) arbitrary_key -> CV_Result (full CV results map)
+        # For (2), reduce to one best result per label by avg_validation_r2.
+        by_label: Dict[Optional[str], CV_Result] = {}
+        if raw_map:
+            looks_like_label_map = all(
+                (k is None or isinstance(k, str))
+                and (
+                    isinstance(v, CV_Result) or CV_Result._is_cv_result_like(v)
+                )
+                and (k is None or v.label == k)
+                for k, v in raw_map.items()
+            )
+
+            if looks_like_label_map:
+                by_label = raw_map
+            else:
+                best_score_by_label: Dict[Optional[str], float] = {}
+                for raw_key, result in raw_map.items():
+                    label = result.label
+                    avg_r2 = result.avg_validation_r2
+                    score = float("-inf") if avg_r2 is None else float(avg_r2)
+                    prev = best_score_by_label.get(label, float("-inf"))
+                    if label not in by_label or score > prev:
+                        by_label[label] = result
+                        best_score_by_label[label] = score
+                        if not looks_like_label_map:
+                            key_by_label[label] = str(raw_key)
+        if not by_label:
+            if fallback_best_result is None:
+                raise ValueError(
+                    "No best result found. Run CV before exporting best model(s)."
+                )
+            logger.info(
+                "No label-mapped best results provided; exporting fallback best result to %s",
+                base_dir,
+            )
+            CV_Result.export_result(
+                {fallback_best_key: fallback_best_result},
+                base_dir,
+                indent,
+            )
+            return
+
+        if len(by_label) == 1:
+            label = next(iter(by_label.keys()))
+            result = by_label[label]
+            best_key = key_by_label.get(label, fallback_best_key)
+            logger.info(
+                "Exporting single best label result label=%s to %s",
+                label,
+                base_dir,
+            )
+            CV_Result.export_result({best_key: result}, base_dir, indent)
+            return
+
+        for label, result in sorted(
+            by_label.items(),
+            key=lambda item: "" if item[0] is None else str(item[0]),
+        ):
+            label_name = CV_Result._sanitize_segment(
+                None if label is None else str(label), "label"
+            )
+            label_dir = base_dir / label_name
+            best_key = key_by_label.get(label, fallback_best_key)
+            logger.info(
+                "Exporting best result of label=%s to %s",
+                label,
+                label_dir,
+            )
+            CV_Result.export_result({best_key: result}, label_dir, indent)
+        logger.info(
+            "Exported best CV results for %d labels to %s",
+            len(by_label),
+            base_dir,
+        )
+
+    @staticmethod
     def export_result(
         results: Union[
             "CV_Result", Sequence["CV_Result"], Dict[str, "CV_Result"]
@@ -257,6 +384,11 @@ class CV_Result:
         if out_dir.exists() and out_dir.is_file():
             out_dir = out_dir.parent
         out_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Exporting %d CV result(s) to %s",
+            len(results_map),
+            out_dir,
+        )
 
         CV_Result.results_dict_to_streaming_files(results_map, out_dir)
         n_feature_rows = CV_Result.export_feature_importances(
@@ -301,6 +433,13 @@ class CV_Result:
         }
         (out_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=indent)
+        )
+        logger.info(
+            "Finished exporting CV results to %s (n_results=%d, n_models=%d, n_feature_importance_rows=%d)",
+            out_dir,
+            len(results_map),
+            len(model_files),
+            n_feature_rows,
         )
 
     @staticmethod

@@ -84,7 +84,7 @@ dataset = (
         custom_groupings="path/to/custom_groupings.csv"                             # Optional
     )
     .apply_preprocessing()
-    .add_taxonomic_features()  # Generate abundance features at different ranks
+    .add_taxonomic_features()          # Defaults to class rank; use all=True for all ranks
     .aggregate_species_to_samples(  # Convert species features to sample features
         species_feature_name="gene_features",
         method="arithmetic_mean",
@@ -108,7 +108,8 @@ dataset.create_holdout_split(
 # Create k-fold cross-validation folds (multiple schemes per label)
 dataset.create_cv_folds(
     n_folds=5,
-    use_holdout=True        # To use previous holdout test/train and create fold based on train data only
+    use_holdout=True,       # To use previous holdout test/train and create fold based on train data only
+    strict=False,           # If True, skip schemes where data produces fewer than n_folds populated folds
 )
 
 # Iterate over all CV folds
@@ -116,9 +117,32 @@ for label, scheme, cv_df in dataset.iter_cv_folds():
     print(f"Label: {label}, Scheme: {scheme}, Samples: {cv_df.height}")
 ```
 
+## Big Data Script (No Notebook)
+
+For large datasets, run the end-to-end pipeline as a script:
+
+```bash
+# 1) Copy and edit the example config with your file paths
+cp scripts/pipeline.example.yaml pipeline.yaml
+
+# 2) Run dataset build -> CV -> best export -> holdout final evaluation
+pixi run python scripts/run_cv_to_final_eval.py --config pipeline.yaml
+```
+
+Outputs are written under `outputs.base_dir` from the config:
+- `cv_results/` (all CV artifacts)
+- `best_models/` (best model package per label when multiple labels)
+- `holdout/` (final holdout model(s) + `holdout_metrics.json`)
+
 ## Feature Engineering Examples
 
 ```python
+# Default: generate taxonomic features at class rank only
+dataset.add_taxonomic_features()  # Creates tax_class
+
+# Generate features at all standard ranks (phylum → species)
+dataset.add_taxonomic_features(all=True)  # Creates tax_phylum, tax_class, tax_order, …
+
 # Generate taxonomic features at specific ranks
 dataset.add_taxonomic_features(
     ranks=["genus", "species"],  # Only genus and species
@@ -168,6 +192,12 @@ cv = CrossValidator(
 # Cross validation run; parameters is required and n_jobs is number of CV done in parallel. Default will detect CPU core
 results = cv.run(param_path="parameters.yaml", n_jobs = 8)
 
+# Best selections after run:
+# - cv.best_result: global best across all labels/schemes/models
+# - cv.best_result_by_label: best per label
+print(cv.best_result)
+print(cv.best_result_by_label)
+
 # Grid Cross validation run -> using GridCV from sklearn
 # Add n_jobs to specify parallelization in GridCV (None will dynamically determine based on CPU and hyperparams combos)
 results_grid = cv.run_grid(param_path="hyperparameters.yaml")
@@ -175,52 +205,77 @@ results_grid = cv.run_grid(param_path="hyperparameters.yaml")
 # Export CV result package (will save everything but not the best model)
 CV_Result.export_result(results, "out/cv_results")
 
-# OR just save the best model
-if cv_temp.best_model_estimator is not None and cv_temp.best_result is not None:
-    # full export package (model, ndjson, feature_importance)
-    CV_Result.export_result({"best": cv_temp.best_result}, out_best)
+# Export best result(s):
+# - if a single label exists, export directly to out_best
+# - if multiple labels exist, export one best model package per label directory
+CV_Result.export_best_results(results, "out/best_models")
+
+# Or explicitly export best-per-label map from CrossValidator
+CV_Result.export_best_results(cv.best_result_by_label, "out/best_models_by_label")
 
 ```
 
 ## Final Holdout-Evaluation
 
-After selecting the best CV configuration (`cv.best_result`), retrain it on the
-holdout-train split and evaluate on holdout-test:
+After selecting the best CV configuration(s), retrain on the holdout-train split
+and evaluate on holdout-test.
 
 ```python
 from microbiome_ml.train.trainer import ModelTrainer
 from microbiome_ml import Visualiser
 
-if cv.best_result is None:
-    raise RuntimeError("Run CV first so best_result is available")
+if cv.best_result is None and not cv.best_result_by_label:
+    raise RuntimeError("Run CV first so best result(s) are available")
 
-# trainer will export whole data to the output_model_path (model.pkl, result, feature importance)
+# Use global best (single-result flow) or per-label best map (multi-label flow)
+best_for_holdout = (
+    cv.best_result_by_label if cv.best_result_by_label else cv.best_result
+)
+
+# trainer exports package(s) into output_model_path
 trainer = ModelTrainer(
     dataset=dataset,
-    best_result=cv.best_result,
+    best_result=best_for_holdout,
     output_model_path="out/holdout",
 )
 evaluation = trainer.train_and_evaluate()
 
-print(evaluation.metrics)
-# keys include: mae, mse, r2, q2, pcc, pval, feature_set, label, scheme, n_test
+if isinstance(evaluation, dict):
+    for label, ev in evaluation.items():
+        print(label, ev.metrics)
+else:
+    print(evaluation.metrics)
+# metrics keys include: mae, mse, r2, q2, pcc, pval, feature_set, label, scheme, n_test
 
 # Optional holdout diagnostics plot
 vis = Visualiser(out="out/figures")
-scheme = evaluation.metrics.get("scheme")
-groups = [scheme] * len(evaluation.targets) if scheme else None
-vis.visualise_model_performance(
-    evaluation.predictions,
-    evaluation.targets,
-    groups=groups,
-    title="Holdout diagnostics",
-    file_name="holdout_diagnostics.png",
-)
+if isinstance(evaluation, dict):
+    for label, ev in evaluation.items():
+        scheme = ev.metrics.get("scheme")
+        groups = [scheme] * len(ev.targets) if scheme else None
+        vis.visualise_model_performance(
+            ev.predictions,
+            ev.targets,
+            groups=groups,
+            title=f"Holdout diagnostics ({label})",
+            file_name=f"holdout_diagnostics_{label}",
+        )
+else:
+    scheme = evaluation.metrics.get("scheme")
+    groups = [scheme] * len(evaluation.targets) if scheme else None
+    vis.visualise_model_performance(
+        evaluation.predictions,
+        evaluation.targets,
+        groups=groups,
+        title="Holdout diagnostics",
+        file_name="holdout_diagnostics",
+    )
 ```
 
 Outputs:
-- Trained holdout model persisted to `output_model_path`
-- `HoldoutEvaluation` object with predictions, targets, metrics, and feature names
+- Trained holdout model package(s) persisted to `output_model_path`
+- Single-label: `HoldoutEvaluation`
+- Multi-label: dict of `label -> HoldoutEvaluation`
 
 ## Feature Importance Workflow
 
@@ -252,14 +307,21 @@ if cv.best_result is not None:
 # 4) Train final holdout model and plot final feature importance
 trainer = ModelTrainer(
     dataset=dataset,
-    best_result=cv.best_result,
+    best_result=cv.best_result_by_label if cv.best_result_by_label else cv.best_result,
     output_model_path="out/holdout",
 )
 evaluation = trainer.train_and_evaluate()
-vis.plot_feature_importances(
-    evaluation,
-    output="holdout_feature_importance.png",
-)
+if isinstance(evaluation, dict):
+    for label, ev in evaluation.items():
+        vis.plot_feature_importances(
+            ev,
+            output=f"holdout_feature_importance_{label}",
+        )
+else:
+    vis.plot_feature_importances(
+        evaluation,
+        output="holdout_feature_importance",
+    )
 ```
 
 Notes:
@@ -291,6 +353,9 @@ from microbiome_ml.train.results import CV_Result
 # Export CV package: manifest + ndjson/csv tables + model pickles
 CV_Result.export_result(results, "out/results")
 CV_Result.export_result(results_grid, "out/grid-results")
+
+# Export best model package(s), one per label when multiple labels are present
+CV_Result.export_best_results(results, "out/best-models")
 
 # Optionally persist the single best estimator/result
 if cv.best_model_estimator is not None and cv.best_result is not None:
@@ -327,21 +392,40 @@ if cv.best_result is not None:
     )
 
 # Feature importance from holdout evaluation
-vis.plot_feature_importances(
-    evaluation,
-    output="holdout_feature_importance",
-)
+if isinstance(evaluation, dict):
+    for label, ev in evaluation.items():
+        vis.plot_feature_importances(
+            ev,
+            output=f"holdout_feature_importance_{label}",
+        )
+else:
+    vis.plot_feature_importances(
+        evaluation,
+        output="holdout_feature_importance",
+    )
 
 # Holdout diagnostics: actual vs predicted + residual histogram
-scheme = evaluation.metrics.get("scheme")
-groups = [scheme] * len(evaluation.targets) if scheme else None
-vis.visualise_model_performance(
-    evaluation.predictions,
-    evaluation.targets,
-    groups=groups,
-    title="Holdout diagnostics",
-    file_name="holdout_diagnostics",      # extension is ignored; formats control output
-)
+if isinstance(evaluation, dict):
+    for label, ev in evaluation.items():
+        scheme = ev.metrics.get("scheme")
+        groups = [scheme] * len(ev.targets) if scheme else None
+        vis.visualise_model_performance(
+            ev.predictions,
+            ev.targets,
+            groups=groups,
+            title=f"Holdout diagnostics ({label})",
+            file_name=f"holdout_diagnostics_{label}",
+        )
+else:
+    scheme = evaluation.metrics.get("scheme")
+    groups = [scheme] * len(evaluation.targets) if scheme else None
+    vis.visualise_model_performance(
+        evaluation.predictions,
+        evaluation.targets,
+        groups=groups,
+        title="Holdout diagnostics",
+        file_name="holdout_diagnostics",      # extension is ignored; formats control output
+    )
 ```
 
 `plot_cv_bars` consumes a results NDJSON file or a directory containing

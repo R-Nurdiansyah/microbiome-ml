@@ -160,6 +160,41 @@ class CrossValidator:
         self.best_result_key: Optional[str] = None
         self.best_result: Optional[CV_Result] = None
         self.best_model_estimator: Optional[Any] = None
+        self._best_validation_r2_by_label: Dict[Optional[str], float] = {}
+        self.best_result_key_by_label: Dict[Optional[str], str] = {}
+        self.best_result_by_label: Dict[Optional[str], CV_Result] = {}
+        self.best_model_estimator_by_label: Dict[Optional[str], Any] = {}
+
+    def _reset_best_tracking(self) -> None:
+        """Clear cached best-model selections before a fresh run."""
+        self._best_validation_r2 = float("-inf")
+        self.best_result_key = None
+        self.best_result = None
+        self.best_model_estimator = None
+        self._best_validation_r2_by_label.clear()
+        self.best_result_key_by_label.clear()
+        self.best_result_by_label.clear()
+        self.best_model_estimator_by_label.clear()
+
+    def _print_best_models_by_label(self) -> None:
+        """Print best model summary for each label tracked in this run."""
+        for label, cv_result in sorted(
+            self.best_result_by_label.items(),
+            key=lambda item: "" if item[0] is None else str(item[0]),
+        ):
+            model = cv_result.model
+            model_name = (
+                model.__class__.__name__ if model is not None else "None"
+            )
+            avg_r2 = cv_result.avg_validation_r2
+            avg_r2_text = (
+                f"{float(avg_r2):.6f}" if avg_r2 is not None else "None"
+            )
+            label_text = "None" if label is None else str(label)
+            best_key = self.best_result_key_by_label.get(label, "")
+            print(
+                f"[best][label={label_text}] model={model_name} avg_r2={avg_r2_text} key={best_key}"
+            )
 
     @staticmethod
     def load_param_grids(path: str) -> dict:
@@ -174,7 +209,7 @@ class CrossValidator:
         cv_result: CV_Result,
         estimator: Optional[Any] = None,
     ) -> None:
-        # Update the best model if the current CV result has a higher average R²
+        # Update global best model and per-label best model by average R².
         avg_r2 = cv_result.avg_validation_r2
         if avg_r2 is None:
             return
@@ -183,6 +218,14 @@ class CrossValidator:
             self.best_result_key = key
             self.best_result = cv_result
             self.best_model_estimator = estimator
+
+        label_key = cv_result.label
+        best_for_label = self._best_validation_r2_by_label.get(label_key)
+        if best_for_label is None or avg_r2 > best_for_label:
+            self._best_validation_r2_by_label[label_key] = avg_r2
+            self.best_result_key_by_label[label_key] = key
+            self.best_result_by_label[label_key] = cv_result
+            self.best_model_estimator_by_label[label_key] = estimator
 
     def _select_n_jobs(
         self,
@@ -222,6 +265,7 @@ class CrossValidator:
             Dict[str, CV_Result]: A dictionary mapping each unique combination of feature set, label, scheme, model, and hyperparameters to its CV_Result.
         """
 
+        self._reset_best_tracking()
         results: Dict[str, CV_Result] = {}
 
         # Determine label and scheme to use
@@ -381,6 +425,7 @@ class CrossValidator:
                     best_key, best_cv_result, estimator=best_estimator
                 )
 
+        self._print_best_models_by_label()
         return results
 
     @staticmethod
@@ -520,6 +565,8 @@ class CrossValidator:
         Outputs:
             Dict[str, CV_Result]: A dictionary mapping each unique combination of feature set, label, scheme, model, and hyperparameters to its CV_Result.
         """
+        self._reset_best_tracking()
+
         # Determine label and scheme to use
         labels_attr = getattr(self.dataset, "labels", None)
         if self.label is not None:
@@ -670,6 +717,8 @@ class CrossValidator:
                     f"Completed grid search CV for {result_key} with best params {best_params} and per-fold R²: {per_r2}"
                 )
                 logger.info(f"Best hyperparameters: {gs.best_params_}\n")
+
+        self._print_best_models_by_label()
         return results
 
     def _prepare_inputs(
