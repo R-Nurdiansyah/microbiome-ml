@@ -195,3 +195,43 @@ def test_train_and_evaluate_handles_multi_label_best_results(tmp_path):
     assert (out_dir / "target2" / "manifest.json").exists()
     assert list((out_dir / "target" / "models").rglob("*.pkl"))
     assert list((out_dir / "target2" / "models").rglob("*.pkl"))
+
+
+def test_train_and_evaluate_by_label_scheme_nests_outputs(tmp_path):
+    """(label, scheme)-keyed input evaluates every scheme and writes each one
+    under <out>/<label>/<scheme>/."""
+    dataset = _build_simple_dataset()
+
+    def _result(scheme: str, r2: float) -> CV_Result:
+        return CV_Result(
+            feature_set="features",
+            label="target",
+            scheme=scheme,
+            validation_r2_per_fold=[r2],
+            trained_model=LinearRegression(),
+        )
+
+    best_by_scheme = {
+        ("target", "random"): _result("random", 0.9),
+        ("target", "bioproject"): _result("bioproject", 0.6),
+    }
+
+    out_dir = tmp_path / "holdout_by_scheme"
+    trainer = ModelTrainer(
+        dataset=dataset,
+        best_result=best_by_scheme,
+        output_model_path=out_dir,
+    )
+    evaluations = trainer.train_and_evaluate()
+
+    assert isinstance(evaluations, dict)
+    assert set(evaluations) == {"target/random", "target/bioproject"}
+    for key, ev in evaluations.items():
+        assert isinstance(ev, HoldoutEvaluation)
+        assert ev.metrics["scheme"] == key.split("/")[1]
+    assert (out_dir / "target" / "random" / "manifest.json").exists()
+    assert (out_dir / "target" / "bioproject" / "manifest.json").exists()
+    assert list((out_dir / "target" / "random" / "models").rglob("*.pkl"))
+
+    # Backward-compatible per-label view keeps the best-scoring scheme.
+    assert trainer.best_results_by_label["target"].scheme == "random"

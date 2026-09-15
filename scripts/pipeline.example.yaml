@@ -58,6 +58,9 @@ cv:
 
 outputs:
   base_dir: out/pipeline
+  holdout_splits_dir: null   # default: <base_dir>/holdout_splits
+  cv_save_models: false      # also pickle every CV combination under cv_results/models/
+  cv_fold_table: false       # also write cv_results/results_folds.csv (derivable from results.ndjson)
   save_dataset_path: null
   save_dataset_compress: false
 
@@ -66,3 +69,14 @@ visualise:
   formats:
     - png
   top_n: 20
+
+# Optional SHAP attribution on each holdout test split. Requires the `shap`
+# package: run with `pixi run -e shap python scripts/run_cv_to_final_eval.py ...`
+# (or `pixi run -e full ...`). If shap is missing the run continues with a
+# warning. Writes shap_summary.csv / shap_values.csv next to each holdout model,
+# adds `shap_top_features` to holdout_metrics.json and, when visualise.enabled,
+# a holdout_shap_bar_<label>__<scheme> plot.
+shap:
+  enabled: false
+  max_background: 100   # background subsample cap (keeps compute bounded)
+  top_n: 20             # features listed in holdout_metrics.json and plotted

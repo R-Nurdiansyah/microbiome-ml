@@ -33,7 +33,7 @@ from sklearn.model_selection import (
 # from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
 
-from microbiome_ml.train.results import CV_Result
+from microbiome_ml.train.results import CV_Result, LabelSchemeKey
 from microbiome_ml.wrangle.dataset import Dataset
 
 logger = logging.getLogger(__name__)
@@ -164,6 +164,17 @@ class CrossValidator:
         self.best_result_key_by_label: Dict[Optional[str], str] = {}
         self.best_result_by_label: Dict[Optional[str], CV_Result] = {}
         self.best_model_estimator_by_label: Dict[Optional[str], Any] = {}
+        # Best per (label, scheme). Lets callers compare CV schemes (e.g.
+        # random vs. grouped) for the same label instead of only seeing the
+        # overall winner, which is usually the leakier random scheme.
+        self._best_validation_r2_by_label_scheme: Dict[
+            LabelSchemeKey, float
+        ] = {}
+        self.best_result_key_by_label_scheme: Dict[LabelSchemeKey, str] = {}
+        self.best_result_by_label_scheme: Dict[LabelSchemeKey, CV_Result] = {}
+        self.best_model_estimator_by_label_scheme: Dict[
+            LabelSchemeKey, Any
+        ] = {}
 
     def _reset_best_tracking(self) -> None:
         """Clear cached best-model selections before a fresh run."""
@@ -175,9 +186,13 @@ class CrossValidator:
         self.best_result_key_by_label.clear()
         self.best_result_by_label.clear()
         self.best_model_estimator_by_label.clear()
+        self._best_validation_r2_by_label_scheme.clear()
+        self.best_result_key_by_label_scheme.clear()
+        self.best_result_by_label_scheme.clear()
+        self.best_model_estimator_by_label_scheme.clear()
 
     def _print_best_models_by_label(self) -> None:
-        """Print best model summary for each label tracked in this run."""
+        """Print best model summary per label and per label/scheme."""
         for label, cv_result in sorted(
             self.best_result_by_label.items(),
             key=lambda item: "" if item[0] is None else str(item[0]),
@@ -194,6 +209,31 @@ class CrossValidator:
             best_key = self.best_result_key_by_label.get(label, "")
             print(
                 f"[best][label={label_text}] model={model_name} avg_r2={avg_r2_text} key={best_key}"
+            )
+
+        for (label, scheme), cv_result in sorted(
+            self.best_result_by_label_scheme.items(),
+            key=lambda item: (
+                "" if item[0][0] is None else str(item[0][0]),
+                "" if item[0][1] is None else str(item[0][1]),
+            ),
+        ):
+            model = cv_result.model
+            model_name = (
+                model.__class__.__name__ if model is not None else "None"
+            )
+            avg_r2 = cv_result.avg_validation_r2
+            avg_r2_text = (
+                f"{float(avg_r2):.6f}" if avg_r2 is not None else "None"
+            )
+            label_text = "None" if label is None else str(label)
+            scheme_text = "None" if scheme is None else str(scheme)
+            best_key = self.best_result_key_by_label_scheme.get(
+                (label, scheme), ""
+            )
+            print(
+                f"[best][label={label_text}][scheme={scheme_text}] "
+                f"model={model_name} avg_r2={avg_r2_text} key={best_key}"
             )
 
     @staticmethod
@@ -226,6 +266,14 @@ class CrossValidator:
             self.best_result_key_by_label[label_key] = key
             self.best_result_by_label[label_key] = cv_result
             self.best_model_estimator_by_label[label_key] = estimator
+
+        ls_key: LabelSchemeKey = (label_key, cv_result.scheme)
+        best_for_ls = self._best_validation_r2_by_label_scheme.get(ls_key)
+        if best_for_ls is None or avg_r2 > best_for_ls:
+            self._best_validation_r2_by_label_scheme[ls_key] = avg_r2
+            self.best_result_key_by_label_scheme[ls_key] = key
+            self.best_result_by_label_scheme[ls_key] = cv_result
+            self.best_model_estimator_by_label_scheme[ls_key] = estimator
 
     def _select_n_jobs(
         self,

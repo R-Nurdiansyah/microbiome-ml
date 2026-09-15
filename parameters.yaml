@@ -1,21 +1,21 @@
 # models + parameters
 # use ~ for None
 rf:
-  n_estimators:
-    - 100
-  max_depth:
-    - ~
-  criterion:
-    - squared_error
-  max_features:
-    - ~
-  ccp_alpha:
-  # this controls the level of pruning performed to reduce overfitting.
-    - 1
-  min_samples_leaf:
-  # # if a feature is < this value, it will not be considered to become a terminal node.
-  # # this can prevent overfitting e.g. where all samples get their own leaf
-    - 1
+  # n_estimators:
+  #   - 100
+  # max_depth:
+  #   - ~
+  # criterion:
+  #   - squared_error
+  # max_features:
+  #   - ~
+  # ccp_alpha:
+  # # this controls the level of pruning performed to reduce overfitting.
+  #   - 1
+  # min_samples_leaf:
+  # # # if a feature is < this value, it will not be considered to become a terminal node.
+  # # # this can prevent overfitting e.g. where all samples get their own leaf
+  #   - 1
 gb:
   n_estimators:
     - 500

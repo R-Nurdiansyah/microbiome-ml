@@ -130,9 +130,10 @@ pixi run python scripts/run_cv_to_final_eval.py --config pipeline.yaml
 ```
 
 Outputs are written under `outputs.base_dir` from the config:
-- `cv_results/` (all CV artifacts)
-- `best_models/` (best model package per label when multiple labels)
-- `holdout/` (final holdout model(s) + `holdout_metrics.json`)
+- `cv_results/` (`results.ndjson`, `results_summary.csv`, `feature_importances.csv`, `manifest.json`; set `outputs.cv_save_models: true` / `outputs.cv_fold_table: true` to also keep per-combination model pickles and `results_folds.csv`)
+- `best_models/<label>/<scheme>/` (best model package for every label × CV scheme, plus `best_models_summary.csv` sorted best → worst by CV R²) — every scheme is kept, not just the overall winner, because the ungrouped `random` scheme usually wins CV by leaking group structure and must be compared against grouped schemes on the holdout
+- `holdout_splits/<label>/holdout.csv` (holdout train/test sample assignments; override with `outputs.holdout_splits_dir`)
+- `holdout/<label>/<scheme>/` (final holdout model per label × scheme) + `holdout_metrics.json` and `holdout_summary.csv` (sorted best → worst by holdout R²)
 
 ## Feature Engineering Examples
 
@@ -328,6 +329,120 @@ Notes:
 - `plot_feature_importances(...)` accepts `CV_Result`, `HoldoutEvaluation`, estimator objects, dict payloads with `{"model": ...}`, or a pickle model path.
 - If feature names are not passed explicitly, the function uses result metadata, then estimator metadata (`feature_names_in_`), then fallback names like `feature_0`.
 
+
+## SHAP Analysis (optional)
+
+SHAP provides sample-level feature attribution beyond mean importance scores.
+It is an **optional** dependency — the rest of the pipeline works without it.
+
+### Installation
+
+```bash
+# Activate the shap pixi environment (includes shap + all dev deps)
+pixi run -e shap python scripts/run_cv_to_final_eval.py --config pipeline.yaml
+
+# Or install shap manually into your active environment
+pip install shap
+```
+
+### Basic usage (after holdout evaluation)
+
+```python
+from microbiome_ml.train.shap_analysis import SHAPAnalyser
+from microbiome_ml import Visualiser
+
+# Assumes `evaluation` is a HoldoutEvaluation and X_test is the feature matrix
+# used during trainer.train_and_evaluate()
+
+analyser = SHAPAnalyser(
+    model=evaluation.estimator,
+    X=X_test,                           # numpy array, shape (n_samples, n_features)
+    feature_names=evaluation.feature_names,
+    max_background=100,                 # subsample cap — keeps compute lightweight
+)
+shap_result = analyser.compute()
+
+# Export summaries
+shap_result.save_summary("out/shap_summary.csv")  # mean |SHAP| per feature
+shap_result.save("out/shap_values.csv")            # raw SHAP matrix
+
+# Plot
+vis = Visualiser(out="out/figures")
+vis.plot_shap_summary(shap_result, style="bar",      output="shap_bar")
+vis.plot_shap_summary(shap_result, style="beeswarm", output="shap_beeswarm",
+                      X=X_test)                      # X needed for colour coding
+```
+
+### SHAP in the pipeline script
+
+`scripts/run_cv_to_final_eval.py` runs SHAP on every holdout model when the
+`shap` section of the config is enabled:
+
+```yaml
+shap:
+  enabled: true
+  max_background: 100
+  top_n: 20
+```
+
+Run it in an environment that has `shap` installed:
+
+```bash
+pixi run -e shap python scripts/run_cv_to_final_eval.py --config pipeline.yaml
+```
+
+Per `holdout/<label>/<scheme>/` you get `shap_summary.csv` (mean |SHAP| per
+feature) and `shap_values.csv`; `holdout_metrics.json` gains a
+`shap_top_features` list per model, and with `visualise.enabled: true` a
+`holdout_shap_bar_<label>__<scheme>` figure is written. If `shap` is not
+installed the pipeline logs a warning and continues without it.
+
+### Automatic SHAP during holdout training
+
+Pass `compute_shap=True` to `train_and_evaluate` and the trainer handles
+everything: SHAP is computed on the test split, `shap_summary.csv` and
+`shap_values.csv` are written alongside the model package, and the result is
+stored on `evaluation.shap_result`.
+
+```python
+trainer = ModelTrainer(
+    dataset=dataset,
+    best_result=cv.best_result_by_label or cv.best_result,
+    output_model_path="out/holdout",
+)
+evaluation = trainer.train_and_evaluate(
+    compute_shap=True,
+    max_shap_background=100,   # background subsample size
+)
+
+# SHAP result is available directly
+if evaluation.shap_result is not None:
+    vis.plot_shap_summary(evaluation.shap_result, output="shap_bar")
+    print(evaluation.shap_result.top_features(n=10))
+```
+
+For multi-label pipelines the trainer loops over labels; set
+`compute_shap=True` once and SHAP is computed per label automatically.
+
+### Parallel SHAP for multiple models
+
+```python
+from microbiome_ml.train.shap_analysis import SHAPAnalyser
+
+# evaluations: dict[str, HoldoutEvaluation], X_by_label: dict[str, np.ndarray]
+jobs = [
+    (ev.estimator, X_by_label[label], ev.feature_names)
+    for label, ev in evaluations.items()
+]
+shap_results = SHAPAnalyser.compute_parallel(jobs, max_background=100, n_jobs=-1)
+```
+
+### Outputs
+
+| File | Description |
+|------|-------------|
+| `shap_summary.csv` | Ranked table: `rank, feature, mean_abs_shap` |
+| `shap_values.csv`  | Full SHAP matrix: rows = samples, cols = features |
 
 ## Save, Load, and Visualize
 

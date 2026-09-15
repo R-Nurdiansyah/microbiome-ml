@@ -863,3 +863,145 @@ class Visualiser:
                 file_path = file_path.with_suffix("")
             self._save_fig(fig, file_path, dpi=300)
         plt.show()
+
+    def plot_shap_summary(
+        self,
+        shap_result: Any,
+        style: str = "bar",
+        top_n: int = 20,
+        output: Optional[str] = None,
+        title: str = "SHAP Feature Importance",
+        X: Optional[np.ndarray] = None,
+    ) -> None:
+        """Plot a SHAP summary using one of two styles.
+
+        Accepted input for ``shap_result``:
+        - :class:`~microbiome_ml.train.shap_analysis.SHAPResult` (from
+          :meth:`SHAPAnalyser.compute` or ``HoldoutEvaluation.shap_result``).
+
+        Styles:
+
+        ``"bar"``
+            Horizontal bar chart of per-feature ``mean(|SHAP|)``.  No extra
+            dependencies beyond matplotlib.
+
+        ``"beeswarm"``
+            Scatter plot showing each sample's SHAP value per feature,
+            coloured by normalised feature value when ``X`` is supplied.
+            Falls back to a plain scatter when ``X`` is ``None``.
+
+        Args:
+            shap_result: A ``SHAPResult`` object.
+            style: ``"bar"`` (default) or ``"beeswarm"``.
+            top_n: Number of top features to display.
+            output: Optional output path stem (extension ignored; respects
+                ``self.formats``).
+            title: Figure title.
+            X: Original feature matrix required for colour-coded beeswarm.
+                Shape must match ``shap_result.shap_values``.
+        """
+        # Duck-type: require shap_values, mean_abs_shap, feature_names.
+        if not all(
+            hasattr(shap_result, attr)
+            for attr in ("shap_values", "mean_abs_shap", "feature_names")
+        ):
+            logging.warning(
+                "shap_result does not look like a SHAPResult. Skipping."
+            )
+            return
+
+        shap_values: np.ndarray = np.asarray(shap_result.shap_values)
+        mean_abs: np.ndarray = np.asarray(shap_result.mean_abs_shap)
+        feature_names: List[str] = list(shap_result.feature_names)
+
+        # Select top-n by mean |SHAP|.
+        order = np.argsort(mean_abs)[::-1][:top_n]
+        order_asc = order[::-1]  # ascending for horizontal barh
+
+        top_names = [feature_names[i] for i in order_asc]
+        top_mean = mean_abs[order_asc]
+        top_shap = shap_values[:, order_asc]
+
+        if style == "bar":
+            fig, ax = plt.subplots(
+                figsize=(9, max(4, len(top_names) * 0.4))
+            )
+            ax.barh(top_names, top_mean, color="#5b8db8", edgecolor="none")
+            ax.set_xlabel("mean(|SHAP value|)")
+            ax.set_title(title)
+            ax.grid(True, axis="x", alpha=0.3)
+            plt.tight_layout()
+
+        elif style == "beeswarm":
+            fig, ax = plt.subplots(
+                figsize=(9, max(4, len(top_names) * 0.5))
+            )
+            y_ticks = np.arange(len(top_names))
+
+            if X is not None:
+                X_top = np.asarray(X)[:, order_asc]
+                # Normalise each feature to [0, 1] for colouring.
+                feat_min = X_top.min(axis=0)
+                feat_max = X_top.max(axis=0)
+                feat_range = np.where(
+                    feat_max > feat_min, feat_max - feat_min, 1.0
+                )
+                X_norm = (X_top - feat_min) / feat_range
+            else:
+                X_norm = None
+
+            cmap = plt.get_cmap("coolwarm")
+            for fi, yi in enumerate(y_ticks):
+                vals = top_shap[:, fi]
+                if X_norm is not None:
+                    colors = cmap(X_norm[:, fi])
+                else:
+                    colors = "#5b8db8"
+                # Jitter y positions slightly to reduce overplotting.
+                rng = np.random.default_rng(seed=fi)
+                jitter = rng.uniform(-0.2, 0.2, size=len(vals))
+                ax.scatter(
+                    vals,
+                    yi + jitter,
+                    c=colors,
+                    s=8,
+                    alpha=0.6,
+                    linewidths=0,
+                )
+
+            ax.set_yticks(y_ticks)
+            ax.set_yticklabels(top_names)
+            ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+            ax.set_xlabel("SHAP value")
+            ax.set_title(title)
+            if X_norm is not None:
+                sm = plt.cm.ScalarMappable(
+                    cmap=cmap, norm=plt.Normalize(0, 1)
+                )
+                sm.set_array([])
+                fig.colorbar(
+                    sm, ax=ax, label="Feature value (normalised)",
+                    fraction=0.02, pad=0.01
+                )
+            ax.grid(True, axis="x", alpha=0.3)
+            plt.tight_layout()
+
+        else:
+            logging.warning(
+                "Unknown SHAP plot style '%s'. Use 'bar' or 'beeswarm'.",
+                style,
+            )
+            return
+
+        if output:
+            file_path = Path(output)
+            if (
+                file_path.parent in (Path(""), Path("."))
+                and not file_path.is_absolute()
+            ):
+                file_path = self.output_dir / file_path.stem
+            else:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path = file_path.with_suffix("")
+            self._save_fig(fig, file_path, dpi=300)
+        plt.show()

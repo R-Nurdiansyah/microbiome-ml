@@ -252,3 +252,51 @@ def test_auto_iteration_cv(splitting_dataset):
     assert "target_cat" in dataset.splits
     assert "random" in dataset.splits["target_cont"].cv_schemes
     assert "random" in dataset.splits["target_cat"].cv_schemes
+
+
+def test_save_holdout_splits_single_label(splitting_dataset, tmp_path):
+    """Holdout split is written to <output_dir>/<label>/holdout.csv."""
+    dataset = splitting_dataset
+    dataset.create_holdout_split(
+        label="target_cont", test_size=0.2, random_state=42
+    )
+
+    written = dataset.save_holdout_splits(tmp_path, label="target_cont")
+
+    expected = tmp_path / "target_cont" / "holdout.csv"
+    assert written == {"target_cont": expected}
+    assert expected.exists()
+
+    saved = pl.read_csv(expected)
+    assert saved.height == 100
+    assert set(saved["split"].unique().to_list()) == {"train", "test"}
+    assert saved.sort("sample").equals(
+        dataset.splits["target_cont"].holdout.sort("sample")
+    )
+
+
+def test_create_holdout_split_output_dir(splitting_dataset, tmp_path):
+    """Passing output_dir to create_holdout_split saves every label."""
+    dataset = splitting_dataset
+    out_dir = tmp_path / "holdout_splits"
+
+    dataset.create_holdout_split(
+        test_size=0.2, random_state=42, output_dir=out_dir
+    )
+
+    for label in ("target_cont", "target_cat"):
+        path = out_dir / label / "holdout.csv"
+        assert path.exists(), f"missing {path}"
+        assert pl.read_csv(path).height == 100
+
+
+def test_save_holdout_splits_errors(splitting_dataset, tmp_path):
+    """Saving before any holdout exists (or a missing label) raises."""
+    dataset = splitting_dataset
+
+    with pytest.raises(ValueError):
+        dataset.save_holdout_splits(tmp_path)
+
+    dataset.create_holdout_split(label="target_cont", random_state=42)
+    with pytest.raises(ValueError):
+        dataset.save_holdout_splits(tmp_path, label="target_cat")

@@ -338,7 +338,7 @@ class SplitManager:
             group_counts = {
                 row[group_col]: row["count"]
                 for row in df.group_by(group_col)
-                .agg(pl.count().alias("count"))
+                .agg(pl.len().alias("count"))
                 .iter_rows(named=True)
             }
 

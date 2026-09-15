@@ -10,19 +10,31 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
 
-from microbiome_ml.train.cv import CrossValidator
-from microbiome_ml.train.results import CV_Result, HoldoutEvaluation
-from microbiome_ml.train.trainer import ModelTrainer
-from microbiome_ml.utils.logging import setup_logging
-from microbiome_ml.visualise.visualisations import Visualiser
-from microbiome_ml.wrangle.dataset import Dataset
+try:
+    import microbiome_ml  # noqa: F401
+except ModuleNotFoundError:
+    # Fallback for running from a checkout where the package has not been
+    # installed into the environment yet (e.g. before `pixi install`).
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from microbiome_ml.train.cv import CrossValidator  # noqa: E402
+from microbiome_ml.train.results import (  # noqa: E402
+    CV_Result,
+    HoldoutEvaluation,
+)
+from microbiome_ml.train.trainer import ModelTrainer  # noqa: E402
+from microbiome_ml.utils.logging import setup_logging  # noqa: E402
+from microbiome_ml.visualise.visualisations import Visualiser  # noqa: E402
+from microbiome_ml.wrangle.dataset import Dataset  # noqa: E402
 
 LOGGER = logging.getLogger("pipeline")
 
@@ -33,6 +45,52 @@ def load_yaml_config(path: Path) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("Top-level config must be a mapping")
     return data
+
+
+_HOLDOUT_SUMMARY_METRICS = ("r2", "q2", "mse", "mae", "pcc", "pval", "n_test")
+
+
+def _metrics_with_shap(ev: HoldoutEvaluation, top_n: int) -> Dict[str, Any]:
+    """Return ``ev.metrics`` plus the top-N SHAP features when SHAP ran."""
+    metrics: Dict[str, Any] = dict(ev.metrics)
+    shap_result = getattr(ev, "shap_result", None)
+    if shap_result is not None and hasattr(shap_result, "top_features"):
+        metrics["shap_top_features"] = list(shap_result.top_features(top_n))
+    return metrics
+
+
+def _write_holdout_summary(
+    metrics_payload: Dict[str, Any], path: Path
+) -> None:
+    """Write one row per evaluated model, sorted best -> worst by R²."""
+
+    def _r2(item: Any) -> float:
+        value = item[1].get("r2") if isinstance(item[1], dict) else None
+        return float("-inf") if value is None else float(value)
+
+    rows = sorted(metrics_payload.items(), key=_r2, reverse=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "key",
+                "label",
+                "scheme",
+                "feature_set",
+                *_HOLDOUT_SUMMARY_METRICS,
+            ]
+        )
+        for key, metrics in rows:
+            m = metrics if isinstance(metrics, dict) else {}
+            writer.writerow(
+                [
+                    key,
+                    m.get("label"),
+                    m.get("scheme"),
+                    m.get("feature_set"),
+                    *(m.get(name) for name in _HOLDOUT_SUMMARY_METRICS),
+                ]
+            )
 
 
 def run_pipeline(
@@ -46,6 +104,7 @@ def run_pipeline(
     prep_cfg = cfg.get("preprocessing") or {}
     feature_cfg = cfg.get("features") or {}
     vis_cfg = cfg.get("visualise") or {}
+    shap_cfg = cfg.get("shap") or {}
 
     if not isinstance(data_cfg, dict):
         raise ValueError("Section 'data' must be a mapping")
@@ -61,6 +120,8 @@ def run_pipeline(
         raise ValueError("Section 'features' must be a mapping")
     if not isinstance(vis_cfg, dict):
         raise ValueError("Section 'visualise' must be a mapping")
+    if not isinstance(shap_cfg, dict):
+        raise ValueError("Section 'shap' must be a mapping")
 
     if not data_cfg.get("metadata") or not data_cfg.get("attributes"):
         raise ValueError("data.metadata and data.attributes are required")
@@ -74,6 +135,14 @@ def run_pipeline(
     cv_out = base_dir / "cv_results"
     best_out = base_dir / "best_models"
     holdout_out = base_dir / "holdout"
+    # Where the holdout train/test sample assignments are written. Defaults
+    # to a sub-directory of base_dir; can be overridden per config.
+    holdout_splits_raw = out_cfg.get("holdout_splits_dir")
+    holdout_splits_out = (
+        Path(str(holdout_splits_raw))
+        if holdout_splits_raw
+        else base_dir / "holdout_splits"
+    )
 
     # Stage 2: Build dataset and feature tables.
     LOGGER.info("Building dataset")
@@ -136,7 +205,9 @@ def run_pipeline(
         grouping=holdout_cfg.get("grouping"),
         random_state=int(holdout_cfg.get("random_state", 42)),
         force=bool(holdout_cfg.get("force", True)),
+        output_dir=holdout_splits_out,
     )
+    LOGGER.info("Saved holdout split(s) to %s", holdout_splits_out)
     dataset = dataset.create_cv_folds(
         label=split_cv_cfg.get("label"),
         n_folds=int(split_cv_cfg.get("n_folds", 5)),
@@ -187,42 +258,66 @@ def run_pipeline(
     else:
         raise ValueError("cv.mode must be either 'run' or 'run_grid'")
 
+    # By default only the tables that are not derivable elsewhere are kept:
+    # per-combination model pickles are already covered by best_models/ and
+    # holdout/, and results_folds.csv is an unpivot of results.ndjson.
     LOGGER.info("Exporting all CV results to %s", cv_out)
-    CV_Result.export_result(results, cv_out)
-
-    LOGGER.info("Exporting best result(s) to %s", best_out)
-    CV_Result.export_best_results(
-        cv.best_result_by_label,
-        best_out,
-        best_result_key_by_label=cv.best_result_key_by_label,
-        fallback_best_result=cv.best_result,
-        fallback_best_key=cv.best_result_key or "best_result",
+    CV_Result.export_result(
+        results,
+        cv_out,
+        save_models=bool(out_cfg.get("cv_save_models", False)),
+        fold_table=bool(out_cfg.get("cv_fold_table", False)),
     )
 
-    # Stage 5: Train final holdout model(s) and write metrics.
+    # Keep the winner of every CV scheme per label (best_models/<label>/
+    # <scheme>/), not just the overall best: the random scheme usually wins
+    # CV because it leaks group structure, so schemes must be compared on
+    # the holdout instead.
+    LOGGER.info("Exporting best result per label/scheme to %s", best_out)
     best_for_holdout: Any
-    if cv.best_result_by_label:
-        best_for_holdout = cv.best_result_by_label
+    if cv.best_result_by_label_scheme:
+        CV_Result.export_best_results_by_scheme(
+            cv.best_result_by_label_scheme,
+            best_out,
+            best_result_key_by_label_scheme=cv.best_result_key_by_label_scheme,
+        )
+        best_for_holdout = cv.best_result_by_label_scheme
     elif cv.best_result is not None:
+        CV_Result.export_result(
+            {cv.best_result_key or "best_result": cv.best_result}, best_out
+        )
         best_for_holdout = cv.best_result
     else:
         raise RuntimeError("No best CV result was produced")
 
-    LOGGER.info("Training final holdout model(s)")
+    # Stage 5: Train final holdout model(s) per label/scheme, write metrics.
+    # SHAP (optional, needs the `shap` package / `pixi run -e shap`) runs on
+    # each holdout test split; the trainer writes shap_summary.csv and
+    # shap_values.csv next to that model and logs a warning if shap is
+    # missing instead of failing the run.
+    shap_enabled = bool(shap_cfg.get("enabled", False))
+    shap_top_n = int(shap_cfg.get("top_n", 20))
+    LOGGER.info("Training final holdout model(s) (shap=%s)", shap_enabled)
     trainer = ModelTrainer(
         dataset=dataset,
         best_result=best_for_holdout,
         output_model_path=holdout_out,
     )
-    evaluation = trainer.train_and_evaluate()
+    evaluation = trainer.train_and_evaluate(
+        compute_shap=shap_enabled,
+        max_shap_background=int(shap_cfg.get("max_background", 100)),
+    )
 
     metrics_path = holdout_out / "holdout_metrics.json"
     if isinstance(evaluation, dict):
         metrics_payload: Dict[str, Any] = {
-            label: ev.metrics for label, ev in evaluation.items()
+            key: _metrics_with_shap(ev, shap_top_n)
+            for key, ev in evaluation.items()
         }
     elif isinstance(evaluation, HoldoutEvaluation):
-        metrics_payload = {"result": evaluation.metrics}
+        metrics_payload = {
+            "result": _metrics_with_shap(evaluation, shap_top_n)
+        }
     else:
         metrics_payload = {"result": str(type(evaluation))}
 
@@ -230,6 +325,11 @@ def run_pipeline(
     with metrics_path.open("w", encoding="utf-8") as handle:
         json.dump(metrics_payload, handle, indent=2)
     LOGGER.info("Wrote holdout metrics to %s", metrics_path)
+
+    # Flat, sorted table so "which scheme generalises best" is one glance.
+    summary_path = holdout_out / "holdout_summary.csv"
+    _write_holdout_summary(metrics_payload, summary_path)
+    LOGGER.info("Wrote holdout summary to %s", summary_path)
 
     # Stage 6: Generate optional holdout visualisations.
     if bool(vis_cfg.get("enabled", False)):
@@ -246,7 +346,9 @@ def run_pipeline(
         )
 
         if isinstance(evaluation, dict):
-            for label, ev in evaluation.items():
+            # Keys are "<label>" or "<label>/<scheme>"; flatten for filenames.
+            for key, ev in evaluation.items():
+                tag = key.replace("/", "__")
                 scheme = (
                     ev.metrics.get("scheme")
                     if isinstance(ev.metrics, dict)
@@ -256,15 +358,23 @@ def run_pipeline(
                 vis.visualise_model_performance(
                     ev.predictions,
                     ev.targets,
-                    title=f"Holdout diagnostics ({label})",
+                    title=f"Holdout diagnostics ({key})",
                     groups=groups,
-                    file_name=f"holdout_diagnostics_{label}",
+                    file_name=f"holdout_diagnostics_{tag}",
                 )
                 vis.plot_feature_importances(
                     ev,
-                    output=f"holdout_feature_importance_{label}",
+                    output=f"holdout_feature_importance_{tag}",
                     top_n=top_n,
                 )
+                if ev.shap_result is not None:
+                    vis.plot_shap_summary(
+                        ev.shap_result,
+                        style="bar",
+                        top_n=shap_top_n,
+                        output=f"holdout_shap_bar_{tag}",
+                        title=f"SHAP feature importance ({key})",
+                    )
         elif isinstance(evaluation, HoldoutEvaluation):
             scheme = (
                 evaluation.metrics.get("scheme")
@@ -284,6 +394,13 @@ def run_pipeline(
                 output="holdout_feature_importance",
                 top_n=top_n,
             )
+            if evaluation.shap_result is not None:
+                vis.plot_shap_summary(
+                    evaluation.shap_result,
+                    style="bar",
+                    top_n=shap_top_n,
+                    output="holdout_shap_bar",
+                )
 
     LOGGER.info("Pipeline finished. Outputs in %s", base_dir)
 

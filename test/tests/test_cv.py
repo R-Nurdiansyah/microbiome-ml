@@ -547,3 +547,144 @@ def test_export_best_models_from_full_results_keeps_one_per_label(tmp_path):
     target2_models = list((out_dir / "target2" / "models").rglob("*.pkl"))
     assert len(target_models) == 1
     assert len(target2_models) == 1
+
+
+def test_export_result_opt_out_models_and_fold_table(tmp_path):
+    """save_models=False / fold_table=False skip those artefacts and the
+    manifest only lists what was actually written."""
+    samples = [f"s{i}" for i in range(6)]
+    X = np.arange(12).reshape(6, 2).astype(float)
+    y = X[:, 0] * 1.0 + np.random.RandomState(3).randn(6) * 0.01
+    ds = DummyDataset(samples, X, y)
+
+    payload = {"linearregression": {"fit_intercept": [True]}}
+    p = tmp_path / "params.json"
+    p.write_text(json.dumps(payload))
+
+    cv = CrossValidator(
+        ds,
+        models=LinearRegression(),
+        cv_folds=2,
+        label="target",
+        scheme="schemeA",
+    )
+    res = cv.run(param_path=str(p))
+    out_dir = tmp_path / "cv_export_trimmed"
+    CV_Result.export_result(
+        res, out_dir, save_models=False, fold_table=False
+    )
+
+    # Kept
+    assert (out_dir / "manifest.json").exists()
+    assert (out_dir / "results.ndjson").exists()
+    assert (out_dir / "results_summary.csv").exists()
+    assert (out_dir / "feature_importances.csv").exists()
+
+    # Trimmed
+    assert not (out_dir / "results_folds.csv").exists()
+    assert not (out_dir / "models").exists()
+
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert "models" not in manifest["components"]
+    assert "results_folds.csv" not in manifest["components"]["results"][
+        "files"
+    ]
+
+
+class TwoSchemeDummyDataset(DummyDataset):
+    """DummyDataset with a second CV scheme for the same label."""
+
+    def __init__(self, samples, X, y):
+        super().__init__(samples, X, y)
+        fold_a = {s: int(i % 2) for i, s in enumerate(samples)}
+        fold_b = {s: int(i < len(samples) // 2) for i, s in enumerate(samples)}
+        self.splits = {"target": {"schemeA": fold_a, "schemeB": fold_b}}
+
+    def iter_cv_folds(self, label=None):
+        yield ("target", "schemeA", None)
+        yield ("target", "schemeB", None)
+
+
+def _two_scheme_cv(tmp_path):
+    samples = [f"s{i}" for i in range(8)]
+    X = np.arange(16).reshape(8, 2).astype(float)
+    y = X[:, 0] * 1.0 + np.random.RandomState(1).randn(8) * 0.01
+    ds = TwoSchemeDummyDataset(samples, X, y)
+    p = tmp_path / "params.json"
+    p.write_text(json.dumps({"linearregression": {"fit_intercept": [True]}}))
+    cv = CrossValidator(ds, models=LinearRegression(), cv_folds=2)
+    res = cv.run(param_path=str(p))
+    return cv, res
+
+
+def test_best_result_tracked_per_label_scheme(tmp_path):
+    cv, _ = _two_scheme_cv(tmp_path)
+
+    assert set(cv.best_result_by_label_scheme) == {
+        ("target", "schemeA"),
+        ("target", "schemeB"),
+    }
+    for (label, scheme), result in cv.best_result_by_label_scheme.items():
+        assert result.label == label
+        assert result.scheme == scheme
+        assert (label, scheme) in cv.best_result_key_by_label_scheme
+
+    # The per-label winner is one of the per-scheme winners.
+    assert cv.best_result_by_label["target"] in list(
+        cv.best_result_by_label_scheme.values()
+    )
+
+
+def test_export_best_results_by_scheme_layout(tmp_path):
+    cv, _ = _two_scheme_cv(tmp_path)
+    out_dir = tmp_path / "best_models"
+
+    summary_path = CV_Result.export_best_results_by_scheme(
+        cv.best_result_by_label_scheme,
+        out_dir,
+        best_result_key_by_label_scheme=cv.best_result_key_by_label_scheme,
+    )
+
+    for scheme in ("schemeA", "schemeB"):
+        scheme_dir = out_dir / "target" / scheme
+        assert (scheme_dir / "manifest.json").exists()
+        assert (scheme_dir / "results.ndjson").exists()
+        assert list((scheme_dir / "models").rglob("*.pkl"))
+
+    assert summary_path == out_dir / "best_models_summary.csv"
+    summary = pl.read_csv(summary_path)
+    assert summary.height == 2
+    assert set(summary["scheme"].to_list()) == {"schemeA", "schemeB"}
+    r2 = summary["avg_validation_r2"].to_list()
+    assert r2 == sorted(r2, reverse=True)
+
+
+def test_results_summary_sorted_best_to_worst(tmp_path):
+    def _result(r2: float) -> CV_Result:
+        return CV_Result(
+            feature_set="feat",
+            label="target",
+            scheme="s",
+            validation_r2_per_fold=[r2],
+            trained_model=LinearRegression(),
+        )
+
+    # Deliberately inserted worst -> best, with one unscored result.
+    results = {
+        "worst": _result(0.1),
+        "mid": _result(0.5),
+        "unscored": CV_Result(feature_set="feat", label="target", scheme="s"),
+        "best": _result(0.9),
+    }
+    out_dir = tmp_path / "sorted"
+    CV_Result.export_result(results, out_dir, save_models=False)
+
+    summary = pl.read_csv(out_dir / "results_summary.csv")
+    r2 = summary["avg_validation_r2"].to_list()
+    scored = [v for v in r2 if v is not None]
+    assert scored == [0.9, 0.5, 0.1]
+    assert r2[-1] is None  # unscored last
+
+    with (out_dir / "results.ndjson").open() as fh:
+        ndjson_r2 = [json.loads(line)["avg_validation_r2"] for line in fh]
+    assert ndjson_r2 == [0.9, 0.5, 0.1, None]

@@ -9,8 +9,19 @@ from scipy.stats import pearsonr
 from sklearn.base import clone
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-from microbiome_ml.train.results import CV_Result, HoldoutEvaluation
+from microbiome_ml.train.results import (
+    CV_Result,
+    HoldoutEvaluation,
+    LabelSchemeKey,
+)
+from microbiome_ml.train.shap_analysis import SHAPAnalyser
 from microbiome_ml.wrangle.dataset import Dataset
+
+BestResultInput = Union[
+    CV_Result,
+    Dict[Optional[str], CV_Result],
+    Dict[LabelSchemeKey, CV_Result],
+]
 
 
 class ModelTrainer:
@@ -26,7 +37,13 @@ class ModelTrainer:
 
     input:
         - dataset: Dataset object containing the holdout splits and feature sets
-        - best_result: CV_Result object representing the best CV result to retrain
+        - best_result: one of
+            * a single CV_Result,
+            * ``{label: CV_Result}`` -> outputs under ``<dir>/<label>/``,
+            * ``{(label, scheme): CV_Result}`` (e.g.
+              ``CrossValidator.best_result_by_label_scheme``) -> outputs under
+              ``<dir>/<label>/<scheme>/`` so each CV scheme's winner gets its
+              own holdout evaluation.
         - output_model_path: directory where the retrained model should be written or a file path
         - model_name: optional file name (defaults to "holdout model.pkl")
         - fillna: value to impute for any missing features in the holdout splits
@@ -35,7 +52,7 @@ class ModelTrainer:
     def __init__(
         self,
         dataset: Dataset,
-        best_result: Union[CV_Result, Dict[Optional[str], CV_Result]],
+        best_result: BestResultInput,
         output_model_path: Union[str, Path],
         model_name: Optional[str] = None,
         fillna: float = 0.0,
@@ -43,9 +60,19 @@ class ModelTrainer:
         """Initialize the trainer with the best CV result and dataset."""
         self.dataset = dataset
         self.fillna = fillna
-        self.best_results_by_label = self._normalize_best_results(best_result)
-        # Backward-compatible handle for single-label usage.
-        self.best_result = next(iter(self.best_results_by_label.values()))
+        self.best_results, self._by_scheme = self._normalize_best_results(
+            best_result
+        )
+        # Backward-compatible handles. For (label, scheme) input the
+        # per-label view keeps the highest-scoring scheme of each label.
+        self.best_results_by_label: Dict[Optional[str], CV_Result] = {}
+        for (label, _scheme), result in self.best_results.items():
+            prev = self.best_results_by_label.get(label)
+            if prev is None or ModelTrainer._score(
+                result
+            ) > ModelTrainer._score(prev):
+                self.best_results_by_label[label] = result
+        self.best_result = next(iter(self.best_results.values()))
 
         provided_path = Path(output_model_path)
         if provided_path.exists() and provided_path.is_file():
@@ -73,48 +100,81 @@ class ModelTrainer:
 
     def train_and_evaluate(
         self,
+        compute_shap: bool = False,
+        max_shap_background: int = 100,
     ) -> Union[HoldoutEvaluation, Dict[str, HoldoutEvaluation]]:
         """Train/re-evaluate the CV winner on the holdout train/test split.
 
         Steps:
             1. Materialize the feature set referenced by `best_result.feature_set`.
-            2. Join the holdout train/test tables with that feature set, filling missing
-              values with `fillna`.
-            3. Clone and configure the estimator stored on `best_result`, retrain it on
-              the holdout training samples, and evaluate on the holdout test samples.
-            4. Persist the retrained estimator. If `output_model_path` is file-like,
-                save a single pickle model. If directory-like, export a full results
-                package via `CV_Result.export_result`.
-            5. Return regression metrics plus the estimator instance.
+            2. Join the holdout train/test tables with that feature set, filling
+               missing values with `fillna`.
+            3. Clone and configure the estimator stored on `best_result`, retrain
+               it on the holdout training samples, and evaluate on test samples.
+            4. Persist the retrained estimator. If `output_model_path` is
+               file-like, save a single pickle model. If directory-like, export a
+               full results package via `CV_Result.export_result`.
+            5. When ``compute_shap=True``, compute SHAP values on the test split
+               using :class:`~microbiome_ml.train.shap_analysis.SHAPAnalyser`
+               and save ``shap_summary.csv`` / ``shap_values.csv`` alongside the
+               model output. Requires the optional ``shap`` package.
+            6. Return regression metrics plus the estimator instance.
+
+        Args:
+            compute_shap: Run SHAP attribution on the holdout test split.
+            max_shap_background: Background sample cap passed to
+                :class:`~microbiome_ml.train.shap_analysis.SHAPAnalyser`.
         """
-        if len(self.best_results_by_label) == 1:
-            only_result = next(iter(self.best_results_by_label.values()))
+        if len(self.best_results) == 1:
+            only_result = next(iter(self.best_results.values()))
             return self._train_and_evaluate_single(
                 best_result=only_result,
                 output_dir=self.output_model_dir,
                 output_file=self.output_model_path,
                 save_as_package=self._save_as_package,
+                compute_shap=compute_shap,
+                max_shap_background=max_shap_background,
             )
 
+        # Multi-result: one sub-directory per label, and per scheme beneath
+        # it when the input was keyed by (label, scheme). Returned keys mirror
+        # the relative directory ("<label>" or "<label>/<scheme>").
         evaluations: Dict[str, HoldoutEvaluation] = {}
         model_file_name = self.output_model_path.name
-        for label, result in sorted(
-            self.best_results_by_label.items(),
-            key=lambda item: "" if item[0] is None else str(item[0]),
+        for (label, scheme), result in sorted(
+            self.best_results.items(),
+            key=lambda item: (
+                "" if item[0][0] is None else str(item[0][0]),
+                "" if item[0][1] is None else str(item[0][1]),
+            ),
         ):
             label_name = CV_Result._sanitize_segment(
                 None if label is None else str(label), "label"
             )
-            label_dir = self.output_model_dir / label_name
+            out_dir = self.output_model_dir / label_name
+            eval_key = label_name
+            if self._by_scheme:
+                scheme_name = CV_Result._sanitize_segment(
+                    None if scheme is None else str(scheme), "scheme"
+                )
+                out_dir = out_dir / scheme_name
+                eval_key = f"{label_name}/{scheme_name}"
             eval_result = self._train_and_evaluate_single(
                 best_result=result,
-                output_dir=label_dir,
-                output_file=label_dir / model_file_name,
+                output_dir=out_dir,
+                output_file=out_dir / model_file_name,
                 save_as_package=True,
+                compute_shap=compute_shap,
+                max_shap_background=max_shap_background,
             )
-            evaluations[label_name] = eval_result
+            evaluations[eval_key] = eval_result
 
         return evaluations
+
+    @staticmethod
+    def _score(result: CV_Result) -> float:
+        avg = result.avg_validation_r2
+        return float("-inf") if avg is None else float(avg)
 
     @staticmethod
     def _is_cv_result_like(obj: Any) -> bool:
@@ -130,13 +190,22 @@ class ModelTrainer:
 
     @staticmethod
     def _normalize_best_results(
-        best_result: Union[CV_Result, Dict[Optional[str], CV_Result]],
-    ) -> Dict[Optional[str], CV_Result]:
+        best_result: BestResultInput,
+    ) -> Tuple[Dict[LabelSchemeKey, CV_Result], bool]:
+        """Normalise any accepted input to ``{(label, scheme): result}``.
+
+        Returns the mapping and a flag telling whether the caller keyed the
+        input by (label, scheme) — in which case outputs are nested one level
+        deeper, per scheme.
+        """
         if isinstance(
             best_result, CV_Result
         ) or ModelTrainer._is_cv_result_like(best_result):
             single_result = cast(CV_Result, best_result)
-            return {single_result.label: single_result}
+            return (
+                {(single_result.label, single_result.scheme): single_result},
+                False,
+            )
         if isinstance(best_result, dict):
             if not best_result:
                 raise TypeError("best_result dictionary cannot be empty")
@@ -147,16 +216,32 @@ class ModelTrainer:
                 raise TypeError(
                     "best_result dictionary values must be CV_Result-like instances"
                 )
-            normalized: Dict[Optional[str], CV_Result] = {}
+            by_scheme = all(
+                isinstance(k, tuple) and len(k) == 2
+                for k in best_result.keys()
+            )
+            normalized: Dict[LabelSchemeKey, CV_Result] = {}
             for key, value in best_result.items():
                 cast_value = cast(CV_Result, value)
+                if by_scheme:
+                    key_label, key_scheme = cast(LabelSchemeKey, key)
+                else:
+                    key_label, key_scheme = cast(Optional[str], key), None
                 label_key = (
-                    cast_value.label if cast_value.label is not None else key
+                    cast_value.label
+                    if cast_value.label is not None
+                    else key_label
                 )
-                normalized[label_key] = cast_value
-            return normalized
+                scheme_key = (
+                    cast_value.scheme
+                    if cast_value.scheme is not None
+                    else key_scheme
+                )
+                normalized[(label_key, scheme_key)] = cast_value
+            return normalized, by_scheme
         raise TypeError(
-            "best_result must be a CV_Result or dict of label -> CV_Result"
+            "best_result must be a CV_Result, a dict of label -> CV_Result, "
+            "or a dict of (label, scheme) -> CV_Result"
         )
 
     def _train_and_evaluate_single(
@@ -165,6 +250,8 @@ class ModelTrainer:
         output_dir: Path,
         output_file: Path,
         save_as_package: bool,
+        compute_shap: bool = False,
+        max_shap_background: int = 100,
     ) -> HoldoutEvaluation:
         feature_set_name = self._require_feature_set(best_result)
         label_name = self._require_label(best_result)
@@ -228,13 +315,62 @@ class ModelTrainer:
         else:
             CV_Result.save_model(estimator, output_file)
 
+        shap_result = None
+        if compute_shap:
+            shap_result = self._compute_shap(
+                estimator=estimator,
+                X_test=X_test,
+                feature_names=feature_cols,
+                output_dir=output_dir,
+                max_background=max_shap_background,
+            )
+
         return HoldoutEvaluation(
             metrics=result_metrics,
             estimator=estimator,
             predictions=np.asarray(predictions),
             targets=np.asarray(y_test),
             feature_names=feature_cols,
+            shap_result=shap_result,
         )
+
+    @staticmethod
+    def _compute_shap(
+        estimator: Any,
+        X_test: np.ndarray,
+        feature_names: List[str],
+        output_dir: Path,
+        max_background: int,
+    ) -> Optional[Any]:
+        """Run SHAP on the test split and save summary/values to output_dir.
+
+        Returns the :class:`~microbiome_ml.train.shap_analysis.SHAPResult`
+        or ``None`` when the shap package is not installed (a warning is
+        logged rather than raising so that the rest of the pipeline completes).
+        """
+        try:
+            analyser = SHAPAnalyser(
+                model=estimator,
+                X=X_test,
+                feature_names=feature_names,
+                max_background=max_background,
+            )
+            result = analyser.compute()
+            result.save_summary(output_dir / "shap_summary.csv")
+            result.save(output_dir / "shap_values.csv")
+            return result
+        except ImportError as exc:
+            import warnings
+
+            warnings.warn(str(exc), stacklevel=3)
+            return None
+        except Exception as exc:
+            import logging as _log
+
+            _log.getLogger(__name__).warning(
+                "SHAP computation failed: %s", exc
+            )
+            return None
 
     def _clone_estimator(self, best_result: CV_Result) -> Any:
         """Make a fresh estimator using the best CV-trained estimator +

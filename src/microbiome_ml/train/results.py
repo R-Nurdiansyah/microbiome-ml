@@ -17,6 +17,7 @@ metadata for a single combo, and `CV_Result.save_model(estimator, path)` for
 pickling models on demand.  `load_model` can restore those pickles later.
 """
 
+import contextlib
 import csv
 import gzip
 import hashlib
@@ -27,11 +28,14 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# (label, scheme) pair used to key "best result per label per CV scheme".
+LabelSchemeKey = Tuple[Optional[str], Optional[str]]
 
 
 @dataclass
@@ -40,6 +44,10 @@ class HoldoutEvaluation:
 
     `feature_names` stores the holdout feature matrix column order so
     visualisation/export utilities can map model importances to names.
+
+    `shap_result` is populated when ``compute_shap=True`` is passed to
+    :meth:`ModelTrainer.train_and_evaluate`.  Its type is
+    ``SHAPResult | None`` (from :mod:`microbiome_ml.train.shap_analysis`).
     """
 
     metrics: Dict[str, Any]
@@ -47,6 +55,7 @@ class HoldoutEvaluation:
     predictions: np.ndarray
     targets: np.ndarray
     feature_names: Optional[List[str]] = None
+    shap_result: Optional[Any] = None  # SHAPResult | None
 
 
 class CV_Result:
@@ -264,6 +273,117 @@ class CV_Result:
         return f"{feat};{label};{scheme}"
 
     @staticmethod
+    def _sorted_by_avg_r2(
+        results_map: Dict[Any, "CV_Result"],
+    ) -> List[Tuple[Any, "CV_Result"]]:
+        """Return (key, result) pairs ordered best -> worst by avg R².
+
+        Results without an average (no folds) sort last; ties keep the original
+        insertion order.
+        """
+
+        def _score(item: Tuple[Any, "CV_Result"]) -> Tuple[int, float]:
+            avg = item[1].avg_validation_r2
+            if avg is None:
+                return (1, 0.0)
+            return (0, -float(avg))
+
+        return sorted(results_map.items(), key=_score)
+
+    @staticmethod
+    def export_best_results_by_scheme(
+        best_result_by_label_scheme: Dict[LabelSchemeKey, "CV_Result"],
+        path: Union[str, Path],
+        best_result_key_by_label_scheme: Optional[
+            Dict[LabelSchemeKey, str]
+        ] = None,
+        indent: int = 2,
+    ) -> Path:
+        """Export the best CV result for every (label, scheme) pair.
+
+        Layout under `path`::
+
+            <path>/
+              best_models_summary.csv      # one row per label/scheme,
+                                           # sorted best -> worst by avg R²
+              <label>/<scheme>/            # full export_result package
+                results.ndjson, results_summary.csv, ...
+                models/...
+
+        This keeps the winner of *every* CV scheme (e.g. random as well as
+        each grouped scheme) so their holdout performance can be compared,
+        rather than only the overall best, which is typically the random
+        scheme because it leaks group structure into validation folds.
+
+        Returns:
+            Path of the written ``best_models_summary.csv``.
+        """
+        if not best_result_by_label_scheme:
+            raise ValueError(
+                "No best results by label/scheme. Run CV before exporting."
+            )
+        base_dir = Path(path)
+        base_dir.mkdir(parents=True, exist_ok=True)
+        key_map = dict(best_result_key_by_label_scheme or {})
+
+        summary_rows: List[List[Any]] = []
+        for (label, scheme), result in CV_Result._sorted_by_avg_r2(
+            best_result_by_label_scheme
+        ):
+            label_name = CV_Result._sanitize_segment(
+                None if label is None else str(label), "label"
+            )
+            scheme_name = CV_Result._sanitize_segment(
+                None if scheme is None else str(scheme), "scheme"
+            )
+            out_dir = base_dir / label_name / scheme_name
+            best_key = key_map.get((label, scheme), "best_result")
+            logger.info(
+                "Exporting best result for label=%s scheme=%s to %s",
+                label,
+                scheme,
+                out_dir,
+            )
+            CV_Result.export_result({best_key: result}, out_dir, indent)
+
+            model = result.model
+            summary_rows.append(
+                [
+                    label_name,
+                    scheme_name,
+                    result.feature_set,
+                    model.__class__.__name__ if model is not None else None,
+                    result.avg_validation_r2,
+                    result.avg_validation_mse,
+                    best_key,
+                    str(out_dir.relative_to(base_dir)),
+                ]
+            )
+
+        summary_path = base_dir / "best_models_summary.csv"
+        with summary_path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(
+                [
+                    "label",
+                    "scheme",
+                    "feature_set",
+                    "model",
+                    "avg_validation_r2",
+                    "avg_validation_mse",
+                    "result_key",
+                    "path",
+                ]
+            )
+            writer.writerows(summary_rows)
+        logger.info(
+            "Exported best CV results for %d label/scheme pair(s) to %s",
+            len(summary_rows),
+            base_dir,
+        )
+        return summary_path
+
+    @staticmethod
     def export_best_results(
         best_result_by_label: Dict[Optional[str], "CV_Result"],
         path: Union[str, Path],
@@ -272,7 +392,8 @@ class CV_Result:
         fallback_best_key: str = "best_result",
         indent: int = 2,
     ) -> None:
-        """Export best CV result(s), splitting by label when multiple labels exist.
+        """Export best CV result(s), splitting by label when multiple labels
+        exist.
 
         If more than one label has a tracked best result, this creates one
         subdirectory per label under `path` and exports that label's winner.
@@ -369,15 +490,28 @@ class CV_Result:
         ],
         path: Union[str, Path],
         indent: int = 2,
+        save_models: bool = True,
+        fold_table: bool = True,
     ) -> None:
         """Export CV results tables, models, and manifest under `path`.
 
         Generated files in the output directory:
         - `results.ndjson`: one JSON record per model/parameter combination
         - `results_summary.csv`: one row per combination
-        - `results_folds.csv`: one row per fold
+        - `results_folds.csv`: one row per fold (if `fold_table`)
         - `feature_importances.csv`: one row per feature/rank (if supported)
+        - `models/`: pickled estimator per combination (if `save_models`)
         - `manifest.json`: export metadata and file inventory
+
+        Args:
+            results: CV result(s) to export.
+            path: Output directory.
+            indent: JSON indent for `manifest.json`.
+            save_models: Write a pickle for every result under `models/`.
+                Disable for large grids where only the best model(s)
+                are needed (see `export_best_results`).
+            fold_table: Write `results_folds.csv`. Its content is fully
+                derivable from the per-fold lists in `results.ndjson`.
         """
         results_map = CV_Result._normalize_results_input(results)
         out_dir = Path(path)
@@ -390,47 +524,51 @@ class CV_Result:
             out_dir,
         )
 
-        CV_Result.results_dict_to_streaming_files(results_map, out_dir)
+        CV_Result.results_dict_to_streaming_files(
+            results_map, out_dir, fold_table=fold_table
+        )
         n_feature_rows = CV_Result.export_feature_importances(
             results_map, out_dir / "feature_importances.csv"
         )
 
+        result_files = ["results.ndjson", "results_summary.csv"]
+        if fold_table:
+            result_files.append("results_folds.csv")
+        result_files.append("feature_importances.csv")
+
         models_dir = out_dir / "models"
         model_files: List[str] = []
-        for key, result in results_map.items():
-            model_obj = getattr(result, "model", None)
-            if model_obj is None:
-                continue
-            model_path = (
-                models_dir
-                / CV_Result._combo_dir_name(result)
-                / CV_Result._model_file_name(key)
-            )
-            model_path.parent.mkdir(parents=True, exist_ok=True)
-            CV_Result.save_model(model_obj, model_path)
-            model_files.append(str(model_path.relative_to(out_dir)))
+        if save_models:
+            for key, result in results_map.items():
+                model_obj = getattr(result, "model", None)
+                if model_obj is None:
+                    continue
+                model_path = (
+                    models_dir
+                    / CV_Result._combo_dir_name(result)
+                    / CV_Result._model_file_name(key)
+                )
+                model_path.parent.mkdir(parents=True, exist_ok=True)
+                CV_Result.save_model(model_obj, model_path)
+                model_files.append(str(model_path.relative_to(out_dir)))
 
-        manifest = {
+        manifest: Dict[str, Any] = {
             "version": "1.0",
             "created": datetime.now().isoformat(),
             "components": {
                 "results": {
-                    "files": [
-                        "results.ndjson",
-                        "results_summary.csv",
-                        "results_folds.csv",
-                        "feature_importances.csv",
-                    ],
+                    "files": result_files,
                     "n_results": len(results_map),
                     "n_feature_importance_rows": n_feature_rows,
                 },
-                "models": {
-                    "path": "models",
-                    "n_models": len(model_files),
-                    "files": model_files,
-                },
             },
         }
+        if save_models:
+            manifest["components"]["models"] = {
+                "path": "models",
+                "n_models": len(model_files),
+                "files": model_files,
+            }
         (out_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=indent)
         )
@@ -463,8 +601,12 @@ class CV_Result:
 
     @staticmethod
     def results_dict_to_streaming_files(
-        results_map: Dict[str, "CV_Result"], out_dir: Union[str, Path]
+        results_map: Dict[str, "CV_Result"],
+        out_dir: Union[str, Path],
+        fold_table: bool = True,
     ) -> None:
+        """Stream `results.ndjson`, `results_summary.csv` and (optionally)
+        `results_folds.csv` for *results_map* into *out_dir*."""
         outp = Path(out_dir)
         outp.mkdir(parents=True, exist_ok=True)
 
@@ -472,25 +614,32 @@ class CV_Result:
         folds_path = outp / "results_folds.csv"
         summary_path = outp / "results_summary.csv"
 
-        with (
-            ndjson_path.open("w", encoding="utf-8") as ndj_f,
-            folds_path.open("w", encoding="utf-8", newline="") as folds_f,
-            summary_path.open("w", encoding="utf-8", newline="") as sum_f,
-        ):
-            folds_writer = csv.writer(folds_f)
+        with contextlib.ExitStack() as stack:
+            ndj_f = stack.enter_context(
+                ndjson_path.open("w", encoding="utf-8")
+            )
+            sum_f = stack.enter_context(
+                summary_path.open("w", encoding="utf-8", newline="")
+            )
             sum_writer = csv.writer(sum_f)
 
-            folds_writer.writerow(
-                [
-                    "feature_set",
-                    "label",
-                    "scheme",
-                    "model",
-                    "fold_index",
-                    "validation_r2",
-                    "validation_mse",
-                ]
-            )
+            folds_writer = None
+            if fold_table:
+                folds_f = stack.enter_context(
+                    folds_path.open("w", encoding="utf-8", newline="")
+                )
+                folds_writer = csv.writer(folds_f)
+                folds_writer.writerow(
+                    [
+                        "feature_set",
+                        "label",
+                        "scheme",
+                        "model",
+                        "fold_index",
+                        "validation_r2",
+                        "validation_mse",
+                    ]
+                )
             sum_writer.writerow(
                 [
                     "feature_set",
@@ -503,7 +652,9 @@ class CV_Result:
                 ]
             )
 
-            for key, res in results_map.items():
+            # Best -> worst by average validation R² (missing scores last),
+            # so results_summary.csv reads top-down and ndjson/folds match.
+            for key, res in CV_Result._sorted_by_avg_r2(results_map):
                 (
                     feat_name,
                     label_name,
@@ -515,23 +666,28 @@ class CV_Result:
                 out_record["model"] = model_name
                 ndj_f.write(json.dumps(out_record, default=str) + "\n")
 
-                r2_list = out_record.get("validation_r2_per_fold", []) or []
-                mse_list = out_record.get("validation_mse_per_fold", []) or []
-                n = max(len(r2_list), len(mse_list))
-                for i in range(n):
-                    r2 = r2_list[i] if i < len(r2_list) else ""
-                    mse = mse_list[i] if i < len(mse_list) else ""
-                    folds_writer.writerow(
-                        [
-                            feat_name,
-                            label_name,
-                            scheme_name,
-                            model_name,
-                            i,
-                            r2,
-                            mse,
-                        ]
+                if folds_writer is not None:
+                    r2_list = (
+                        out_record.get("validation_r2_per_fold", []) or []
                     )
+                    mse_list = (
+                        out_record.get("validation_mse_per_fold", []) or []
+                    )
+                    n = max(len(r2_list), len(mse_list))
+                    for i in range(n):
+                        r2 = r2_list[i] if i < len(r2_list) else ""
+                        mse = mse_list[i] if i < len(mse_list) else ""
+                        folds_writer.writerow(
+                            [
+                                feat_name,
+                                label_name,
+                                scheme_name,
+                                model_name,
+                                i,
+                                r2,
+                                mse,
+                            ]
+                        )
 
                 sum_writer.writerow(
                     [

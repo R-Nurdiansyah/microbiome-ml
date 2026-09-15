@@ -961,7 +961,7 @@ class Dataset:
             if overlap:
                 raise ValueError(f"Duplicate label columns: {overlap}")
             self.labels = self.labels.join(
-                new_df, on="sample", how="outer", coalesce=True
+                new_df, on="sample", how="full", coalesce=True
             )
 
         self._sync_accessions()
@@ -1029,7 +1029,7 @@ class Dataset:
                 raise ValueError(f"Duplicate grouping columns: {overlap}")
 
             self.groupings = self.groupings.join(
-                new_df, on="sample", how="outer", coalesce=True
+                new_df, on="sample", how="full", coalesce=True
             )
 
         self._sync_accessions()
@@ -1230,6 +1230,7 @@ class Dataset:
         grouping: Optional[str] = None,
         random_state: int = 42,
         force: bool = False,
+        output_dir: Optional[Union[str, Path]] = None,
     ) -> "Dataset":
         """Create holdout train/test splits for one or all labels.
 
@@ -1243,6 +1244,9 @@ class Dataset:
             grouping: Optional grouping column to prevent leakage
             random_state: Random seed for reproducibility
             force: If True, overwrite existing splits
+            output_dir: Optional directory. If given, each created holdout
+                split is written to ``<output_dir>/<label>/holdout.csv``
+                (see :meth:`save_holdout_splits`).
 
         Returns:
             Self for chaining
@@ -1318,7 +1322,66 @@ class Dataset:
                 metadata=metadata_df,
             )
 
+        if output_dir is not None:
+            self.save_holdout_splits(output_dir, label=label)
+
         return self
+
+    def save_holdout_splits(
+        self,
+        output_dir: Union[str, Path],
+        label: Optional[str] = None,
+    ) -> Dict[str, Path]:
+        """Write holdout split(s) to ``<output_dir>/<label>/holdout.csv``.
+
+        The CSV layout matches what :meth:`save` writes under ``splits/``,
+        so a single holdout split can be persisted to a user-chosen
+        location without saving the whole dataset.
+
+        Args:
+            output_dir: Directory to write into (created if missing)
+            label: Specific label to write. If None, writes every label
+                that has a holdout split.
+
+        Returns:
+            Mapping of label -> path of the written ``holdout.csv``
+
+        Raises:
+            ValueError: If *label* is given but has no holdout split, or if
+                no holdout splits exist at all.
+        """
+        output_dir = Path(output_dir)
+
+        to_write: Dict[str, pl.DataFrame] = {}
+        if label is not None:
+            split_manager = self._require_split_manager(label)
+            if split_manager.holdout is None:
+                raise ValueError(
+                    f"Holdout split for '{label}' has not been created yet"
+                )
+            to_write[label] = split_manager.holdout
+        else:
+            for lbl, sm in self.splits.items():
+                if sm.holdout is not None:
+                    to_write[lbl] = sm.holdout
+            if not to_write:
+                raise ValueError(
+                    "No holdout splits to save; "
+                    "call create_holdout_split first"
+                )
+
+        written: Dict[str, Path] = {}
+        for lbl, holdout_df in to_write.items():
+            label_dir = output_dir / lbl
+            label_dir.mkdir(parents=True, exist_ok=True)
+            holdout_path = label_dir / "holdout.csv"
+            holdout_df.write_csv(holdout_path)
+            written[lbl] = holdout_path
+            logger.info(
+                "Saved holdout split for '%s' to %s", lbl, holdout_path
+            )
+
+        return written
 
     def _require_split_manager(self, label: str) -> SplitManager:
         if label not in self.splits:

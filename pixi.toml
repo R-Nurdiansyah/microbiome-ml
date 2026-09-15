@@ -24,6 +24,15 @@ matplotlib = ">=3.5.3"
 seaborn = ">=0.12.2"
 cmasher = ">=1.9.2"
 
+[pypi-dependencies]
+# Install this project into the environment (editable) so that
+# `pixi shell` / `pixi run python scripts/...` can `import microbiome_ml`.
+microbiome_ml = { path = ".", editable = true }
+
+[feature.shap.dependencies]
+# Optional: SHAP-based feature attribution (used by SHAPAnalyser / Visualiser)
+shap = ">=0.44.0"
+
 [feature.dev.dependencies]
 pytest = ">=7.0.0"
 pytest-cov = ">=4.0.0"
@@ -79,12 +88,13 @@ docs-serve = "mkdocs serve"
 docs-build = "mkdocs build"
 pre-commit-install = "pre-commit install"
 clean = "find . -type d -name __pycache__ -delete && find . -name '*.pyc' -delete"
-install-dev = "pip install -e ."
-test = { depends-on = ["install-dev"], cmd = "pytest test/tests/" }
+install-dev = "pip install -e ."  # Fallback only; editable install is handled by [pypi-dependencies]
+test = "pytest test/tests/"
 local-check = { depends-on = ["lint", "type-check", "test"] }
 
 
 [environments]
 default = ["dev"]
 docs = ["dev", "docs"]
-full = ["dev", "docs"]
+full = ["dev", "docs", "shap"]
+shap = ["dev", "shap"]
