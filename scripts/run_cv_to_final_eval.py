@@ -15,7 +15,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import yaml
 
@@ -56,7 +56,102 @@ def _metrics_with_shap(ev: HoldoutEvaluation, top_n: int) -> Dict[str, Any]:
     shap_result = getattr(ev, "shap_result", None)
     if shap_result is not None and hasattr(shap_result, "top_features"):
         metrics["shap_top_features"] = list(shap_result.top_features(top_n))
+    if shap_result is not None and hasattr(shap_result, "top_features_signed"):
+        # direction: Spearman(feature value, SHAP value); >0 means higher
+        # abundance pushes the prediction up, <0 pushes it down.
+        metrics["shap_top_features_direction"] = {
+            name: (None if direction != direction else round(direction, 4))
+            for name, direction in shap_result.top_features_signed(top_n)
+        }
     return metrics
+
+
+def _plot_shap(
+    vis: Visualiser,
+    shap_result: Any,
+    top_n: int,
+    tag: Optional[str] = None,
+    label: Optional[str] = None,
+) -> None:
+    """Write the direction-coloured bar chart and the beeswarm.
+
+    The bar shows magnitude (mean |SHAP|) with sign from ``direction``; the
+    beeswarm shows every sample so the sign and spread are visible directly.
+    """
+    suffix = f"_{tag}" if tag else ""
+    title_tail = f" ({label})" if label else ""
+    vis.plot_shap_summary(
+        shap_result,
+        style="bar",
+        top_n=top_n,
+        output=f"holdout_shap_bar{suffix}",
+        title=f"SHAP feature importance{title_tail}",
+    )
+    vis.plot_shap_summary(
+        shap_result,
+        style="beeswarm",
+        top_n=top_n,
+        output=f"holdout_shap_beeswarm{suffix}",
+        title=f"SHAP values per sample{title_tail}",
+    )
+
+
+def _log_best_combinations(cv: CrossValidator) -> None:
+    """Log the CV winner per label/scheme, best -> worst, for quick reading."""
+    if not cv.best_result_by_label_scheme:
+        return
+    LOGGER.info("Best CV combination per label/scheme (by avg validation R2):")
+    for (label, scheme), result in CV_Result._sorted_by_avg_r2(
+        cv.best_result_by_label_scheme
+    ):
+        model = result.model
+        r2 = result.avg_validation_r2
+        LOGGER.info(
+            "  label=%-14s scheme=%-14s model=%-24s feature_set=%-14s "
+            "avg_r2=%s",
+            label,
+            scheme,
+            model.__class__.__name__ if model is not None else "None",
+            result.feature_set,
+            f"{r2:.4f}" if r2 is not None else "None",
+        )
+
+
+def _validate_grouping_references(
+    cfg: Dict[str, Any], available: List[str]
+) -> None:
+    """Fail fast if split/cv config names a grouping that does not exist.
+
+    Runs right after the groupings table is built, before the (slow)
+    feature-engineering stage, so a typo costs seconds rather than minutes.
+    """
+    split_cfg = cfg.get("split") or {}
+    holdout_g = (split_cfg.get("holdout") or {}).get("grouping")
+    cv_g = (split_cfg.get("cv") or {}).get("grouping", "all")
+    schemes = (cfg.get("cv") or {}).get("scheme")
+
+    def _check(name: Any, where: str, extra_ok: Sequence[str] = ()) -> None:
+        if name is None or name in extra_ok:
+            return
+        if not isinstance(name, str):
+            raise ValueError(
+                f"{where} must be a single column name, got {name!r}. "
+                "To compare several groupings run the pipeline once per "
+                "grouping (holdout) or list them under cv.scheme (CV)."
+            )
+        if name not in available:
+            raise ValueError(
+                f"{where} = '{name}' is not a grouping column. "
+                f"Available: {available}. Add it via groupings.columns "
+                "(a metadata column) or groupings.file (a CSV)."
+            )
+
+    _check(holdout_g, "split.holdout.grouping")
+    _check(cv_g, "split.cv.grouping", extra_ok=("all", "random"))
+    if schemes is not None:
+        scheme_list = schemes if isinstance(schemes, list) else [schemes]
+        for s in scheme_list:
+            _check(s, "cv.scheme entry", extra_ok=("random",))
 
 
 def _write_holdout_summary(
@@ -105,6 +200,7 @@ def run_pipeline(
     feature_cfg = cfg.get("features") or {}
     vis_cfg = cfg.get("visualise") or {}
     shap_cfg = cfg.get("shap") or {}
+    holdout_eval_cfg = cfg.get("holdout_evaluation") or {}
 
     if not isinstance(data_cfg, dict):
         raise ValueError("Section 'data' must be a mapping")
@@ -122,6 +218,20 @@ def run_pipeline(
         raise ValueError("Section 'visualise' must be a mapping")
     if not isinstance(shap_cfg, dict):
         raise ValueError("Section 'shap' must be a mapping")
+    if not isinstance(holdout_eval_cfg, dict):
+        raise ValueError("Section 'holdout_evaluation' must be a mapping")
+
+    # `groupings` section; older configs used features.create_default_groupings
+    # and data.groupings (a CSV path) instead — still honoured as fallbacks.
+    group_cfg = cfg.get("groupings")
+    if group_cfg is None:
+        group_cfg = {
+            "defaults": feature_cfg.get("create_default_groupings", True),
+            "columns": [],
+            "file": data_cfg.get("groupings"),
+        }
+    if not isinstance(group_cfg, dict):
+        raise ValueError("Section 'groupings' must be a mapping")
 
     if not data_cfg.get("metadata") or not data_cfg.get("attributes"):
         raise ValueError("data.metadata and data.attributes are required")
@@ -135,14 +245,12 @@ def run_pipeline(
     cv_out = base_dir / "cv_results"
     best_out = base_dir / "best_models"
     holdout_out = base_dir / "holdout"
-    # Where the holdout train/test sample assignments are written. Defaults
-    # to a sub-directory of base_dir; can be overridden per config.
-    holdout_splits_raw = out_cfg.get("holdout_splits_dir")
-    holdout_splits_out = (
-        Path(str(holdout_splits_raw))
-        if holdout_splits_raw
-        else base_dir / "holdout_splits"
-    )
+    # Where the sample assignments are written: holdout.csv (train/test) and
+    # cv_<scheme>.csv (fold membership, drawn from holdout-train only) per
+    # label. Defaults to <base_dir>/splits; `outputs.splits_dir` overrides
+    # (`holdout_splits_dir` is still accepted as the old name).
+    splits_raw = out_cfg.get("splits_dir") or out_cfg.get("holdout_splits_dir")
+    splits_out = Path(str(splits_raw)) if splits_raw else base_dir / "splits"
 
     # Stage 2: Build dataset and feature tables.
     LOGGER.info("Building dataset")
@@ -160,12 +268,37 @@ def run_pipeline(
         .add_labels(labels)
     )
 
-    groupings = data_cfg.get("groupings")
-    if groupings is not None:
-        dataset = dataset.add_groupings(groupings)
-
-    if feature_cfg.get("create_default_groupings", True):
+    # Groupings: the columns that `split.holdout.grouping`, `split.cv.grouping`
+    # and `cv.scheme` can refer to. Built in this order so nothing is lost:
+    #   1. defaults from metadata (missing ones skipped),
+    #   2. user-named metadata columns (missing ones are an error),
+    #   3. user CSV of custom columns (merged; duplicates are an error).
+    if group_cfg.get("defaults", True):
         dataset = dataset.create_default_groupings(force=True)
+
+    extra_columns = group_cfg.get("columns") or []
+    if isinstance(extra_columns, str):
+        extra_columns = [extra_columns]
+    if not isinstance(extra_columns, list):
+        raise ValueError("groupings.columns must be a list of column names")
+    if extra_columns:
+        dataset = dataset.create_default_groupings(
+            groupings=[str(c) for c in extra_columns],
+            force=False,
+            strict=True,
+        )
+
+    groupings_file = group_cfg.get("file")
+    if groupings_file:
+        dataset = dataset.add_groupings(groupings_file)
+
+    available_groupings = (
+        [c for c in dataset.groupings.columns if c != "sample"]
+        if dataset.groupings is not None
+        else []
+    )
+    LOGGER.info("Grouping columns available: %s", available_groupings)
+    _validate_grouping_references(cfg, available_groupings)
 
     if prep_cfg.get("enabled", True):
         dataset = dataset.apply_preprocessing(
@@ -205,9 +338,9 @@ def run_pipeline(
         grouping=holdout_cfg.get("grouping"),
         random_state=int(holdout_cfg.get("random_state", 42)),
         force=bool(holdout_cfg.get("force", True)),
-        output_dir=holdout_splits_out,
+        output_dir=splits_out,
     )
-    LOGGER.info("Saved holdout split(s) to %s", holdout_splits_out)
+    LOGGER.info("Saved holdout split(s) to %s", splits_out)
     dataset = dataset.create_cv_folds(
         label=split_cv_cfg.get("label"),
         n_folds=int(split_cv_cfg.get("n_folds", 5)),
@@ -218,6 +351,8 @@ def run_pipeline(
         force=bool(split_cv_cfg.get("force", True)),
         strict=bool(split_cv_cfg.get("strict", True)),
     )
+    dataset.save_cv_folds(splits_out)
+    LOGGER.info("Saved CV fold assignments to %s", splits_out)
 
     save_dataset_path = out_cfg.get("save_dataset_path")
     if save_dataset_path:
@@ -290,6 +425,31 @@ def run_pipeline(
     else:
         raise RuntimeError("No best CV result was produced")
 
+    _log_best_combinations(cv)
+
+    vis_enabled = bool(vis_cfg.get("enabled", False))
+    vis_formats = list(vis_cfg.get("formats", ["png"]))
+    top_n = int(vis_cfg.get("top_n", 20))
+    if vis_enabled:
+        LOGGER.info("Generating CV bar visualisations from %s", cv_out)
+        Visualiser(
+            base_dir / "cv_visualisations", formats=vis_formats
+        ).plot_cv_bars(results=cv_out, out_dir=base_dir / "cv_visualisations")
+
+    # Optional stop: inspect CV / best_models before committing to the
+    # one-shot holdout evaluation. The holdout split was still created and
+    # saved under splits/, so a later run with the same split.* settings
+    # evaluates against the identical test samples.
+    if not bool(holdout_eval_cfg.get("enabled", True)):
+        LOGGER.info(
+            "holdout_evaluation.enabled is false: stopping after CV. "
+            "Best model per label/scheme is under %s "
+            "(see best_models_summary.csv). Outputs in %s",
+            best_out,
+            base_dir,
+        )
+        return
+
     # Stage 5: Train final holdout model(s) per label/scheme, write metrics.
     # SHAP (optional, needs the `shap` package / `pixi run -e shap`) runs on
     # each holdout test split; the trainer writes shap_summary.csv and
@@ -332,18 +492,8 @@ def run_pipeline(
     LOGGER.info("Wrote holdout summary to %s", summary_path)
 
     # Stage 6: Generate optional holdout visualisations.
-    if bool(vis_cfg.get("enabled", False)):
-        vis = Visualiser(
-            holdout_out,
-            formats=list(vis_cfg.get("formats", ["png"])),
-        )
-        top_n = int(vis_cfg.get("top_n", 20))
-
-        LOGGER.info("Generating CV bar visualisations from %s", cv_out)
-        vis.plot_cv_bars(
-            results=cv_out,
-            out_dir=base_dir / "cv_visualisations",
-        )
+    if vis_enabled:
+        vis = Visualiser(holdout_out, formats=vis_formats)
 
         if isinstance(evaluation, dict):
             # Keys are "<label>" or "<label>/<scheme>"; flatten for filenames.
@@ -368,12 +518,8 @@ def run_pipeline(
                     top_n=top_n,
                 )
                 if ev.shap_result is not None:
-                    vis.plot_shap_summary(
-                        ev.shap_result,
-                        style="bar",
-                        top_n=shap_top_n,
-                        output=f"holdout_shap_bar_{tag}",
-                        title=f"SHAP feature importance ({key})",
+                    _plot_shap(
+                        vis, ev.shap_result, shap_top_n, tag=tag, label=key
                     )
         elif isinstance(evaluation, HoldoutEvaluation):
             scheme = (
@@ -395,12 +541,7 @@ def run_pipeline(
                 top_n=top_n,
             )
             if evaluation.shap_result is not None:
-                vis.plot_shap_summary(
-                    evaluation.shap_result,
-                    style="bar",
-                    top_n=shap_top_n,
-                    output="holdout_shap_bar",
-                )
+                _plot_shap(vis, evaluation.shap_result, shap_top_n)
 
     LOGGER.info("Pipeline finished. Outputs in %s", base_dir)
 

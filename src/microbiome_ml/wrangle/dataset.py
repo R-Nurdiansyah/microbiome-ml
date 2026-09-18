@@ -1133,8 +1133,9 @@ class Dataset:
         self,
         groupings: Optional[List[str]] = None,
         force: bool = False,
+        strict: bool = False,
     ) -> "Dataset":
-        """Create default grouping columns from metadata fields.
+        """Create grouping columns from metadata fields.
 
         Automatically extracts common grouping variables from metadata for use
         in train/test splitting and analysis. Fields are extracted as-is without
@@ -1144,7 +1145,11 @@ class Dataset:
             groupings: List of specific groupings to create. If None, creates all
                       available default groupings: ['bioproject', 'biome', 'domain',
                       'ecoregion', 'year', 'month', 'climate', 'season']
-            force: If True, overwrite existing groupings. If False, merge with existing
+            force: If True, replace any existing groupings table. If False,
+                   merge into it; fields already present are left untouched.
+            strict: If True, raise ``ValueError`` when any requested field
+                    cannot be found in the metadata (instead of skipping it
+                    with a warning). Use this for user-specified groupings.
 
         Returns:
             Self for chaining
@@ -1156,11 +1161,17 @@ class Dataset:
             # Create only specific groupings
             dataset.create_default_groupings(groupings=['bioproject', 'biome'])
 
+            # Add user columns on top of existing groupings; fail if missing
+            dataset.create_default_groupings(
+                groupings=['depth_category'], strict=True
+            )
+
             # Overwrite existing groupings
             dataset.create_default_groupings(force=True)
 
         Raises:
-            ValueError: If metadata is not available
+            ValueError: If metadata is not available, or (with
+                ``strict=True``) if a requested field is missing.
         """
         if self.metadata is None:
             raise ValueError(
@@ -1180,12 +1191,28 @@ class Dataset:
         ]
 
         # Use provided list or defaults
-        fields_to_extract = (
+        fields_to_extract = list(
             groupings if groupings is not None else default_groupings
         )
 
-        # Try to extract each field, skip if not available
+        # When merging, leave fields that already exist alone so a user list
+        # may overlap the defaults without tripping the duplicate check.
+        if not force and self.groupings is not None:
+            existing = set(self.groupings.columns) - {"sample"}
+            already = [f for f in fields_to_extract if f in existing]
+            if already:
+                logger.info(
+                    "Grouping field(s) already present, skipping: %s", already
+                )
+            fields_to_extract = [
+                f for f in fields_to_extract if f not in existing
+            ]
+            if not fields_to_extract:
+                return self
+
+        # Try to extract each field; skip (or raise, if strict) if missing
         extracted_fields = []
+        missing_fields: List[str] = []
         for field in fields_to_extract:
             try:
                 # Use the new metadata API to get the field
@@ -1193,14 +1220,28 @@ class Dataset:
                 # Verify it has data by checking if we can collect at least one row
                 if field_data.head(1).collect().height > 0:
                     extracted_fields.append(field)
+                else:
+                    missing_fields.append(field)
             except AttributeError:
-                logger.warning(
-                    f"Field '{field}' not found in metadata, skipping"
-                )
+                missing_fields.append(field)
+                if not strict:
+                    logger.warning(
+                        f"Field '{field}' not found in metadata, skipping"
+                    )
             except Exception as e:
-                logger.warning(
-                    f"Could not extract field '{field}' from metadata: {e}"
-                )
+                missing_fields.append(field)
+                if not strict:
+                    logger.warning(
+                        f"Could not extract field '{field}' from metadata: {e}"
+                    )
+
+        if strict and missing_fields:
+            available = self.metadata.get_available_fields()
+            raise ValueError(
+                f"Grouping field(s) not found in metadata: {missing_fields}. "
+                f"Available metadata columns: {available.get('metadata')}; "
+                f"attribute keys: {available.get('attributes')}"
+            )
 
         if not extracted_fields:
             logger.warning(
@@ -1281,7 +1322,20 @@ class Dataset:
                 )
                 continue
 
-            logger.info(f"Creating holdout split for label: {lbl}")
+            if grouping is not None:
+                logger.info(
+                    "Creating holdout split for label: %s, grouped by '%s' "
+                    "(each %s value goes wholly to train or wholly to test)",
+                    lbl,
+                    grouping,
+                    grouping,
+                )
+            else:
+                logger.info(
+                    "Creating holdout split for label: %s, stratified random "
+                    "(no grouping; groups may appear in both train and test)",
+                    lbl,
+                )
 
             # Initialize SplitManager if needed
             if lbl not in self.splits:
@@ -1379,6 +1433,67 @@ class Dataset:
             written[lbl] = holdout_path
             logger.info(
                 "Saved holdout split for '%s' to %s", lbl, holdout_path
+            )
+
+        return written
+
+    def save_cv_folds(
+        self,
+        output_dir: Union[str, Path],
+        label: Optional[str] = None,
+    ) -> Dict[str, Dict[str, Path]]:
+        """Write CV fold tables to ``<output_dir>/<label>/cv_<scheme>.csv``.
+
+        One CSV per scheme with columns ``sample, fold`` — the exact fold
+        membership CV was run on (only holdout-train samples when the folds
+        were created with ``use_holdout=True``). Same layout as
+        :meth:`save` uses under ``splits/``.
+
+        Args:
+            output_dir: Directory to write into (created if missing)
+            label: Specific label to write. If None, writes every label
+                that has at least one CV scheme.
+
+        Returns:
+            Mapping of label -> {scheme -> path of the written CSV}
+
+        Raises:
+            ValueError: If *label* is given but has no CV folds, or if no
+                CV folds exist at all.
+        """
+        output_dir = Path(output_dir)
+
+        to_write: Dict[str, Dict[str, pl.DataFrame]] = {}
+        if label is not None:
+            split_manager = self._require_split_manager(label)
+            if not split_manager.cv_schemes:
+                raise ValueError(
+                    f"CV folds for '{label}' have not been created yet"
+                )
+            to_write[label] = dict(split_manager.cv_schemes)
+        else:
+            for lbl, sm in self.splits.items():
+                if sm.cv_schemes:
+                    to_write[lbl] = dict(sm.cv_schemes)
+            if not to_write:
+                raise ValueError(
+                    "No CV folds to save; call create_cv_folds first"
+                )
+
+        written: Dict[str, Dict[str, Path]] = {}
+        for lbl, schemes in to_write.items():
+            label_dir = output_dir / lbl
+            label_dir.mkdir(parents=True, exist_ok=True)
+            written[lbl] = {}
+            for scheme_name, cv_df in schemes.items():
+                cv_path = label_dir / f"cv_{scheme_name}.csv"
+                cv_df.write_csv(cv_path)
+                written[lbl][scheme_name] = cv_path
+            logger.info(
+                "Saved %d CV scheme(s) for '%s' to %s",
+                len(schemes),
+                lbl,
+                label_dir,
             )
 
         return written

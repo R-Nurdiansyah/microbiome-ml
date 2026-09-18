@@ -358,15 +358,19 @@ class Visualiser:
             ax.set_xticks(x)
 
             if show_values:
+                # Always inside the bar at its far end: just below the top
+                # for positive bars, just above the bottom for negative ones.
                 for xi, v in zip(x, folds):
-                    ax.text(
-                        xi,
-                        v,
+                    ax.annotate(
                         f"{v:.3f}",
+                        xy=(xi, v),
+                        xytext=(0, -3 if v >= 0 else 3),
+                        textcoords="offset points",
                         ha="center",
-                        va="bottom",
+                        va="top" if v >= 0 else "bottom",
                         fontsize=8,
-                        rotation=0,
+                        color="white",
+                        fontweight="bold",
                     )
 
             ax.legend(loc="best")
@@ -882,13 +886,16 @@ class Visualiser:
         Styles:
 
         ``"bar"``
-            Horizontal bar chart of per-feature ``mean(|SHAP|)``.  No extra
-            dependencies beyond matplotlib.
+            Horizontal bar chart of per-feature ``mean(|SHAP|)``. Bars are
+            coloured by ``shap_result.direction`` when available: blue for
+            features whose higher values push the prediction *up*, red for
+            those pushing it *down*, grey when direction is undefined.
 
         ``"beeswarm"``
             Scatter plot showing each sample's SHAP value per feature,
-            coloured by normalised feature value when ``X`` is supplied.
-            Falls back to a plain scatter when ``X`` is ``None``.
+            coloured by normalised feature value. Uses ``X`` if supplied,
+            else ``shap_result.X``; falls back to a plain scatter when
+            neither is available.
 
         Args:
             shap_result: A ``SHAPResult`` object.
@@ -897,8 +904,8 @@ class Visualiser:
             output: Optional output path stem (extension ignored; respects
                 ``self.formats``).
             title: Figure title.
-            X: Original feature matrix required for colour-coded beeswarm.
-                Shape must match ``shap_result.shap_values``.
+            X: Feature matrix for colour-coded beeswarm. Defaults to
+                ``shap_result.X``; shape must match ``shap_values``.
         """
         # Duck-type: require shap_values, mean_abs_shap, feature_names.
         if not all(
@@ -913,6 +920,14 @@ class Visualiser:
         shap_values: np.ndarray = np.asarray(shap_result.shap_values)
         mean_abs: np.ndarray = np.asarray(shap_result.mean_abs_shap)
         feature_names: List[str] = list(shap_result.feature_names)
+        direction_raw = getattr(shap_result, "direction", None)
+        direction: Optional[np.ndarray] = (
+            np.asarray(direction_raw, dtype=float)
+            if direction_raw is not None
+            else None
+        )
+        if X is None:
+            X = getattr(shap_result, "X", None)
 
         # Select top-n by mean |SHAP|.
         order = np.argsort(mean_abs)[::-1][:top_n]
@@ -923,19 +938,44 @@ class Visualiser:
         top_shap = shap_values[:, order_asc]
 
         if style == "bar":
-            fig, ax = plt.subplots(
-                figsize=(9, max(4, len(top_names) * 0.4))
-            )
-            ax.barh(top_names, top_mean, color="#5b8db8", edgecolor="none")
+            fig, ax = plt.subplots(figsize=(9, max(4, len(top_names) * 0.4)))
+            pos_color, neg_color, na_color = "#5b8db8", "#c0504d", "#9e9e9e"
+            if direction is not None:
+                top_dir = direction[order_asc]
+                bar_colors: List[str] = [
+                    na_color
+                    if not np.isfinite(d)
+                    else (pos_color if d >= 0 else neg_color)
+                    for d in top_dir
+                ]
+            else:
+                bar_colors = [pos_color] * len(top_names)
+            ax.barh(top_names, top_mean, color=bar_colors, edgecolor="none")
             ax.set_xlabel("mean(|SHAP value|)")
             ax.set_title(title)
             ax.grid(True, axis="x", alpha=0.3)
+            if direction is not None:
+                from matplotlib.patches import Patch
+
+                handles = [
+                    Patch(
+                        color=pos_color,
+                        label="higher value → higher prediction",
+                    ),
+                    Patch(
+                        color=neg_color,
+                        label="higher value → lower prediction",
+                    ),
+                ]
+                if any(not np.isfinite(d) for d in direction[order_asc]):
+                    handles.append(
+                        Patch(color=na_color, label="direction n/a")
+                    )
+                ax.legend(handles=handles, loc="lower right", fontsize="small")
             plt.tight_layout()
 
         elif style == "beeswarm":
-            fig, ax = plt.subplots(
-                figsize=(9, max(4, len(top_names) * 0.5))
-            )
+            fig, ax = plt.subplots(figsize=(9, max(4, len(top_names) * 0.5)))
             y_ticks = np.arange(len(top_names))
 
             if X is not None:
@@ -975,13 +1015,14 @@ class Visualiser:
             ax.set_xlabel("SHAP value")
             ax.set_title(title)
             if X_norm is not None:
-                sm = plt.cm.ScalarMappable(
-                    cmap=cmap, norm=plt.Normalize(0, 1)
-                )
+                sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1))
                 sm.set_array([])
                 fig.colorbar(
-                    sm, ax=ax, label="Feature value (normalised)",
-                    fraction=0.02, pad=0.01
+                    sm,
+                    ax=ax,
+                    label="Feature value (normalised)",
+                    fraction=0.02,
+                    pad=0.01,
                 )
             ax.grid(True, axis="x", alpha=0.3)
             plt.tight_layout()

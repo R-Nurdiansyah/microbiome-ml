@@ -1,82 +1,209 @@
+# =============================================================================
+# Pipeline config for scripts/run_cv_to_final_eval.py
+#
+#   pixi run python scripts/run_cv_to_final_eval.py --config pipeline.yaml
+#   pixi run -e shap python scripts/run_cv_to_final_eval.py --config ...   # with SHAP
+#
+# Stages, in order:
+#   1. data        -> load metadata / profiles / labels
+#   2. groupings   -> columns that holdout and CV can split by
+#   3. features    -> taxonomic feature tables (the X matrix)
+#   4. preprocessing (optional QC)
+#   5. split       -> holdout train/test, then CV folds inside train
+#   6. cv          -> model selection; best model per label x scheme
+#   7. holdout     -> refit each winner on train, score once on test (+ SHAP)
+#                     (skippable with holdout_evaluation.enabled: false)
+#   8. outputs / visualise
+#
+# Paths may be absolute or relative to the directory you launch from.
+# `null` means "not set / use the default".
+# =============================================================================
+
 data:
+  # Sample metadata, one row per sample. Must have a `sample` column; the
+  # default groupings are read from here (bioproject, biome, ecoregion, ...).
   metadata: /path/to/metadata.csv
+  # Long-format sample attributes: columns `sample,key,value`
+  # (e.g. SRR123,latitude,40.6). Extra per-sample fields live here.
   attributes: /path/to/attributes.csv
+  # Optional CSV of study titles keyed by bioproject/sample. null = none.
   study_titles: null
+  # Taxonomic profiles, one row per sample x taxon:
+  #   acc,coverage,taxonomy   (taxonomy = "Root; d__...; p__...; c__...; ...")
   profiles: /path/to/profiles.csv
+  # Optional per-sample root coverage CSV (total reads) if not derivable
+  # from the profiles. null = not needed.
   root: null
+  # Labels to predict. Each CSV has columns `sample,<value>`; the key here
+  # becomes the label name used everywhere (outputs, split.*.label, ...).
+  # Samples with an empty value are dropped for that label only.
   labels:
     temperature: /path/to/temperature_labels.csv
     ph: /path/to/ph_labels.csv
+  # Deprecated: use groupings.file below. Still honoured if groupings: is absent.
   groupings: null
 
+# Grouping columns are what split.holdout.grouping, split.cv.grouping and
+# cv.scheme can refer to. Built in this order; nothing is dropped.
+groupings:
+  # Extract the standard grouping columns from data.metadata:
+  #   bioproject, biome, domain, ecoregion, year, month, climate, season
+  # Columns missing from your metadata are skipped with a warning.
+  defaults: true
+  # Any OTHER column of data.metadata to use as a grouping, e.g.
+  #   columns: [depth_category, zone, realm]
+  # Missing columns are an error (names are checked before the slow stages).
+  columns: []
+  # CSV with `sample` + custom grouping columns you derived yourself, e.g. a
+  # latitude band (`sample,lat_band` / `SRR123,tropical`). Merged on top;
+  # a column name that already exists is an error. null = none.
+  file: null
+
 features:
-  create_default_groupings: true
+  # Build taxonomic feature tables (relative abundance per taxon) from the
+  # profiles. These are the model inputs; one feature set per rank.
   add_taxonomic_features: true
+  # true  -> one feature set for every rank phylum..species (ignores `ranks`)
+  # false -> only the ranks listed below (null = class only)
   all: true
+  # e.g. [phylum, class, order, family, genus]. Used when all: false.
   ranks: null
+  # Feature-set name prefix: tax -> tax_phylum, tax_class, ...
   prefix: tax
 
 preprocessing:
+  # Master switch for the QC steps below. false = use the data as given.
   enabled: false
+  # Drop samples whose sequencing depth (megabase pairs column) is below
+  # metadata_mbp_cutoff megabase pairs.
   metadata_qc: true
+  # Fill missing taxa, convert to relative abundance, then drop samples with
+  # coverage < profiles_cov_cutoff or dominated by a single taxon.
   profiles_qc: true
+  # After QC keep only samples present in every component (recommended).
   sync_after: true
-  metadata_mbp_cutoff: 15
-  profiles_cov_cutoff: 0
-  profiles_dominated_cutoff: 0.99
-  profiles_rank: order
+  metadata_mbp_cutoff: 15          # min megabase pairs per sample
+  profiles_cov_cutoff: 0           # min total coverage per sample (0 = keep all)
+  profiles_dominated_cutoff: 0.99  # drop sample if one taxon > this fraction
+  profiles_rank: order             # rank at which the domination check is done
 
 split:
+  # Level 1: hold out a test set that is NEVER used for CV/model selection.
   holdout:
+    # Which label to split on; null = create a holdout for every label.
     label: null
+    # Fraction of samples held out as `test` (approximate when grouping set).
     test_size: 0.2
+    # Continuous labels are cut into this many quantile bins and the test set
+    # is stratified across them, so it spans the label's range.
     n_bins: 5
+    # ONE grouping column, or null.
+    #   null        -> stratified random split; the same bioproject/region
+    #                  can appear in both train and test.
+    #   bioproject  -> every bioproject goes wholly to train or wholly to
+    #                  test, i.e. the test set is UNSEEN groups. Use this to
+    #                  measure generalisation to new studies/regions.
+    # A list is not accepted: run the pipeline once per grouping instead.
     grouping: null
     random_state: 42
+    # Recreate the split even if one already exists on the dataset.
     force: true
+  # Level 2: CV folds, drawn from the holdout TRAIN samples only.
   cv:
-    label: null
+    label: null                    # null = folds for every label
     n_folds: 5
-    n_bins: 5
+    n_bins: 5                      # label stratification, as above
+    # Which fold schemes to build (each scheme = a different way to cut the
+    # train samples into folds):
+    #   all      -> `random` + one scheme per grouping column
+    #   random   -> only the ungrouped baseline
+    #   <column> -> only that grouping (plus nothing else)
+    # Building schemes is cheap; use cv.scheme below to limit what is trained.
     grouping: all
     random_state: 42
+    # true = folds come from holdout-train only (keep this true; false leaks
+    # the test samples into model selection).
     use_holdout: true
     force: true
+    # true  -> skip a scheme that cannot produce n_folds populated folds
+    #          (e.g. a grouping with only 3 distinct values).
+    # false -> keep it with however many folds it can make.
     strict: true
 
 cv:
+  # Models to evaluate. Short names: rf (random forest), gb (gradient
+  # boosting), xgb / xgboost. Hyperparameters come from param_path.
   models:
     - rf
     - xgboost
+  # run      -> evaluate EVERY parameter combination in param_path with CV
+  #             and keep them all in cv_results (best is chosen per scheme).
+  # run_grid -> sklearn GridSearchCV per model/scheme; only the grid winner
+  #             is kept. Faster output to read, less detail.
   mode: run
+  # YAML of per-model parameter lists (see parameters.yaml in the repo).
   param_path: parameters.yaml
+  # Parallel jobs across feature/label/scheme combinations.
+  # null = use all detected CPU cores.
   n_jobs: null
+  # run_grid only, when n_jobs is null: parameter combos per job.
   params_per_job: 2
-  label: null
+  # Restrict CV to a subset. null = everything the split stage produced.
+  label: null                      # e.g. ph, or [ph, temperature]
+  # Schemes to actually train, e.g. [random, bioproject, ecoregion].
+  # Keep `random` as the leaky baseline to compare grouped schemes against.
   scheme: null
-  feature_set: null
+  feature_set: null                # e.g. tax_order, or [tax_order, tax_genus]
+
+# Stage 7 switch. false = stop after CV: best_models/ and cv_results/ are
+# written (plus CV bar plots if visualise.enabled) and the log lists the best
+# combination per label/scheme, but nothing is refit or scored on the test
+# set. The holdout split is still created and saved under splits/, so a later
+# run with the same split.* settings evaluates on the identical test samples.
+holdout_evaluation:
+  enabled: true
 
 outputs:
+  # Everything below is written under here (also overridable with
+  # --output-dir on the command line):
+  #   splits/<label>/holdout.csv, cv_<scheme>.csv   sample assignments
+  #   cv_results/                                   all CV results (sorted)
+  #   best_models/<label>/<scheme>/ + summary       CV winner per scheme
+  #   holdout/<label>/<scheme>/ + holdout_summary   final models + metrics
   base_dir: out/pipeline
-  holdout_splits_dir: null   # default: <base_dir>/holdout_splits
-  cv_save_models: false      # also pickle every CV combination under cv_results/models/
-  cv_fold_table: false       # also write cv_results/results_folds.csv (derivable from results.ndjson)
+  # Where the split assignment CSVs go. null = base_dir/splits
+  splits_dir: null
+  # Also pickle every CV combination under cv_results/models/ (large!).
+  # The best model per scheme is always saved under best_models/ regardless.
+  cv_save_models: false
+  # Also write cv_results/results_folds.csv (one row per fold; the same
+  # numbers are inside results.ndjson).
+  cv_fold_table: false
+  # Save the fully prepared dataset (features + splits) so it can be reloaded
+  # with Dataset.load() without recomputing. e.g. /abs/path/dataset. null = skip
   save_dataset_path: null
+  # Pack save_dataset_path into a single .tar.gz instead of a directory.
   save_dataset_compress: false
 
 visualise:
+  # Write figures: CV bar charts, holdout diagnostics (pred vs obs,
+  # residuals), feature-importance bars, and SHAP plots when shap.enabled.
   enabled: false
-  formats:
+  formats:                         # any of png, svg, pdf, eps
     - png
-  top_n: 20
+  top_n: 20                        # features shown in importance plots
 
-# Optional SHAP attribution on each holdout test split. Requires the `shap`
+# Optional SHAP attribution on each holdout TEST split. Requires the `shap`
 # package: run with `pixi run -e shap python scripts/run_cv_to_final_eval.py ...`
 # (or `pixi run -e full ...`). If shap is missing the run continues with a
-# warning. Writes shap_summary.csv / shap_values.csv next to each holdout model,
-# adds `shap_top_features` to holdout_metrics.json and, when visualise.enabled,
-# a holdout_shap_bar_<label>__<scheme> plot.
+# warning. Per holdout model it writes shap_summary.csv (mean_abs_shap,
+# mean_shap, direction) and shap_values.csv, adds `shap_top_features` /
+# `shap_top_features_direction` to holdout_metrics.json, and with
+# visualise.enabled a direction-coloured bar plot and a beeswarm.
+# direction = Spearman(abundance, SHAP): >0 pushes the label up, <0 down.
 shap:
   enabled: false
-  max_background: 100   # background subsample cap (keeps compute bounded)
-  top_n: 20             # features listed in holdout_metrics.json and plotted
+  # Background samples for the explainer; caps compute on large test sets.
+  max_background: 100
+  # Features listed in holdout_metrics.json and shown in the SHAP plots.
+  top_n: 20

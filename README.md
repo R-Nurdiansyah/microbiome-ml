@@ -132,8 +132,45 @@ pixi run python scripts/run_cv_to_final_eval.py --config pipeline.yaml
 Outputs are written under `outputs.base_dir` from the config:
 - `cv_results/` (`results.ndjson`, `results_summary.csv`, `feature_importances.csv`, `manifest.json`; set `outputs.cv_save_models: true` / `outputs.cv_fold_table: true` to also keep per-combination model pickles and `results_folds.csv`)
 - `best_models/<label>/<scheme>/` (best model package for every label × CV scheme, plus `best_models_summary.csv` sorted best → worst by CV R²) — every scheme is kept, not just the overall winner, because the ungrouped `random` scheme usually wins CV by leaking group structure and must be compared against grouped schemes on the holdout
-- `holdout_splits/<label>/holdout.csv` (holdout train/test sample assignments; override with `outputs.holdout_splits_dir`)
+- `splits/<label>/holdout.csv` (every sample tagged `train`/`test`; the `test` rows are the holdout set) and `splits/<label>/cv_<scheme>.csv` (fold membership per CV scheme, drawn from holdout-`train` only) — override the directory with `outputs.splits_dir`
 - `holdout/<label>/<scheme>/` (final holdout model per label × scheme) + `holdout_metrics.json` and `holdout_summary.csv` (sorted best → worst by holdout R²)
+
+### Stopping after CV
+
+Set `holdout_evaluation.enabled: false` to run everything up to and including
+model selection and stop there: `cv_results/`, `best_models/<label>/<scheme>/`
+and `best_models_summary.csv` are written, the log prints the best combination
+per label/scheme, and nothing is fitted or scored on the holdout test set. Use
+this to inspect the CV picture first (e.g. does a grouped scheme come close to
+`random`?) before spending the one-shot holdout. The holdout split is still
+created and saved under `splits/`, so re-running with `enabled: true` and the
+same `split.*` settings evaluates on the identical test samples.
+
+### Choosing grouping columns
+
+Groupings are the columns that `split.holdout.grouping`, `split.cv.grouping`
+and `cv.scheme` can name. The `groupings:` section builds them in three layers,
+none of which overwrites the others:
+
+```yaml
+groupings:
+  defaults: true                      # bioproject, biome, domain, ecoregion,
+                                      # year, month, climate, season
+  columns: [depth_category, zone]     # any other metadata column; error if absent
+  file: /path/to/my_groupings.csv     # `sample` + derived columns, e.g. lat bands
+```
+
+- `split.holdout.grouping` takes **one** column (or `null`): every value of that
+  column is placed wholly in `train` or wholly in `test`. To compare holdouts by
+  different groupings, run the pipeline once per grouping.
+- `split.cv.grouping: all` builds a fold scheme for every grouping column;
+  `cv.scheme: [random, month, zone]` then limits which schemes are actually
+  trained. `random` is the ungrouped baseline.
+- Any name that is not a grouping column fails immediately after the groupings
+  are built, before feature engineering, with the list of available columns.
+
+Older configs using `features.create_default_groupings` and `data.groupings`
+still work; they map onto `groupings.defaults` and `groupings.file`.
 
 ## Feature Engineering Examples
 
@@ -391,11 +428,27 @@ Run it in an environment that has `shap` installed:
 pixi run -e shap python scripts/run_cv_to_final_eval.py --config pipeline.yaml
 ```
 
-Per `holdout/<label>/<scheme>/` you get `shap_summary.csv` (mean |SHAP| per
-feature) and `shap_values.csv`; `holdout_metrics.json` gains a
-`shap_top_features` list per model, and with `visualise.enabled: true` a
-`holdout_shap_bar_<label>__<scheme>` figure is written. If `shap` is not
-installed the pipeline logs a warning and continues without it.
+Per `holdout/<label>/<scheme>/` you get `shap_summary.csv` and `shap_values.csv`;
+`holdout_metrics.json` gains `shap_top_features` and
+`shap_top_features_direction` per model, and with `visualise.enabled: true`
+two figures per model: `holdout_shap_bar_<label>__<scheme>` and
+`holdout_shap_beeswarm_<label>__<scheme>`. If `shap` is not installed the
+pipeline logs a warning and continues without it.
+
+**Reading direction.** `mean_abs_shap` (the bar length) is magnitude only —
+the absolute value is taken before averaging, so it cannot tell you whether a
+taxon pushes the label up or down. `shap_summary.csv` therefore also carries:
+
+- `mean_shap` — signed mean SHAP across samples;
+- `direction` — Spearman correlation between the feature value (abundance)
+  and its SHAP value, in [-1, 1]. Positive: more abundant → higher predicted
+  label; negative: more abundant → lower predicted label. Empty when the
+  feature is constant in the test split.
+
+The bar plot colours bars blue (positive direction) / red (negative); the
+beeswarm shows every sample so you can also see how consistent the effect is.
+Rank-based `direction` is used rather than a linear slope because microbiome
+abundances are zero-inflated and heavily skewed.
 
 ### Automatic SHAP during holdout training
 

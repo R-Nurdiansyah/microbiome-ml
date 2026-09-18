@@ -300,3 +300,39 @@ def test_save_holdout_splits_errors(splitting_dataset, tmp_path):
     dataset.create_holdout_split(label="target_cont", random_state=42)
     with pytest.raises(ValueError):
         dataset.save_holdout_splits(tmp_path, label="target_cat")
+
+
+def test_save_cv_folds_writes_one_csv_per_scheme(splitting_dataset, tmp_path):
+    """cv_<scheme>.csv is written per label with only holdout-train rows."""
+    dataset = splitting_dataset
+    dataset.create_holdout_split(
+        label="target_cont", test_size=0.2, random_state=42
+    )
+    dataset.create_cv_folds(
+        label="target_cont", n_folds=3, random_state=42, use_holdout=True
+    )
+
+    written = dataset.save_cv_folds(tmp_path, label="target_cont")
+
+    assert "target_cont" in written
+    schemes = written["target_cont"]
+    assert schemes  # at least the 'random' scheme
+    for scheme, path in schemes.items():
+        assert path == tmp_path / "target_cont" / f"cv_{scheme}.csv"
+        cv = pl.read_csv(path)
+        assert {"sample", "fold"} <= set(cv.columns)
+        # folds come from holdout-train only: no test sample may appear
+        holdout = dataset.splits["target_cont"].holdout
+        test_samples = set(
+            holdout.filter(pl.col("split") == "test")["sample"].to_list()
+        )
+        assert not (set(cv["sample"].to_list()) & test_samples)
+
+
+def test_save_cv_folds_errors_without_folds(splitting_dataset, tmp_path):
+    dataset = splitting_dataset
+    with pytest.raises(ValueError):
+        dataset.save_cv_folds(tmp_path)
+    dataset.create_holdout_split(label="target_cont", random_state=42)
+    with pytest.raises(ValueError):
+        dataset.save_cv_folds(tmp_path, label="target_cont")

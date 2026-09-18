@@ -1273,6 +1273,63 @@ class TestDatasetDefaultGroupings:
         # Custom groupings should be gone
         assert "custom_group" not in dataset.groupings.columns
 
+    def test_create_default_groupings_strict_raises_on_missing(
+        self, sample_metadata
+    ):
+        """strict=True turns a missing field into an informative error."""
+        dataset = Dataset(metadata=sample_metadata)
+
+        with pytest.raises(ValueError) as excinfo:
+            dataset.create_default_groupings(
+                groupings=["bioproject", "not_a_column"], strict=True
+            )
+        msg = str(excinfo.value)
+        assert "not_a_column" in msg
+        assert "Available metadata columns" in msg
+        # nothing was written on failure
+        assert dataset.groupings is None
+
+    def test_create_default_groupings_merge_skips_existing(
+        self, sample_metadata
+    ):
+        """Merging a list that overlaps existing columns must not raise."""
+        dataset = Dataset(metadata=sample_metadata)
+        dataset.create_default_groupings(force=True)
+        before = set(dataset.groupings.columns)
+
+        # 'bioproject' already exists; 'biome' too. Must be a no-op, not
+        # a 'Duplicate grouping columns' error.
+        dataset.create_default_groupings(
+            groupings=["bioproject", "biome"], force=False, strict=True
+        )
+        assert set(dataset.groupings.columns) == before
+
+    def test_pipeline_grouping_order_keeps_defaults_and_custom(
+        self, sample_metadata
+    ):
+        """Defaults first, then user columns, then a custom table: all kept.
+
+        This is the order run_cv_to_final_eval.py uses; the old order
+        (custom table first, then force=True defaults) dropped the custom
+        column silently.
+        """
+        dataset = Dataset(metadata=sample_metadata)
+        dataset.create_default_groupings(force=True)
+        dataset.create_default_groupings(
+            groupings=["biosample"], force=False, strict=True
+        )
+        dataset.add_groupings(
+            pl.DataFrame(
+                {
+                    "sample": ["S1", "S2", "S3", "S4"],
+                    "lat_band": ["low", "low", "high", "high"],
+                }
+            )
+        )
+
+        cols = set(dataset.groupings.columns)
+        assert {"bioproject", "biome", "biosample", "lat_band"} <= cols
+
     def test_create_default_groupings_preserves_nulls(self, tmp_path):
         """Test that null values are preserved in groupings."""
         # Create metadata with some null values
