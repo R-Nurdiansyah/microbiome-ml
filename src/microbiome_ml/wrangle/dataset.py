@@ -30,6 +30,27 @@ from microbiome_ml.wrangle.splits import SplitManager
 logger = logging.getLogger(__name__)
 
 
+def _as_rank(rank: Union[str, TaxonomicRanks]) -> TaxonomicRanks:
+    """Accept a rank as a name ('family'), a prefix ('f__' / 'f'), or enum."""
+    if isinstance(rank, TaxonomicRanks):
+        return rank
+    text = str(rank).strip().lower()
+    if not text:
+        raise ValueError("Rank must not be empty")
+    try:
+        return TaxonomicRanks.from_name(text)
+    except ValueError:
+        pass
+    prefix = text if text.endswith("__") else f"{text}__"
+    try:
+        return TaxonomicRanks.from_prefix(prefix)
+    except ValueError:
+        raise ValueError(
+            f"Invalid taxonomic rank {rank!r}; use a name like 'family' or "
+            "a prefix like 'f__'"
+        )
+
+
 class Dataset:
     """Global entry point for microbiome ML workflows with flexible builder
     pattern.
@@ -1374,6 +1395,240 @@ class Dataset:
                 n_bins=n_bins,
                 random_state=random_state,
                 metadata=metadata_df,
+            )
+
+        if output_dir is not None:
+            self.save_holdout_splits(output_dir, label=label)
+
+        return self
+
+    def _rank_feature_set(self, rank: TaxonomicRanks) -> str:
+        """Name of the feature set holding *rank* (e.g. 'tax_family')."""
+        suffix = f"_{rank.name.lower()}"
+        candidates = [
+            name for name in self.feature_sets if name.endswith(suffix)
+        ]
+        if not candidates:
+            raise ValueError(
+                f"No feature set for rank '{rank.name.lower()}'. Available: "
+                f"{sorted(self.feature_sets)}. Add it with "
+                "add_taxonomic_features(ranks=[...]) before splitting."
+            )
+        return sorted(candidates)[0]
+
+    def taxon_prevalence(
+        self,
+        rank: Union[str, TaxonomicRanks],
+        samples: Optional[List[str]] = None,
+        presence_threshold: float = 0.0,
+    ) -> pl.DataFrame:
+        """Prevalence of every taxon at *rank* across *samples*.
+
+        Args:
+            rank: Rank name ('family'), prefix ('f__'), or TaxonomicRanks.
+            samples: Restrict to these samples (default: all in the set).
+            presence_threshold: A taxon counts as present when its value is
+                strictly greater than this (default: any non-zero value).
+
+        Returns:
+            DataFrame {taxon, n_present, n_samples, prevalence}, most
+            prevalent first.
+        """
+        rank_enum = _as_rank(rank)
+        feature_name = self._rank_feature_set(rank_enum)
+        df = self.feature_sets[feature_name].to_df()
+        if samples is not None:
+            df = df.filter(pl.col("sample").is_in(samples))
+        n_samples = df.height
+        if n_samples == 0:
+            raise ValueError(
+                f"No samples left for rank '{rank_enum.name.lower()}'"
+            )
+        taxa = [c for c in df.columns if c != "sample"]
+        counts = df.select(
+            [(pl.col(c) > presence_threshold).sum().alias(c) for c in taxa]
+        ).row(0)
+        return (
+            pl.DataFrame(
+                {
+                    "taxon": taxa,
+                    "n_present": list(counts),
+                }
+            )
+            .with_columns(
+                pl.lit(n_samples).alias("n_samples"),
+                (pl.col("n_present") / n_samples).alias("prevalence"),
+            )
+            .sort("prevalence", descending=True)
+        )
+
+    def create_taxon_holdout_split(
+        self,
+        rank: Union[str, TaxonomicRanks],
+        label: Optional[str] = None,
+        test_size: float = 0.2,
+        presence_threshold: float = 0.0,
+        min_test_samples: int = 2,
+        force: bool = False,
+        output_dir: Optional[Union[str, Path]] = None,
+    ) -> "Dataset":
+        """Hold out samples by presence/absence of one taxon at *rank*.
+
+        Instead of splitting on a metadata column, the test set is defined by
+        the community itself: the taxon at *rank* whose prevalence across the
+        labelled samples is closest to ``test_size`` is chosen, and the
+        samples carrying it (or lacking it, whichever lands nearer the
+        target) become the holdout. Training therefore never sees a community
+        containing that taxon, so the holdout asks whether the model
+        generalises to communities defined by a different membership.
+
+        Only samples with a non-null label are considered, so the profiles are
+        effectively filtered to the labelled rows first.
+
+        Args:
+            rank: Rank to split on: 'family', 'f__', or TaxonomicRanks.FAMILY.
+            label: Label to split. If None, splits every label separately
+                (each may end up with a different taxon).
+            test_size: Target fraction of samples in the holdout.
+            presence_threshold: A taxon counts as present above this value.
+            min_test_samples: Refuse a taxon that would leave fewer than this
+                many samples on either side of the split.
+            force: Overwrite an existing split for the label.
+            output_dir: If given, write the split(s) with
+                :meth:`save_holdout_splits`.
+
+        Returns:
+            Self for chaining.
+        """
+        if self.labels is None:
+            raise ValueError("Labels must be added before creating splits")
+        rank_enum = _as_rank(rank)
+        feature_name = self._rank_feature_set(rank_enum)
+        feature_df = self.feature_sets[feature_name].to_df()
+
+        all_label_cols = [c for c in self.labels.columns if c != "sample"]
+        if label is not None:
+            if label not in all_label_cols:
+                raise ValueError(f"Label '{label}' not found in labels")
+            label_list = [label]
+        else:
+            label_list = all_label_cols
+
+        metadata_df: Optional[pl.DataFrame] = None
+        if self.metadata is not None:
+            metadata_df = self.metadata.metadata.collect()
+
+        for lbl in label_list:
+            if lbl in self.splits and not force:
+                logger.warning(
+                    f"Split for '{lbl}' already exists. "
+                    "Use force=True to overwrite."
+                )
+                continue
+
+            # Labelled samples only, and only those with a profile.
+            data = self.labels.select(["sample", lbl]).drop_nulls(subset=[lbl])
+            data = data.filter(
+                pl.col("sample").is_in(feature_df["sample"].to_list())
+            )
+            n_samples = data.height
+            if n_samples < 2 * min_test_samples:
+                logger.warning(
+                    "Label '%s': only %d labelled samples with a profile; "
+                    "skipping taxon holdout",
+                    lbl,
+                    n_samples,
+                )
+                continue
+
+            prevalence = self.taxon_prevalence(
+                rank_enum,
+                samples=data["sample"].to_list(),
+                presence_threshold=presence_threshold,
+            )
+            # Presence -> test, or absence -> test: whichever prevalence puts
+            # closest to the requested test_size while leaving both sides
+            # above min_test_samples.
+            usable = prevalence.with_columns(
+                (pl.col("prevalence") - test_size).abs().alias("_d_present"),
+                ((1 - pl.col("prevalence")) - test_size)
+                .abs()
+                .alias("_d_absent"),
+            ).filter(
+                (pl.col("n_present") >= min_test_samples)
+                & (
+                    pl.col("n_samples") - pl.col("n_present")
+                    >= min_test_samples
+                )
+            )
+            if usable.height == 0:
+                logger.warning(
+                    "Label '%s': no %s taxon splits the %d samples with at "
+                    "least %d on each side; skipping taxon holdout",
+                    lbl,
+                    rank_enum.name.lower(),
+                    n_samples,
+                    min_test_samples,
+                )
+                continue
+
+            by_present = usable.sort(["_d_present", "taxon"]).row(
+                0, named=True
+            )
+            by_absent = usable.sort(["_d_absent", "taxon"]).row(0, named=True)
+            if by_present["_d_present"] <= by_absent["_d_absent"]:
+                chosen, presence_is_test = by_present, True
+                achieved = chosen["prevalence"]
+            else:
+                chosen, presence_is_test = by_absent, False
+                achieved = 1.0 - chosen["prevalence"]
+
+            taxon = chosen["taxon"]
+            present = feature_df.filter(pl.col(taxon) > presence_threshold)[
+                "sample"
+            ].to_list()
+            in_test = pl.col("sample").is_in(present)
+            if not presence_is_test:
+                in_test = ~in_test
+
+            logger.info(
+                "Creating holdout split for label: %s, by %s taxon '%s' "
+                "(%s -> test; %d/%d samples = %.1f%%, target %.1f%%)",
+                lbl,
+                rank_enum.name.lower(),
+                taxon,
+                "presence" if presence_is_test else "absence",
+                round(achieved * n_samples),
+                n_samples,
+                achieved * 100,
+                test_size * 100,
+            )
+
+            holdout_df = data.select(
+                "sample",
+                pl.when(in_test)
+                .then(pl.lit("test"))
+                .otherwise(pl.lit("train"))
+                .alias("split"),
+            )
+
+            if lbl not in self.splits:
+                self.splits[lbl] = SplitManager(lbl)
+            enriched = self.splits[lbl]._enrich_holdout(
+                holdout_df=holdout_df,
+                data=data,
+                target_col=lbl,
+                metadata=metadata_df,
+                split_col_name="split",
+            )
+            # _enrich_holdout selects a fixed column set, so record which
+            # taxon produced the split afterwards.
+            self.splits[lbl].holdout = enriched.with_columns(
+                pl.lit(taxon).alias("holdout_taxon"),
+                pl.lit(rank_enum.name.lower()).alias("holdout_rank"),
+                pl.lit("presence" if presence_is_test else "absence").alias(
+                    "holdout_taxon_in_test"
+                ),
             )
 
         if output_dir is not None:

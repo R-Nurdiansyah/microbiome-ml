@@ -3,6 +3,8 @@
 #
 #   pixi run python scripts/run_cv_to_final_eval.py --config pipeline.yaml
 #   pixi run -e shap python scripts/run_cv_to_final_eval.py --config ...   # with SHAP
+#   ... --set split.holdout.grouping=bioproject --set outputs.base_dir=out/x
+#       (override any key from the CLI; repeatable; values parsed as YAML)
 #
 # Stages, in order:
 #   1. data        -> load metadata / profiles / labels
@@ -105,6 +107,16 @@ split:
     #                  measure generalisation to new studies/regions.
     # A list is not accepted: run the pipeline once per grouping instead.
     grouping: null
+    # Alternative to `grouping`: split on COMMUNITY MEMBERSHIP instead of a
+    # metadata column. Set a rank ('family' or 'f__') and the taxon at that
+    # rank whose prevalence is nearest test_size defines the holdout -- the
+    # samples carrying it (or lacking it, whichever lands nearer) become the
+    # test set, so training never sees a community containing that taxon.
+    # Needs the matching feature set (features.ranks must include the rank).
+    # Only labelled samples are considered. null = use `grouping` instead.
+    taxon_rank: null
+    presence_threshold: 0.0   # a taxon counts as present above this value
+    min_test_samples: 2       # refuse a taxon leaving fewer on either side
     random_state: 42
     # Recreate the split even if one already exists on the dataset.
     force: true

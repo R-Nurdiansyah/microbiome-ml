@@ -32,8 +32,11 @@ microbiome_ml = { path = ".", editable = true }
 [feature.shap.dependencies]
 # Optional: SHAP-based feature attribution (used by SHAPAnalyser / Visualiser)
 shap = ">=0.44.0"
+snakemake-executor-plugin-cluster-generic = ">=1.0.9,<2"
 
 [feature.dev.dependencies]
+# Workflow engine for workflow/Snakefile (parallel holdout-grouping sweep)
+snakemake-minimal = ">=8.0"
 pytest = ">=7.0.0"
 pytest-cov = ">=4.0.0"
 pytest-mock = ">=3.10.0"
@@ -91,6 +94,8 @@ clean = "find . -type d -name __pycache__ -delete && find . -name '*.pyc' -delet
 install-dev = "pip install -e ."  # Fallback only; editable install is handled by [pypi-dependencies]
 test = "pytest test/tests/"
 local-check = { depends-on = ["lint", "type-check", "test"] }
+# Parallel sweep: pixi run sweep --configfile pipeline.yaml --config holdout_groupings=random,bioproject --cores 32
+sweep = "snakemake -s workflow/Snakefile"
 
 
 [environments]

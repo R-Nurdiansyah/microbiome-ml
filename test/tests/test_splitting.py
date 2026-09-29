@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 import pytest
@@ -336,3 +338,140 @@ def test_save_cv_folds_errors_without_folds(splitting_dataset, tmp_path):
     dataset.create_holdout_split(label="target_cont", random_state=42)
     with pytest.raises(ValueError):
         dataset.save_cv_folds(tmp_path, label="target_cont")
+
+
+@pytest.fixture
+def taxon_dataset():
+    """Dataset whose family feature set reproduces the worked example:
+
+        s1: f__a, f__b, f__c
+        s2:       f__c, f__d, f__e
+        s3: f__x, f__b, f__c
+        s4:       f__b, f__c, f__d
+
+    f__a and f__e and f__x are each in exactly 1 of 4 samples (25%).
+    """
+    from microbiome_ml.wrangle.features import SampleFeatureSet
+
+    samples = ["s1", "s2", "s3", "s4"]
+    taxa = ["f__a", "f__b", "f__c", "f__d", "f__e", "f__x"]
+    present = {
+        "s1": {"f__a", "f__b", "f__c"},
+        "s2": {"f__c", "f__d", "f__e"},
+        "s3": {"f__x", "f__b", "f__c"},
+        "s4": {"f__b", "f__c", "f__d"},
+    }
+    matrix = np.array(
+        [[1.0 if t in present[s] else 0.0 for t in taxa] for s in samples]
+    )
+
+    dataset = Dataset()
+    dataset.add_labels(
+        pl.DataFrame({"sample": samples, "target": [1.0, 2.0, 3.0, 4.0]})
+    )
+    dataset.feature_sets["tax_family"] = SampleFeatureSet(
+        accessions=samples,
+        feature_names=taxa,
+        features=matrix,
+        name="tax_family",
+    )
+    return dataset
+
+
+def test_taxon_prevalence(taxon_dataset):
+    prev = taxon_dataset.taxon_prevalence("family")
+
+    as_dict = dict(zip(prev["taxon"], prev["prevalence"]))
+    assert as_dict["f__c"] == 1.0  # in all 4
+    assert as_dict["f__b"] == 0.75
+    assert as_dict["f__d"] == 0.5
+    assert as_dict["f__a"] == 0.25
+    assert prev["n_samples"][0] == 4
+
+
+def test_taxon_holdout_picks_prevalence_nearest_test_size(taxon_dataset):
+    """25% prevalence is nearest to test_size=0.2, so a singleton taxon
+    defines the holdout and its one sample is the test set."""
+    taxon_dataset.create_taxon_holdout_split(
+        rank="family", label="target", test_size=0.2, min_test_samples=1
+    )
+
+    holdout = taxon_dataset.splits["target"].holdout
+    assert holdout is not None
+    assert holdout.height == 4
+    test = holdout.filter(pl.col("split") == "test")
+    assert test.height == 1
+
+    taxon = holdout["holdout_taxon"][0]
+    assert taxon in {"f__a", "f__e", "f__x"}  # the 25% taxa
+    assert holdout["holdout_rank"][0] == "family"
+    assert holdout["holdout_taxon_in_test"][0] == "presence"
+
+
+def test_taxon_holdout_train_never_contains_the_taxon(taxon_dataset):
+    taxon_dataset.create_taxon_holdout_split(
+        rank="f__", label="target", test_size=0.2, min_test_samples=1
+    )
+
+    holdout = taxon_dataset.splits["target"].holdout
+    taxon = holdout["holdout_taxon"][0]
+    feature_df = taxon_dataset.feature_sets["tax_family"].to_df()
+    carriers = set(feature_df.filter(pl.col(taxon) > 0)["sample"].to_list())
+    test_samples = set(
+        holdout.filter(pl.col("split") == "test")["sample"].to_list()
+    )
+    train_samples = set(
+        holdout.filter(pl.col("split") == "train")["sample"].to_list()
+    )
+    assert test_samples == carriers
+    assert not (train_samples & carriers)
+
+
+def test_taxon_holdout_prefers_presence_on_ties(taxon_dataset):
+    """Presence and absence are equidistant here (25% vs 75%); the rule is
+    to prefer presence, so the test set carries the taxon."""
+    taxon_dataset.create_taxon_holdout_split(
+        rank="family", label="target", test_size=0.25, min_test_samples=1
+    )
+    holdout = taxon_dataset.splits["target"].holdout
+    assert holdout["holdout_taxon_in_test"][0] == "presence"
+    assert holdout.filter(pl.col("split") == "test").height == 1
+
+
+def test_taxon_holdout_skips_when_no_usable_taxon(taxon_dataset):
+    """min_test_samples=3 cannot be met on both sides of any split here."""
+    taxon_dataset.create_taxon_holdout_split(
+        rank="family", label="target", test_size=0.2, min_test_samples=3
+    )
+    assert taxon_dataset.splits.get("target") is None or (
+        taxon_dataset.splits["target"].holdout is None
+    )
+
+
+def test_taxon_holdout_unknown_rank_raises(taxon_dataset):
+    with pytest.raises(ValueError, match="Invalid taxonomic rank"):
+        taxon_dataset.create_taxon_holdout_split(rank="nonsense")
+
+
+def test_taxon_holdout_missing_feature_set_raises(taxon_dataset):
+    with pytest.raises(ValueError, match="No feature set for rank"):
+        taxon_dataset.create_taxon_holdout_split(rank="genus")
+
+
+def test_holdout_spec_tokens():
+    """Sweep tokens map to the right holdout strategy and directory name."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    import pipeline_steps as steps
+
+    assert steps.holdout_spec("random") == ("column", None)
+    assert steps.holdout_spec("null") == ("column", None)
+    assert steps.holdout_spec("bioproject") == ("column", "bioproject")
+    assert steps.holdout_spec("taxon:family") == ("taxon", "family")
+    assert steps.holdout_spec("taxon_family") == ("taxon", "family")
+
+    assert steps.spec_dir_name("random") == "random"
+    assert steps.spec_dir_name("bioproject") == "bioproject"
+    assert steps.spec_dir_name("taxon:family") == "taxon_family"
+    assert steps.spec_dir_name("taxon_family") == "taxon_family"

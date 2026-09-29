@@ -15,7 +15,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
@@ -45,6 +45,41 @@ def load_yaml_config(path: Path) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("Top-level config must be a mapping")
     return data
+
+
+def _parse_override(item: str) -> Tuple[str, Any]:
+    """Split ``KEY=VALUE``; VALUE is parsed as YAML so types match the file."""
+    if "=" not in item:
+        raise ValueError(
+            f"--set expects KEY=VALUE, got {item!r} "
+            "(e.g. --set split.holdout.grouping=bioproject)"
+        )
+    key, raw = item.split("=", 1)
+    key = key.strip()
+    if not key:
+        raise ValueError(f"--set has an empty key in {item!r}")
+    try:
+        value = yaml.safe_load(raw) if raw.strip() != "" else None
+    except yaml.YAMLError as exc:
+        raise ValueError(f"--set {key}: could not parse {raw!r}: {exc}")
+    return key, value
+
+
+def _set_by_path(cfg: Dict[str, Any], dotted: str, value: Any) -> None:
+    """Assign ``value`` at dotted path ``a.b.c``, creating dicts as needed."""
+    parts = dotted.split(".")
+    node = cfg
+    for part in parts[:-1]:
+        child = node.get(part)
+        if child is None:
+            child = {}
+            node[part] = child
+        elif not isinstance(child, dict):
+            raise ValueError(
+                f"--set {dotted}: '{part}' is not a mapping in the config"
+            )
+        node = child
+    node[parts[-1]] = value
 
 
 _HOLDOUT_SUMMARY_METRICS = ("r2", "q2", "mse", "mae", "pcc", "pval", "n_test")
@@ -155,9 +190,15 @@ def _validate_grouping_references(
 
 
 def _write_holdout_summary(
-    metrics_payload: Dict[str, Any], path: Path
+    metrics_payload: Dict[str, Any],
+    path: Path,
+    holdout_grouping: Optional[str],
 ) -> None:
-    """Write one row per evaluated model, sorted best -> worst by R²."""
+    """Write one row per evaluated model, sorted best -> worst by R².
+
+    ``holdout_grouping`` (the split.holdout.grouping used, or "random") is
+    stamped on every row so summaries from several runs can be concatenated.
+    """
 
     def _r2(item: Any) -> float:
         value = item[1].get("r2") if isinstance(item[1], dict) else None
@@ -168,6 +209,7 @@ def _write_holdout_summary(
         writer = csv.writer(handle)
         writer.writerow(
             [
+                "holdout_grouping",
                 "key",
                 "label",
                 "scheme",
@@ -179,6 +221,7 @@ def _write_holdout_summary(
             m = metrics if isinstance(metrics, dict) else {}
             writer.writerow(
                 [
+                    holdout_grouping or "random",
                     key,
                     m.get("label"),
                     m.get("scheme"),
@@ -188,50 +231,54 @@ def _write_holdout_summary(
             )
 
 
-def run_pipeline(
-    cfg: Dict[str, Any], output_dir: Optional[Path] = None
-) -> None:
-    # Stage 1: Resolve and validate config sections.
-    data_cfg = cfg.get("data") or {}
-    split_cfg = cfg.get("split") or {}
-    cv_cfg = cfg.get("cv") or {}
-    out_cfg = cfg.get("outputs") or {}
-    prep_cfg = cfg.get("preprocessing") or {}
-    feature_cfg = cfg.get("features") or {}
-    vis_cfg = cfg.get("visualise") or {}
-    shap_cfg = cfg.get("shap") or {}
-    holdout_eval_cfg = cfg.get("holdout_evaluation") or {}
+_SECTIONS = (
+    "data",
+    "split",
+    "cv",
+    "outputs",
+    "preprocessing",
+    "features",
+    "visualise",
+    "shap",
+    "holdout_evaluation",
+)
 
-    if not isinstance(data_cfg, dict):
-        raise ValueError("Section 'data' must be a mapping")
-    if not isinstance(split_cfg, dict):
-        raise ValueError("Section 'split' must be a mapping")
-    if not isinstance(cv_cfg, dict):
-        raise ValueError("Section 'cv' must be a mapping")
-    if not isinstance(out_cfg, dict):
-        raise ValueError("Section 'outputs' must be a mapping")
-    if not isinstance(prep_cfg, dict):
-        raise ValueError("Section 'preprocessing' must be a mapping")
-    if not isinstance(feature_cfg, dict):
-        raise ValueError("Section 'features' must be a mapping")
-    if not isinstance(vis_cfg, dict):
-        raise ValueError("Section 'visualise' must be a mapping")
-    if not isinstance(shap_cfg, dict):
-        raise ValueError("Section 'shap' must be a mapping")
-    if not isinstance(holdout_eval_cfg, dict):
-        raise ValueError("Section 'holdout_evaluation' must be a mapping")
+
+def _sections(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Stage 1: return every config section as a (validated) mapping."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for name in _SECTIONS:
+        section = cfg.get(name) or {}
+        if not isinstance(section, dict):
+            raise ValueError(f"Section '{name}' must be a mapping")
+        out[name] = section
 
     # `groupings` section; older configs used features.create_default_groupings
     # and data.groupings (a CSV path) instead — still honoured as fallbacks.
     group_cfg = cfg.get("groupings")
     if group_cfg is None:
         group_cfg = {
-            "defaults": feature_cfg.get("create_default_groupings", True),
+            "defaults": out["features"].get("create_default_groupings", True),
             "columns": [],
-            "file": data_cfg.get("groupings"),
+            "file": out["data"].get("groupings"),
         }
     if not isinstance(group_cfg, dict):
         raise ValueError("Section 'groupings' must be a mapping")
+    out["groupings"] = group_cfg
+    return out
+
+
+def build_dataset(cfg: Dict[str, Any]) -> Dataset:
+    """Stage 2: load inputs, build groupings, QC, and feature tables.
+
+    Everything here is independent of how the data is later split, so a
+    sweep over holdout groupings can call this once and reuse the result.
+    """
+    sec = _sections(cfg)
+    data_cfg = sec["data"]
+    prep_cfg = sec["preprocessing"]
+    feature_cfg = sec["features"]
+    group_cfg = sec["groupings"]
 
     if not data_cfg.get("metadata") or not data_cfg.get("attributes"):
         raise ValueError("data.metadata and data.attributes are required")
@@ -241,18 +288,6 @@ def run_pipeline(
     if not isinstance(labels, dict) or not labels:
         raise ValueError("data.labels must be a non-empty mapping")
 
-    base_dir = output_dir or Path(str(out_cfg.get("base_dir", "out/pipeline")))
-    cv_out = base_dir / "cv_results"
-    best_out = base_dir / "best_models"
-    holdout_out = base_dir / "holdout"
-    # Where the sample assignments are written: holdout.csv (train/test) and
-    # cv_<scheme>.csv (fold membership, drawn from holdout-train only) per
-    # label. Defaults to <base_dir>/splits; `outputs.splits_dir` overrides
-    # (`holdout_splits_dir` is still accepted as the old name).
-    splits_raw = out_cfg.get("splits_dir") or out_cfg.get("holdout_splits_dir")
-    splits_out = Path(str(splits_raw)) if splits_raw else base_dir / "splits"
-
-    # Stage 2: Build dataset and feature tables.
     LOGGER.info("Building dataset")
     dataset = (
         Dataset()
@@ -322,6 +357,48 @@ def run_pipeline(
             all=bool(feature_cfg.get("all", True)),
         )
 
+    return dataset
+
+
+def run_from_dataset(
+    cfg: Dict[str, Any],
+    dataset: Dataset,
+    output_dir: Optional[Path] = None,
+) -> Path:
+    """Stages 3-6: split, cross-validate, export, and (optionally) evaluate
+    on the holdout. Returns the base output directory.
+
+    Safe to call repeatedly on the same ``dataset`` with different
+    ``split.*`` settings: splits are recreated with ``force=True`` each time
+    and feature tables are untouched.
+    """
+    sec = _sections(cfg)
+    split_cfg = sec["split"]
+    cv_cfg = sec["cv"]
+    out_cfg = sec["outputs"]
+    vis_cfg = sec["visualise"]
+    shap_cfg = sec["shap"]
+    holdout_eval_cfg = sec["holdout_evaluation"]
+
+    base_dir = output_dir or Path(str(out_cfg.get("base_dir", "out/pipeline")))
+    cv_out = base_dir / "cv_results"
+    best_out = base_dir / "best_models"
+    holdout_out = base_dir / "holdout"
+    # Where the sample assignments are written: holdout.csv (train/test) and
+    # cv_<scheme>.csv (fold membership, drawn from holdout-train only) per
+    # label. Defaults to <base_dir>/splits; `outputs.splits_dir` overrides
+    # (`holdout_splits_dir` is still accepted as the old name).
+    splits_raw = out_cfg.get("splits_dir") or out_cfg.get("holdout_splits_dir")
+    splits_out = Path(str(splits_raw)) if splits_raw else base_dir / "splits"
+
+    # The grouping names may differ per call (sweeps); re-check them here.
+    available_groupings = (
+        [c for c in dataset.groupings.columns if c != "sample"]
+        if dataset.groupings is not None
+        else []
+    )
+    _validate_grouping_references(cfg, available_groupings)
+
     # Stage 3: Create holdout and CV splits.
     LOGGER.info("Creating holdout split and CV folds")
     holdout_cfg = split_cfg.get("holdout") or {}
@@ -331,15 +408,32 @@ def run_pipeline(
     if not isinstance(split_cv_cfg, dict):
         raise ValueError("Section 'split.cv' must be a mapping")
 
-    dataset = dataset.create_holdout_split(
-        label=holdout_cfg.get("label"),
-        test_size=float(holdout_cfg.get("test_size", 0.2)),
-        n_bins=int(holdout_cfg.get("n_bins", 5)),
-        grouping=holdout_cfg.get("grouping"),
-        random_state=int(holdout_cfg.get("random_state", 42)),
-        force=bool(holdout_cfg.get("force", True)),
-        output_dir=splits_out,
-    )
+    taxon_rank = holdout_cfg.get("taxon_rank")
+    if taxon_rank:
+        # Split on community membership instead of a metadata column: the
+        # taxon at this rank whose prevalence is nearest test_size defines
+        # the holdout, so training never sees a community carrying it.
+        dataset = dataset.create_taxon_holdout_split(
+            rank=str(taxon_rank),
+            label=holdout_cfg.get("label"),
+            test_size=float(holdout_cfg.get("test_size", 0.2)),
+            presence_threshold=float(
+                holdout_cfg.get("presence_threshold", 0.0)
+            ),
+            min_test_samples=int(holdout_cfg.get("min_test_samples", 2)),
+            force=bool(holdout_cfg.get("force", True)),
+            output_dir=splits_out,
+        )
+    else:
+        dataset = dataset.create_holdout_split(
+            label=holdout_cfg.get("label"),
+            test_size=float(holdout_cfg.get("test_size", 0.2)),
+            n_bins=int(holdout_cfg.get("n_bins", 5)),
+            grouping=holdout_cfg.get("grouping"),
+            random_state=int(holdout_cfg.get("random_state", 42)),
+            force=bool(holdout_cfg.get("force", True)),
+            output_dir=splits_out,
+        )
     LOGGER.info("Saved holdout split(s) to %s", splits_out)
     dataset = dataset.create_cv_folds(
         label=split_cv_cfg.get("label"),
@@ -448,7 +542,7 @@ def run_pipeline(
             best_out,
             base_dir,
         )
-        return
+        return base_dir
 
     # Stage 5: Train final holdout model(s) per label/scheme, write metrics.
     # SHAP (optional, needs the `shap` package / `pixi run -e shap`) runs on
@@ -488,7 +582,11 @@ def run_pipeline(
 
     # Flat, sorted table so "which scheme generalises best" is one glance.
     summary_path = holdout_out / "holdout_summary.csv"
-    _write_holdout_summary(metrics_payload, summary_path)
+    _write_holdout_summary(
+        metrics_payload,
+        summary_path,
+        f"taxon_{taxon_rank}" if taxon_rank else holdout_cfg.get("grouping"),
+    )
     LOGGER.info("Wrote holdout summary to %s", summary_path)
 
     # Stage 6: Generate optional holdout visualisations.
@@ -544,6 +642,15 @@ def run_pipeline(
                 _plot_shap(vis, evaluation.shap_result, shap_top_n)
 
     LOGGER.info("Pipeline finished. Outputs in %s", base_dir)
+    return base_dir
+
+
+def run_pipeline(
+    cfg: Dict[str, Any], output_dir: Optional[Path] = None
+) -> Path:
+    """Full pipeline: build the dataset, then split / CV / holdout."""
+    dataset = build_dataset(cfg)
+    return run_from_dataset(cfg, dataset, output_dir=output_dir)
 
 
 def main() -> None:
@@ -568,11 +675,29 @@ def main() -> None:
         default=None,
         help="Optional output directory override (defaults to outputs.base_dir in YAML)",
     )
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Override a config value using a dotted key, e.g. "
+            "--set split.holdout.grouping=bioproject "
+            "--set outputs.base_dir=out/holdout_bioproject "
+            "--set cv.scheme=[random,bioproject]. Values are parsed as YAML "
+            "(null, true, 0.2, [a,b]). Repeatable; applied in order after "
+            "the file is loaded."
+        ),
+    )
     args = parser.parse_args()
 
     setup_logging(args.log_level)
     LOGGER.setLevel(getattr(logging, args.log_level.upper()))
     cfg = load_yaml_config(args.config)
+    for item in args.set:
+        key, value = _parse_override(item)
+        _set_by_path(cfg, key, value)
+        LOGGER.info("Config override: %s = %r", key, value)
     run_pipeline(cfg, output_dir=args.output_dir)
 
 

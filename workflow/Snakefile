@@ -1,0 +1,289 @@
+# Snakemake workflow: holdout-grouping sweep, parallelised per
+# holdout grouping x label x CV scheme.
+#
+#   pixi run snakemake -s workflow/Snakefile --configfile pipeline.yaml \
+#       --config holdout_groupings=random,bioproject,ecoregion --cores 32
+#
+# The YAML is the same one scripts/run_cv_to_final_eval.py takes. Which
+# holdout groupings to sweep comes from either
+#   * a `sweep: {holdout_groupings: [random, bioproject, ...]}` section, or
+#   * --config holdout_groupings=random,bioproject (comma separated),
+# `random` meaning the stratified-random holdout without grouping.
+#
+# DAG:
+#   prepare  (1)                  build dataset once      -> <base>/prepared/
+#   split    (per grouping)       holdout + CV folds      -> <base>/holdout_<g>/splits/
+#   cv       (per g x label x scheme, PARALLEL)           -> <base>/holdout_<g>/runs/<label>/<scheme>/
+#   collate  (1)                  TSV summaries           -> <base>/cv_sweep_headline.tsv, ...
+#
+# The set of CV schemes is only known after `split` runs (it depends on the
+# grouping columns found in the metadata), hence the checkpoint.
+
+import json
+import shlex
+import sys
+from pathlib import Path
+
+import yaml
+from snakemake.exceptions import WorkflowError
+
+if "data" not in config or "outputs" not in config:
+    raise WorkflowError(
+        "Pass the pipeline YAML with --configfile pipeline.yaml "
+        "(it must contain at least the data/ and outputs/ sections)."
+    )
+
+# ---------------------------------------------------------------------------
+# Resolve settings
+# ---------------------------------------------------------------------------
+REPO = Path(workflow.basedir).parent
+STEPS = f"python -u {shlex.quote(str(REPO / 'scripts' / 'pipeline_steps.py'))}"
+
+# The steps module is imported for its token parsing (holdout_spec /
+# spec_dir_name) so the Snakefile and the CLI agree on names.
+sys.path.insert(0, str(REPO / "scripts"))
+import pipeline_steps as steps
+
+BASE = Path(config["outputs"].get("base_dir", "out/pipeline"))
+if not BASE.is_absolute():
+    BASE = Path.cwd() / BASE
+BASE_S = str(BASE)
+
+
+def _grouping_names():
+    raw = config.get("holdout_groupings")
+    if raw is None:
+        raw = (config.get("sweep") or {}).get("holdout_groupings")
+    if raw is None:
+        raise WorkflowError(
+            "No holdout groupings given. Use --config "
+            "holdout_groupings=random,bioproject or add "
+            "sweep: {holdout_groupings: [...]} to the YAML."
+        )
+    if isinstance(raw, str):
+        raw = [x for x in raw.split(",")]
+    # Canonical, directory-safe names: "random", a metadata column, or
+    # "taxon_<rank>" for a community-membership holdout (written either as
+    # taxon:family or taxon_family in the config).
+    names = []
+    for g in raw:
+        token = "random" if g is None else str(g).strip()
+        name = steps.spec_dir_name(token)
+        if name not in names:
+            names.append(name)
+    return names
+
+
+GROUPINGS = _grouping_names()
+HOLDOUT_ENABLED = bool(
+    (config.get("holdout_evaluation") or {}).get("enabled", True)
+)
+# Per-rule resources, in Snakemake's standard names (threads, mem_mb, runtime
+# in minutes) so an executor profile can map them to the queue. Override any
+# of them in the YAML:
+#   sweep:
+#     resources:
+#       cv: {threads: 16, mem_mb: 128000, runtime: 1440}
+# The cv job is told to use exactly its `threads` (cv.n_jobs), so it never
+# over-subscribes the allocation; cv.n_jobs in the YAML is the fallback.
+_DEFAULT_RESOURCES = {
+    "prepare": {"threads": 8, "mem_mb": 64000, "runtime": 6 * 60},
+    "split": {"threads": 2, "mem_mb": 16000, "runtime": 3 * 60},
+    "cv": {
+        "threads": int((config.get("cv") or {}).get("n_jobs") or 8),
+        "mem_mb": 256000,
+        "runtime": 48 * 60,
+    },
+    "collate": {"threads": 1, "mem_mb": 4000, "runtime": 15},
+}
+_USER_RESOURCES = (config.get("sweep") or {}).get("resources") or {}
+
+# Retry a killed job with more memory. An OOM kill leaves no traceback (the
+# log just stops), so the usual symptom of "needs more RAM" is a job that
+# dies silently -- hence retrying is the practical response.
+#   attempt 1: mem_mb, attempt 2: mem_mb * mem_scale, attempt 3: * scale^2 ...
+# Tune in the YAML:  sweep: {mem_scale: 2.0, retries: {prepare: 3}}
+_SWEEP = config.get("sweep") or {}
+MEM_SCALE = float(_SWEEP.get("mem_scale", 2.0))
+_DEFAULT_RETRIES = {"prepare": 2, "split": 2, "cv": 2, "collate": 0}
+_USER_RETRIES = _SWEEP.get("retries") or {}
+
+
+def RES(rule_name, key):
+    user = _USER_RESOURCES.get(rule_name) or {}
+    return int(user.get(key, _DEFAULT_RESOURCES[rule_name][key]))
+
+
+def RETRIES(rule_name):
+    if isinstance(_USER_RETRIES, int):
+        return int(_USER_RETRIES)
+    return int(_USER_RETRIES.get(rule_name, _DEFAULT_RETRIES[rule_name]))
+
+
+def MEM(rule_name):
+    """mem_mb callable that grows by MEM_SCALE on every retry."""
+    base = RES(rule_name, "mem_mb")
+    return lambda wildcards, attempt: int(base * (MEM_SCALE ** (attempt - 1)))
+
+
+def RUNTIME(rule_name):
+    """runtime callable; a retry also gets proportionally more wall clock."""
+    base = RES(rule_name, "runtime")
+    return lambda wildcards, attempt: int(base * attempt)
+
+# Written to the log before each attempt. Logs are opened in append mode, so a
+# retry adds to the record instead of erasing the failed attempt -- and if the
+# job is OOM-killed (no traceback, the output simply stops) this header is
+# still there to show how much memory that attempt had. mem_mb identifies the
+# attempt, since it grows by MEM_SCALE each time.
+LOGHDR = (
+    'printf "\\n===== %s host=%s rule=%s mem_mb=%s threads=%s =====\\n" '
+    '"$(date -Is)" "$(hostname)" "{rule}" "{resources.mem_mb}" "{threads}" '
+    ">> {log};"
+)
+
+# The steps read a file, not the in-memory dict, so --config overrides given
+# on the snakemake command line are written out once and passed along.
+RESOLVED = BASE / "resolved_config.yaml"
+BASE.mkdir(parents=True, exist_ok=True)
+_resolved = {
+    k: v for k, v in config.items() if k not in {"holdout_groupings", "sweep"}
+}
+RESOLVED.write_text(yaml.safe_dump(_resolved, sort_keys=False))
+RESOLVED_S = shlex.quote(str(RESOLVED))
+
+wildcard_constraints:
+    grouping="[^/]+",
+    label="[^/]+",
+    scheme="[^/]+",
+
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+# Every split's schemes.json is an explicit target here. Without this the
+# checkpoint lookups in all_runs() would stop at the first missing split and
+# the groupings would be discovered -- and run -- one after another.
+ALL_SCHEMES = [
+    f"{BASE_S}/holdout_{g}/splits/schemes.json" for g in GROUPINGS
+]
+
+
+onerror:
+    # An OOM kill leaves no traceback: the step's log just stops. Point at the
+    # logs and at the knob that fixes it, rather than only "job failed".
+    print(
+        "\nA job failed. Per-job logs (all attempts, appended):\n"
+        f"    {BASE_S}/logs/\n"
+        "If a log simply stops with no traceback the job was killed, almost\n"
+        "always out of memory. Retries already double mem_mb "
+        f"(x{MEM_SCALE}, {RETRIES('prepare')} retries for prepare); raise the\n"
+        "starting point in the config if every attempt dies:\n"
+        "    sweep:\n"
+        "      resources:\n"
+        "        prepare: {mem_mb: 256000, runtime: 600}\n"
+        "and resume with --rerun-incomplete (finished jobs are not redone).\n"
+    )
+
+
+rule all:
+    input:
+        ALL_SCHEMES,
+        f"{BASE_S}/cv_sweep_headline.tsv",
+        f"{BASE_S}/sweep_status.tsv",
+
+
+rule prepare:
+    output:
+        f"{BASE_S}/prepared/manifest.json",
+    threads: RES("prepare", "threads")
+    retries: RETRIES("prepare")
+    resources:
+        mem_mb=MEM("prepare"),
+        runtime=RUNTIME("prepare"),
+    log:
+        f"{BASE_S}/logs/prepare.log",
+    shell:
+        "{LOGHDR} "
+        "{STEPS} prepare --config {RESOLVED_S} "
+        "--out {BASE_S}/prepared >> {log} 2>&1"
+
+
+checkpoint split:
+    input:
+        rules.prepare.output,
+    output:
+        f"{BASE_S}/holdout_{{grouping}}/splits/schemes.json",
+    threads: RES("split", "threads")
+    retries: RETRIES("split")
+    resources:
+        mem_mb=MEM("split"),
+        runtime=RUNTIME("split"),
+    log:
+        f"{BASE_S}/logs/split_{{grouping}}.log",
+    shell:
+        "{LOGHDR} "
+        "{STEPS} split --config {RESOLVED_S} "
+        "--dataset {BASE_S}/prepared "
+        "--grouping {wildcards.grouping} "
+        "--out {BASE_S}/holdout_{wildcards.grouping}/splits >> {log} 2>&1"
+
+
+rule cv:
+    input:
+        prepared=rules.prepare.output,
+        schemes=f"{BASE_S}/holdout_{{grouping}}/splits/schemes.json",
+    output:
+        f"{BASE_S}/holdout_{{grouping}}/runs/{{label}}/{{scheme}}/status.json",
+    threads: RES("cv", "threads")
+    retries: RETRIES("cv")
+    resources:
+        mem_mb=MEM("cv"),
+        runtime=RUNTIME("cv"),
+    log:
+        f"{BASE_S}/logs/cv_{{grouping}}_{{label}}_{{scheme}}.log",
+    shell:
+        "{LOGHDR} "
+        "{STEPS} cv --config {RESOLVED_S} "
+        "--dataset {BASE_S}/prepared "
+        "--splits {BASE_S}/holdout_{wildcards.grouping}/splits "
+        "--grouping {wildcards.grouping} "
+        "--label {wildcards.label} --scheme {wildcards.scheme} "
+        "--out {BASE_S}/holdout_{wildcards.grouping}/runs/"
+        "{wildcards.label}/{wildcards.scheme} "
+        "--set cv.n_jobs={threads} >> {log} 2>&1"
+
+
+def all_runs(wildcards):
+    """Expand to one cv output per grouping x label x scheme (checkpoint)."""
+    outs = []
+    for g in GROUPINGS:
+        schemes_file = checkpoints.split.get(grouping=g).output[0]
+        schemes = json.loads(Path(schemes_file).read_text())
+        for label, names in schemes.items():
+            for scheme in names:
+                outs.append(
+                    f"{BASE_S}/holdout_{g}/runs/{label}/{scheme}/status.json"
+                )
+    if not outs:
+        raise WorkflowError("split produced no label/scheme to run")
+    return outs
+
+
+rule collate:
+    input:
+        schemes=ALL_SCHEMES,
+        runs=all_runs,
+    output:
+        headline=f"{BASE_S}/cv_sweep_headline.tsv",
+        status=f"{BASE_S}/sweep_status.tsv",
+    threads: RES("collate", "threads")
+    retries: RETRIES("collate")
+    resources:
+        mem_mb=MEM("collate"),
+        runtime=RUNTIME("collate"),
+    log:
+        f"{BASE_S}/logs/collate.log",
+    shell:
+        "{LOGHDR} "
+        "{STEPS} collate --out {BASE_S} --runs {input.runs} >> {log} 2>&1"
