@@ -92,6 +92,17 @@ class SplitManager:
         # Shuffle data
         df = data.sample(fraction=1.0, shuffle=True, seed=random_state)
 
+        if df.height == 0:
+            # No sample has a value for this label (or none survived the
+            # holdout-train filter). Binning an empty column would fail on
+            # a missing min/max, so record no scheme.
+            logger.warning(
+                "CV scheme '%s' for label '%s' has no samples; skipping",
+                scheme_name,
+                self.label,
+            )
+            return
+
         # Determine if continuous or categorical
         is_continuous = df.schema[self.label] in [pl.Float32, pl.Float64]
 
@@ -261,6 +272,26 @@ class SplitManager:
             )
             raise ValueError(
                 f"Target column '{target_col}' not found in source data"
+            )
+
+        if df.height == 0:
+            # Nothing to split -- e.g. a label that is null for every
+            # sample. Binning an empty column would divide by a missing
+            # min/max; return the empty split so callers see a holdout
+            # that exists and is simply empty.
+            logger.warning(
+                "No samples with a value for '%s'; empty split",
+                target_col,
+            )
+            return self._enrich_holdout(
+                holdout_df=df.select(
+                    "sample",
+                    pl.lit("train", dtype=pl.Utf8).alias(split_col_name),
+                ),
+                data=data,
+                target_col=target_col,
+                metadata=metadata,
+                split_col_name=split_col_name,
             )
 
         if grouping is not None:

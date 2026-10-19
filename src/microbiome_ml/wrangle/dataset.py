@@ -1067,6 +1067,9 @@ class Dataset:
         ranks: Optional[List[Union[str, TaxonomicRanks]]] = None,
         prefix: str = "tax",
         all: bool = False,
+        stream_dir: Optional[Union[str, Path]] = None,
+        chunk_samples: int = 5000,
+        labelled_only: bool = False,
     ) -> "Dataset":
         """Generate FeatureSets from TaxonomicProfiles at specified ranks.
 
@@ -1074,6 +1077,14 @@ class Dataset:
             ranks: List of taxonomic ranks. Defaults to [TaxonomicRanks.CLASS] when
                    neither ``ranks`` nor ``all`` is specified.
             prefix: Prefix for generated feature set names (default: "tax")
+            stream_dir: Build each rank a chunk of samples at a time and
+                write it here as `<prefix>_<rank>.csv`, keeping a scan of
+                that file instead of the wide table. Peak memory becomes
+                chunk_samples x n_taxa. None builds in memory.
+            chunk_samples: Samples per chunk when streaming.
+            labelled_only: Build features only for samples that have a
+                non-null value for at least one label. Nothing downstream
+                uses an unlabelled sample's features.
             all: If True, run all standard ranks (phylum to species), ignoring
                  the ``ranks`` argument. Defaults to False.
 
@@ -1115,10 +1126,50 @@ class Dataset:
 
         added_ranks: List[str] = []
 
+        # Only samples that are actually modelled, when asked: CV, the
+        # trainer and SHAP all work from labelled samples.
+        keep_samples: Optional[List[str]] = None
+        if labelled_only:
+            if self.labels is None:
+                logger.warning(
+                    "labelled_only=True but no labels are set; "
+                    "building features for every sample"
+                )
+            else:
+                value_cols = [c for c in self.labels.columns if c != "sample"]
+                # Annotated: to_list() is Any, so without this mypy keeps
+                # the declared Optional and flags the len() below.
+                labelled: List[str] = (
+                    self.labels.filter(
+                        pl.any_horizontal(
+                            [pl.col(c).is_not_null() for c in value_cols]
+                        )
+                    )
+                    .get_column("sample")
+                    .unique()
+                    .to_list()
+                )
+                keep_samples = labelled
+                logger.info(
+                    "labelled_only: building features for %d of %d samples",
+                    len(labelled),
+                    self.labels.height,
+                )
+
         # Generate feature sets for each requested rank
         for rank in ranks_list:
-            feature_set = self.profiles.create_features(rank)
             feature_name = f"{prefix}_{rank.name.lower()}"
+            stream_path = (
+                Path(stream_dir) / f"{feature_name}.csv"
+                if stream_dir is not None
+                else None
+            )
+            feature_set = self.profiles.create_features(
+                rank,
+                stream_path=stream_path,
+                chunk_samples=chunk_samples,
+                samples=keep_samples,
+            )
 
             if not feature_set.feature_names:
                 logger.warning(
@@ -1445,8 +1496,17 @@ class Dataset:
                 f"No samples left for rank '{rank_enum.name.lower()}'"
             )
         taxa = [c for c in df.columns if c != "sample"]
+        # Cast defensively: a feature table read from CSV can carry String
+        # columns where the values were empty in the inference window, and
+        # comparing those to a float raises. Nulls stay null, so a null
+        # never counts as present.
         counts = df.select(
-            [(pl.col(c) > presence_threshold).sum().alias(c) for c in taxa]
+            [
+                (pl.col(c).cast(pl.Float64, strict=False) > presence_threshold)
+                .sum()
+                .alias(c)
+                for c in taxa
+            ]
         ).row(0)
         return (
             pl.DataFrame(
@@ -1460,6 +1520,32 @@ class Dataset:
                 (pl.col("n_present") / n_samples).alias("prevalence"),
             )
             .sort("prevalence", descending=True)
+        )
+
+    def _register_empty_holdout(
+        self,
+        label: str,
+        data: pl.DataFrame,
+        metadata: Optional[pl.DataFrame],
+    ) -> None:
+        """Record a zero-row holdout for a label that cannot be split.
+
+        The metadata-based path always leaves a SplitManager behind (an
+        all-null label yields a header-only holdout.csv), and
+        ``create_cv_folds(use_holdout=True)`` relies on that: a missing
+        SplitManager raises instead of skipping the label. Skipped taxon
+        holdouts register the same empty frame so one unusable label does
+        not abort the whole run.
+        """
+        if label not in self.splits:
+            self.splits[label] = SplitManager(label)
+        empty = data.head(0).select("sample", pl.lit("train").alias("split"))
+        self.splits[label].holdout = self.splits[label]._enrich_holdout(
+            holdout_df=empty,
+            data=data,
+            target_col=label,
+            metadata=metadata,
+            split_col_name="split",
         )
 
     def create_taxon_holdout_split(
@@ -1539,6 +1625,7 @@ class Dataset:
                     lbl,
                     n_samples,
                 )
+                self._register_empty_holdout(lbl, data, metadata_df)
                 continue
 
             prevalence = self.taxon_prevalence(
@@ -1570,6 +1657,7 @@ class Dataset:
                     n_samples,
                     min_test_samples,
                 )
+                self._register_empty_holdout(lbl, data, metadata_df)
                 continue
 
             by_present = usable.sort(["_d_present", "taxon"]).row(
@@ -1584,9 +1672,10 @@ class Dataset:
                 achieved = 1.0 - chosen["prevalence"]
 
             taxon = chosen["taxon"]
-            present = feature_df.filter(pl.col(taxon) > presence_threshold)[
-                "sample"
-            ].to_list()
+            present = feature_df.filter(
+                pl.col(taxon).cast(pl.Float64, strict=False)
+                > presence_threshold
+            )["sample"].to_list()
             in_test = pl.col("sample").is_in(present)
             if not presence_is_test:
                 in_test = ~in_test
@@ -1622,13 +1711,16 @@ class Dataset:
                 split_col_name="split",
             )
             # _enrich_holdout selects a fixed column set, so record which
-            # taxon produced the split afterwards.
+            # taxon produced the split afterwards. holdout_taxon_presence is
+            # per sample: True when that sample carries the taxon. It is
+            # therefore constant within each side of the split and opposite
+            # between them, which is the whole point of the split.
             self.splits[lbl].holdout = enriched.with_columns(
                 pl.lit(taxon).alias("holdout_taxon"),
                 pl.lit(rank_enum.name.lower()).alias("holdout_rank"),
-                pl.lit("presence" if presence_is_test else "absence").alias(
-                    "holdout_taxon_in_test"
-                ),
+                pl.col("sample")
+                .is_in(present)
+                .alias("holdout_taxon_presence"),
             )
 
         if output_dir is not None:
@@ -2259,12 +2351,44 @@ class Dataset:
 
             for name, feature_set in self.feature_sets.items():
                 fs_path = features_dir / f"{name}.csv"
-                feature_set.save(fs_path)
+                source = getattr(feature_set, "source_path", None)
+                same_file = False
+                if source is not None:
+                    try:
+                        same_file = Path(source).resolve() == fs_path.resolve()
+                    except OSError:
+                        same_file = False
+                if same_file:
+                    # Streamed straight here during feature building;
+                    # re-writing would read and overwrite the same file.
+                    logger.debug(
+                        "Feature set %s already at %s; not rewriting",
+                        name,
+                        fs_path,
+                    )
+                else:
+                    feature_set.save(fs_path)
                 manifest["components"]["features"][name] = {
                     "file": f"{name}.csv",
                     "n_samples": len(feature_set.accessions),
                     "n_features": len(feature_set.feature_names),
                 }
+                if not compress:
+                    # Hand the in-memory table back: from here the feature
+                    # set reads from the file just written, so a long-lived
+                    # process does not keep every wide table resident.
+                    # Skipped when compressing, since work_dir is deleted.
+                    try:
+                        self.feature_sets[name] = SampleFeatureSet.scan(
+                            fs_path, name=name
+                        )
+                    except Exception as exc:  # pragma: no cover
+                        logger.debug(
+                            "Could not re-scan %s after saving (%s); "
+                            "keeping the in-memory copy",
+                            name,
+                            exc,
+                        )
 
         # Save labels
         if self.labels is not None:

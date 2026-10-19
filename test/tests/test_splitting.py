@@ -405,7 +405,16 @@ def test_taxon_holdout_picks_prevalence_nearest_test_size(taxon_dataset):
     taxon = holdout["holdout_taxon"][0]
     assert taxon in {"f__a", "f__e", "f__x"}  # the 25% taxa
     assert holdout["holdout_rank"][0] == "family"
-    assert holdout["holdout_taxon_in_test"][0] == "presence"
+    # per-sample flag: the single test sample carries the taxon, the rest
+    # do not -- the two sides of the split differ by exactly this
+    assert holdout.filter(pl.col("split") == "test")[
+        "holdout_taxon_presence"
+    ].to_list() == [True]
+    assert not any(
+        holdout.filter(pl.col("split") == "train")[
+            "holdout_taxon_presence"
+        ].to_list()
+    )
 
 
 def test_taxon_holdout_train_never_contains_the_taxon(taxon_dataset):
@@ -434,18 +443,25 @@ def test_taxon_holdout_prefers_presence_on_ties(taxon_dataset):
         rank="family", label="target", test_size=0.25, min_test_samples=1
     )
     holdout = taxon_dataset.splits["target"].holdout
-    assert holdout["holdout_taxon_in_test"][0] == "presence"
-    assert holdout.filter(pl.col("split") == "test").height == 1
+    test_rows = holdout.filter(pl.col("split") == "test")
+    assert test_rows.height == 1
+    # presence (not absence) won the tie: the test sample is a carrier
+    assert test_rows["holdout_taxon_presence"].to_list() == [True]
 
 
 def test_taxon_holdout_skips_when_no_usable_taxon(taxon_dataset):
-    """min_test_samples=3 cannot be met on both sides of any split here."""
+    """min_test_samples=3 cannot be met on both sides of any split here.
+
+    The label is registered with an EMPTY holdout rather than left out:
+    create_cv_folds(use_holdout=True) raises on a missing split manager,
+    so one unusable label would otherwise abort the whole run.
+    """
     taxon_dataset.create_taxon_holdout_split(
         rank="family", label="target", test_size=0.2, min_test_samples=3
     )
-    assert taxon_dataset.splits.get("target") is None or (
-        taxon_dataset.splits["target"].holdout is None
-    )
+    holdout = taxon_dataset.splits["target"].holdout
+    assert holdout is not None
+    assert holdout.height == 0
 
 
 def test_taxon_holdout_unknown_rank_raises(taxon_dataset):
@@ -475,3 +491,212 @@ def test_holdout_spec_tokens():
     assert steps.spec_dir_name("bioproject") == "bioproject"
     assert steps.spec_dir_name("taxon:family") == "taxon_family"
     assert steps.spec_dir_name("taxon_family") == "taxon_family"
+
+
+def test_taxon_holdout_ignores_zero_coverage_taxa(taxon_dataset):
+    """A taxon with no coverage anywhere must never define the holdout.
+
+    Splitting on an all-zero taxon would put every sample on one side, and
+    "absence" of something nobody has is not a meaningful test set.
+    """
+    from microbiome_ml.wrangle.features import SampleFeatureSet
+
+    samples = ["s1", "s2", "s3", "s4"]
+    taxa = ["f__a", "f__b", "f__c", "f__d", "f__e", "f__x", "f__ghost"]
+    present = {
+        "s1": {"f__a", "f__b", "f__c"},
+        "s2": {"f__c", "f__d", "f__e"},
+        "s3": {"f__x", "f__b", "f__c"},
+        "s4": {"f__b", "f__c", "f__d"},
+    }
+    matrix = np.array(
+        [[1.0 if t in present[s] else 0.0 for t in taxa] for s in samples]
+    )
+    taxon_dataset.feature_sets["tax_family"] = SampleFeatureSet(
+        accessions=samples,
+        feature_names=taxa,
+        features=matrix,
+        name="tax_family",
+    )
+
+    prev = dict(
+        zip(
+            taxon_dataset.taxon_prevalence("family")["taxon"],
+            taxon_dataset.taxon_prevalence("family")["prevalence"],
+        )
+    )
+    assert prev["f__ghost"] == 0.0
+
+    taxon_dataset.create_taxon_holdout_split(
+        rank="family", label="target", test_size=0.2, min_test_samples=1
+    )
+    holdout = taxon_dataset.splits["target"].holdout
+    chosen = holdout["holdout_taxon"][0]
+    assert chosen != "f__ghost"
+
+    # the chosen taxon really is carried by the test samples
+    feature_df = taxon_dataset.feature_sets["tax_family"].to_df()
+    test_samples = holdout.filter(pl.col("split") == "test")["sample"]
+    carried = feature_df.filter(pl.col("sample").is_in(test_samples.to_list()))
+    assert (carried[chosen] > 0).all()
+
+
+def test_feature_set_reload_casts_sparse_columns(tmp_path):
+    """A taxon that is empty in the first CSV rows but has values later must
+    come back numeric, not String (the production failure mode)."""
+    from microbiome_ml.wrangle.features import SampleFeatureSet
+
+    n = 150  # more than polars' default 100-row inference window
+    samples = [f"s{i}" for i in range(n)]
+    # empty for the first 120 rows, non-zero afterwards
+    sparse = [None] * 120 + [0.5] * (n - 120)
+    dense = [float(i) for i in range(n)]
+
+    df = pl.DataFrame(
+        {"sample": samples, "f__dense": dense, "f__sparse": sparse}
+    )
+    path = tmp_path / "tax_family.csv"
+    df.write_csv(path)
+
+    # Plain scan_csv infers String for this column (its inference window is
+    # all empty); not asserted here, as that is polars behaviour, not ours.
+    loaded = SampleFeatureSet.load(path, name="tax_family").to_df()
+    assert loaded["f__sparse"].dtype == pl.Float64
+    assert loaded["f__dense"].dtype == pl.Float64
+    # the real values survived the cast
+    assert loaded["f__sparse"].sum() == pytest.approx(0.5 * (n - 120))
+    # and a comparison against a float no longer raises
+    assert (loaded["f__sparse"] > 0).sum() == n - 120
+
+
+def test_holdout_taxon_presence_separates_the_two_sides(taxon_dataset):
+    """holdout_taxon_presence is per sample and must be uniform within each
+    side and opposite between them -- that is what the split encodes."""
+    taxon_dataset.create_taxon_holdout_split(
+        rank="family", label="target", test_size=0.2, min_test_samples=1
+    )
+    holdout = taxon_dataset.splits["target"].holdout
+
+    test_flags = set(
+        holdout.filter(pl.col("split") == "test")[
+            "holdout_taxon_presence"
+        ].to_list()
+    )
+    train_flags = set(
+        holdout.filter(pl.col("split") == "train")[
+            "holdout_taxon_presence"
+        ].to_list()
+    )
+    assert len(test_flags) == 1
+    assert len(train_flags) == 1
+    assert test_flags != train_flags
+
+    # and the flag agrees with the actual community profile
+    taxon = holdout["holdout_taxon"][0]
+    feature_df = taxon_dataset.feature_sets["tax_family"].to_df()
+    carriers = set(feature_df.filter(pl.col(taxon) > 0)["sample"].to_list())
+    flagged = set(
+        holdout.filter(pl.col("holdout_taxon_presence"))["sample"].to_list()
+    )
+    assert flagged == carriers
+
+
+def test_taxon_holdout_empty_label_does_not_break_cv(taxon_dataset):
+    """A label with no usable samples must leave an empty holdout behind,
+    not a missing one, or create_cv_folds(use_holdout=True) raises and the
+    whole run dies because of one unusable label (e.g. oxygen in soil)."""
+    # add an all-null label alongside the usable one
+    labels = taxon_dataset.labels.with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("oxy")
+    )
+    taxon_dataset.labels = labels
+
+    taxon_dataset.create_taxon_holdout_split(
+        rank="family", test_size=0.2, min_test_samples=1
+    )
+
+    # the unusable label is registered with a zero-row holdout ...
+    assert "oxy" in taxon_dataset.splits
+    assert taxon_dataset.splits["oxy"].holdout is not None
+    assert taxon_dataset.splits["oxy"].holdout.height == 0
+    # ... while the usable one is split normally
+    assert taxon_dataset.splits["target"].holdout.height == 4
+
+    # and CV over all labels no longer raises
+    taxon_dataset.create_cv_folds(
+        n_folds=2, use_holdout=True, force=True, strict=False
+    )
+    assert taxon_dataset.splits["target"].cv_schemes
+
+
+def test_sweep_pairs_tokens_and_dir_names():
+    """sweep.pairs maps label -> grouping; each pair gets its own run name
+    so the summary tables can tell the runs apart."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    import sweep_tokens as st
+
+    pairs = {"geo_ph": "organism", "ph": "taxon:family", "oxy": None}
+    names = {}
+    for label, token in pairs.items():
+        token = "random" if token is None else token
+        names[label] = f"holdout_{st.spec_dir_name(token)}__{label}"
+
+    assert names["geo_ph"] == "holdout_organism__geo_ph"
+    assert names["ph"] == "holdout_taxon_family__ph"
+    assert names["oxy"] == "holdout_random__oxy"
+    # every run directory still matches the holdout_* glob the collation
+    # and fold profile rely on
+    assert all(n.startswith("holdout_") for n in names.values())
+
+
+def test_all_null_numeric_label_does_not_crash_binning(splitting_dataset):
+    """An all-null Float64 label used to raise in the quantile binning
+    (min/max of nothing). Both split paths must degrade to empty."""
+    dataset = splitting_dataset
+    dataset.labels = dataset.labels.with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("all_null")
+    )
+
+    dataset.create_holdout_split(test_size=0.2, random_state=42, force=True)
+    assert dataset.splits["all_null"].holdout is not None
+    assert dataset.splits["all_null"].holdout.height == 0
+
+    dataset.create_cv_folds(
+        n_folds=2, use_holdout=True, force=True, strict=False
+    )
+    assert not dataset.splits["all_null"].cv_schemes
+    # the usable label is unaffected
+    assert dataset.splits["target_cont"].cv_schemes
+
+
+def test_sweep_pairs_list_expands_to_one_run_each():
+    """A label may name several groupings; each becomes its own run, and
+    two labels may share a grouping without colliding."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    import sweep_tokens as st
+
+    pairs = {
+        "temperature": ["bioproject", "organism"],
+        "ph": "bioproject",
+        "oxy": None,
+    }
+    runs = []
+    for label, tokens in pairs.items():
+        if tokens is None or isinstance(tokens, str):
+            tokens = [tokens]
+        for token in tokens:
+            token = "random" if token is None else token
+            runs.append(f"holdout_{st.spec_dir_name(token)}__{label}")
+
+    assert runs == [
+        "holdout_bioproject__temperature",
+        "holdout_organism__temperature",
+        "holdout_bioproject__ph",
+        "holdout_random__oxy",
+    ]
+    # distinct directories, so adding a grouping later never overwrites
+    assert len(set(runs)) == len(runs)

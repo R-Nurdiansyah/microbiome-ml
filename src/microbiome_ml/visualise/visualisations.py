@@ -43,7 +43,7 @@ import warnings
 from collections import Counter
 from pathlib import Path
 from textwrap import wrap
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import cmasher as cmr
 import matplotlib.gridspec as gridspec
@@ -64,6 +64,24 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 _VALID_FORMATS = {"png", "svg", "eps", "pdf"}
+
+# Categorical hues for stacked marks: matplotlib tab10, with its grey moved
+# last so that for <= 9 categories grey is free to mean "Other". Distinct
+# hues rather than steps of one ramp -- neighbouring steps of a continuous
+# colormap read as the same category once they are stacked together.
+_CATEGORICAL_HUES = (
+    "#1f77b4",  # blue
+    "#ff7f0e",  # orange
+    "#2ca02c",  # green
+    "#d62728",  # red
+    "#9467bd",  # purple
+    "#8c564b",  # brown
+    "#e377c2",  # pink
+    "#bcbd22",  # olive
+    "#17becf",  # cyan
+    "#7f7f7f",  # grey (last: only used at 10+ categories)
+)
+_OTHER_HUE = "#bdbdbd"  # lighter than tab10 grey, so the two never merge
 
 
 class Visualiser:
@@ -714,6 +732,212 @@ class Visualiser:
             plt.tight_layout(rect=(0, 0, 1, 0.95))
             self._save_fig(fig, file_path, dpi=300)
         plt.show()
+
+    def plot_holdout_distribution(
+        self,
+        holdout: Union[str, Path, pl.DataFrame],
+        label: Optional[str] = None,
+        grouping: Optional[str] = None,
+        bins: int = 30,
+        stat: Union[str, Sequence[str]] = ("count", "probability"),
+        max_categories: int = 10,
+        output: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Compare the label distribution in holdout train vs test.
+
+        Two histograms side by side on shared bins, so a holdout can be
+        checked for representativeness: the shapes should match even
+        though the test side holds ~20% of the samples. Bars are stacked
+        by *grouping* (e.g. ``bioproject``) to show which groups make up
+        each part of the range -- the same categories and colours in both
+        panels.
+
+        Args:
+            holdout: ``holdout.csv`` path, or the DataFrame itself. Needs
+                a ``split`` column of train/test plus the label column.
+            label: Label column. Defaults to the first column that is
+                neither ``sample`` nor ``split`` (how the pipeline writes
+                holdout.csv).
+            grouping: Column to stack by. None = a single colour.
+            bins: Bin count, shared by both panels.
+            max_categories: Groups past the most common this many fold
+                into a grey "Other" (default 10 = the tab10 palette).
+                Categories are taken most-common first.
+            stat: One statistic, or several -- one row of panels each.
+                ``"count"`` shows raw numbers (the 80/20 size difference
+                stays visible); ``"probability"`` puts both sides on one
+                scale so the shapes can be compared. Default: both.
+            output: Output path stem; respects ``self.formats``.
+            title: Figure title.
+        """
+        if isinstance(holdout, (str, Path)):
+            holdout = pl.read_csv(holdout, infer_schema_length=10000)
+        if "split" not in holdout.columns:
+            raise ValueError("holdout must have a 'split' column")
+        if label is None:
+            rest = [c for c in holdout.columns if c not in ("sample", "split")]
+            if not rest:
+                raise ValueError("No label column found in holdout")
+            label = rest[0]
+        if label not in holdout.columns:
+            raise ValueError(f"Label '{label}' not in holdout columns")
+        if grouping is not None and grouping not in holdout.columns:
+            raise ValueError(f"Grouping '{grouping}' not in holdout columns")
+
+        df = holdout.filter(pl.col(label).is_not_null())
+        if df.height == 0:
+            logging.warning("No non-null '%s' values to plot", label)
+            return {
+                "label": label,
+                "n_train": 0,
+                "n_test": 0,
+                "ks": None,
+                "p": None,
+            }
+
+        # Shared bin edges, so the two panels are directly comparable.
+        values = df[label].cast(pl.Float64, strict=False).to_numpy()
+        edges = np.histogram_bin_edges(values[np.isfinite(values)], bins=bins)
+
+        # One category -> colour mapping for both panels; building it per
+        # panel would recolour a group that is absent from one side.
+        # Distinct hues, not steps of one ramp: stacked segments sit next
+        # to each other, and neighbouring steps of a continuous colormap
+        # are easy to read as the same category.
+        palette: Optional[dict] = None
+        hue_order: Optional[List[str]] = None
+        if grouping is not None:
+            cats = df[grouping].cast(pl.Utf8).fill_null("NA").to_list()
+            counts = Counter(cats)
+            keep = [c for c, _ in counts.most_common(max_categories)]
+            hue_order = list(keep)
+            colors = list(_CATEGORICAL_HUES)
+            palette = {
+                cat: colors[i % len(colors)] for i, cat in enumerate(keep)
+            }
+            if len(counts) > len(keep):
+                palette["Other"] = _OTHER_HUE
+                hue_order.append("Other")
+
+        # One row per requested stat: "count" keeps the raw numbers (and the
+        # 80/20 size difference) visible, "probability" puts both sides on
+        # one scale so the shapes can be compared. Asking for both is the
+        # honest default when n differs a lot between the sides.
+        stats_list = [stat] if isinstance(stat, str) else list(stat)
+        if not stats_list:
+            raise ValueError("stat must name at least one statistic")
+
+        n_rows = len(stats_list)
+        fig, axes = plt.subplots(
+            n_rows,
+            2,
+            figsize=(12, 4.5 * n_rows),
+            sharex=True,
+            sharey="row",
+            squeeze=False,
+        )
+        for row, this_stat in enumerate(stats_list):
+            for col, side in enumerate(("train", "test")):
+                ax = cast(plt.Axes, axes[row][col])
+                part = df.filter(pl.col("split") == side)
+                x = part[label].cast(pl.Float64, strict=False).to_numpy()
+                hue = None
+                if grouping is not None and palette is not None and len(x):
+                    # An empty panel would leave hue as an empty list,
+                    # which seaborn treats as "no hue" and then warns that
+                    # the palette is unused.
+                    raw = (
+                        part[grouping].cast(pl.Utf8).fill_null("NA").to_list()
+                    )
+                    hue = [c if c in palette else "Other" for c in raw]
+                sns.histplot(
+                    x=x,
+                    bins=edges,
+                    hue=hue,
+                    hue_order=hue_order if hue is not None else None,
+                    palette=palette if hue is not None else None,
+                    multiple="stack",
+                    stat=this_stat,
+                    common_norm=True,
+                    ec=None,
+                    alpha=1,
+                    # one legend for the whole figure
+                    legend=(row == 0 and side == "test" and hue is not None),
+                    ax=ax,
+                )
+                if len(x):
+                    ax.axvline(
+                        float(np.nanmedian(x)),
+                        color="#7272a1",
+                        linestyle="dashed",
+                        zorder=3,
+                    )
+                if row == 0:
+                    ax.set_title(
+                        f"{side}  (n={len(x)}"
+                        + (
+                            f", median={np.nanmedian(x):.3g}, "
+                            f"sd={np.nanstd(x):.3g})"
+                            if len(x)
+                            else ")"
+                        ),
+                        fontsize=10,
+                    )
+                ax.set_xlabel(label if row == n_rows - 1 else "")
+                ax.set_ylabel(this_stat if col == 0 else "")
+
+        # Do the two sides actually match? Report it rather than eyeball.
+        head = title or f"Holdout label distribution: {label}"
+        tr = df.filter(pl.col("split") == "train")[label].to_numpy()
+        te = df.filter(pl.col("split") == "test")[label].to_numpy()
+        stats: Dict[str, Any] = {
+            "label": label,
+            "n_train": int(len(tr)),
+            "n_test": int(len(te)),
+            "median_train": float(np.nanmedian(tr)) if len(tr) else None,
+            "median_test": float(np.nanmedian(te)) if len(te) else None,
+            "sd_train": float(np.nanstd(tr)) if len(tr) else None,
+            "sd_test": float(np.nanstd(te)) if len(te) else None,
+            "ks": None,
+            "p": None,
+        }
+        try:
+            from scipy.stats import ks_2samp
+
+            if len(tr) > 1 and len(te) > 1:
+                ks = ks_2samp(tr, te)
+                stats["ks"] = float(ks.statistic)
+                stats["p"] = float(ks.pvalue)
+                head += (
+                    f"   ·   KS={ks.statistic:.3f} (p={ks.pvalue:.3g})"
+                    "  —  larger KS = more shift between train and test"
+                )
+        except Exception:  # pragma: no cover - scipy optional at runtime
+            pass
+        fig.suptitle(head, fontsize=12)
+
+        legend_obj = cast(plt.Axes, axes[0][1]).get_legend()
+        # A legend only exists when the bars were stacked, which needs a
+        # grouping -- so the title is never None here.
+        if legend_obj is not None and grouping is not None:
+            legend_obj.set_bbox_to_anchor((1.02, 1))
+            legend_obj.set_title(grouping)
+        fig.tight_layout()
+
+        if output:
+            file_path = Path(output)
+            if (
+                file_path.parent in (Path(""), Path("."))
+                and not file_path.is_absolute()
+            ):
+                file_path = self.output_dir / file_path.stem
+            else:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path = file_path.with_suffix("")
+            self._save_fig(fig, file_path, dpi=300)
+        plt.show()
+        return stats
 
     def plot_feature_importances(
         self,

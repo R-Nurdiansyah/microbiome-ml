@@ -10,11 +10,18 @@
 #   * --config holdout_groupings=random,bioproject (comma separated),
 # `random` meaning the stratified-random holdout without grouping.
 #
-# DAG:
-#   prepare  (1)                  build dataset once      -> <base>/prepared/
-#   split    (per grouping)       holdout + CV folds      -> <base>/holdout_<g>/splits/
-#   cv       (per g x label x scheme, PARALLEL)           -> <base>/holdout_<g>/runs/<label>/<scheme>/
-#   collate  (1)                  TSV summaries           -> <base>/cv_sweep_headline.tsv, ...
+# DAG, where <run> is holdout_<grouping> for a cross-product sweep and
+# holdout_<grouping>__<label> for a `pairs` sweep:
+#   prepare  (1)                  build dataset once  -> <base>/prepared/
+#   split    (per run)            holdout + CV folds  -> <base>/<run>/splits/
+#   cv       (per run x label x scheme, PARALLEL)
+#                                 -> <base>/<run>/runs/<label>/<scheme>/
+#   collate  (1)                  TSV summaries
+#                                 -> <base>/cv_sweep_headline.tsv, ...
+#
+# collate reads every <base>/holdout_*/ on disk, not only the runs of this
+# invocation, so a later sweep extends the summary TSVs rather than
+# replacing them.
 #
 # The set of CV schemes is only known after `split` runs (it depends on the
 # grouping columns found in the metadata), hence the checkpoint.
@@ -39,10 +46,11 @@ if "data" not in config or "outputs" not in config:
 REPO = Path(workflow.basedir).parent
 STEPS = f"python -u {shlex.quote(str(REPO / 'scripts' / 'pipeline_steps.py'))}"
 
-# The steps module is imported for its token parsing (holdout_spec /
-# spec_dir_name) so the Snakefile and the CLI agree on names.
+# Token parsing only -- a dependency-free module. Importing pipeline_steps
+# here would pull in microbiome_ml, whose setup_logging() configures the
+# root logger and makes every Snakemake log line print twice.
 sys.path.insert(0, str(REPO / "scripts"))
-import pipeline_steps as steps
+import sweep_tokens as steps
 
 BASE = Path(config["outputs"].get("base_dir", "out/pipeline"))
 if not BASE.is_absolute():
@@ -50,31 +58,86 @@ if not BASE.is_absolute():
 BASE_S = str(BASE)
 
 
-def _grouping_names():
-    raw = config.get("holdout_groupings")
-    if raw is None:
-        raw = (config.get("sweep") or {}).get("holdout_groupings")
+def _run_specs():
+    """The runs this sweep performs, as {dir_name: spec}.
+
+    Two modes:
+      sweep.holdout_groupings: [random, bioproject, "taxon:family"]
+          every grouping x every label -- the cross-product.
+      sweep.pairs: {geo_ph: organism, geo_temperature: realm}
+          one run per label, each with its own holdout grouping.
+    `pairs` wins if both are given. A pair run restricts the label at
+    every stage, so a label without a holdout cannot trip up CV.
+    """
+    sweep = config.get("sweep") or {}
+    pairs = config.get("pairs") or sweep.get("pairs")
+    if pairs:
+        if isinstance(pairs, str):  # --config pairs=geo_ph:organism,...
+            pairs = dict(
+                item.split(":", 1) for item in pairs.split(",") if item
+            )
+        if not isinstance(pairs, dict):
+            raise WorkflowError(
+                "sweep.pairs must be a mapping of label -> holdout grouping"
+            )
+        specs = {}
+        for label, tokens in pairs.items():
+            # A label may name several groupings; each becomes its own run,
+            # so adding one later does not disturb the runs already done.
+            if tokens is None or isinstance(tokens, str):
+                tokens = [tokens]
+            elif not isinstance(tokens, (list, tuple)):
+                raise WorkflowError(
+                    f"sweep.pairs[{label}] must be a grouping or a list of "
+                    f"groupings, got {tokens!r}"
+                )
+            for token in tokens:
+                token = "random" if token is None else str(token).strip()
+                gname = steps.spec_dir_name(token)
+                specs[f"holdout_{gname}__{label}"] = {
+                    "token": token,
+                    "label": str(label),
+                    "stamp": f"{gname}__{label}",
+                }
+        return specs
+
+    raw = config.get("holdout_groupings") or sweep.get("holdout_groupings")
     if raw is None:
         raise WorkflowError(
-            "No holdout groupings given. Use --config "
-            "holdout_groupings=random,bioproject or add "
-            "sweep: {holdout_groupings: [...]} to the YAML."
+            "Nothing to sweep. Give either sweep.holdout_groupings "
+            "([random, bioproject, ...]) or sweep.pairs "
+            "({label: grouping}); --config holdout_groupings=... and "
+            "--config pairs=label:grouping,... also work."
         )
     if isinstance(raw, str):
         raw = [x for x in raw.split(",")]
-    # Canonical, directory-safe names: "random", a metadata column, or
-    # "taxon_<rank>" for a community-membership holdout (written either as
-    # taxon:family or taxon_family in the config).
-    names = []
+    specs = {}
     for g in raw:
         token = "random" if g is None else str(g).strip()
-        name = steps.spec_dir_name(token)
-        if name not in names:
-            names.append(name)
-    return names
+        gname = steps.spec_dir_name(token)
+        specs.setdefault(
+            f"holdout_{gname}",
+            {"token": token, "label": None, "stamp": gname},
+        )
+    return specs
 
 
-GROUPINGS = _grouping_names()
+RUNS = _run_specs()
+RUN_NAMES = list(RUNS)
+
+
+def _label_sets(run):
+    """--set overrides pinning a pair run to its one label."""
+    label = RUNS[run]["label"]
+    if label is None:
+        return ""
+    return " ".join(
+        f"--set {key}={label}"
+        for key in ("split.holdout.label", "split.cv.label", "cv.label")
+    )
+
+
+CV_ENABLED = bool((config.get("cv") or {}).get("enabled", True))
 HOLDOUT_ENABLED = bool(
     (config.get("holdout_evaluation") or {}).get("enabled", True)
 )
@@ -91,8 +154,8 @@ _DEFAULT_RESOURCES = {
     "split": {"threads": 2, "mem_mb": 16000, "runtime": 3 * 60},
     "cv": {
         "threads": int((config.get("cv") or {}).get("n_jobs") or 8),
-        "mem_mb": 256000,
-        "runtime": 48 * 60,
+        "mem_mb": 64000,
+        "runtime": 12 * 60,
     },
     "collate": {"threads": 1, "mem_mb": 4000, "runtime": 15},
 }
@@ -153,7 +216,7 @@ RESOLVED.write_text(yaml.safe_dump(_resolved, sort_keys=False))
 RESOLVED_S = shlex.quote(str(RESOLVED))
 
 wildcard_constraints:
-    grouping="[^/]+",
+    run="holdout_[^/]+",
     label="[^/]+",
     scheme="[^/]+",
 
@@ -165,7 +228,7 @@ wildcard_constraints:
 # checkpoint lookups in all_runs() would stop at the first missing split and
 # the groupings would be discovered -- and run -- one after another.
 ALL_SCHEMES = [
-    f"{BASE_S}/holdout_{g}/splits/schemes.json" for g in GROUPINGS
+    f"{BASE_S}/{run}/splits/schemes.json" for run in RUN_NAMES
 ]
 
 
@@ -186,11 +249,20 @@ onerror:
     )
 
 
+# With cv.enabled: false the workflow stops after the splits and their
+# distribution plots -- nothing downstream is requested.
+COLLATED = (
+    [f"{BASE_S}/cv_sweep_headline.tsv", f"{BASE_S}/sweep_status.tsv"]
+    if CV_ENABLED
+    else []
+)
+
+
 rule all:
     input:
         ALL_SCHEMES,
-        f"{BASE_S}/cv_sweep_headline.tsv",
-        f"{BASE_S}/sweep_status.tsv",
+        f"{BASE_S}/holdout_distribution_summary.txt",
+        COLLATED,
 
 
 rule prepare:
@@ -213,62 +285,95 @@ checkpoint split:
     input:
         rules.prepare.output,
     output:
-        f"{BASE_S}/holdout_{{grouping}}/splits/schemes.json",
+        f"{BASE_S}/{{run}}/splits/schemes.json",
+    params:
+        token=lambda w: RUNS[w.run]["token"],
+        stamp=lambda w: RUNS[w.run]["stamp"],
+        label_sets=lambda w: _label_sets(w.run),
     threads: RES("split", "threads")
     retries: RETRIES("split")
     resources:
         mem_mb=MEM("split"),
         runtime=RUNTIME("split"),
     log:
-        f"{BASE_S}/logs/split_{{grouping}}.log",
+        f"{BASE_S}/logs/split_{{run}}.log",
     shell:
         "{LOGHDR} "
         "{STEPS} split --config {RESOLVED_S} "
         "--dataset {BASE_S}/prepared "
-        "--grouping {wildcards.grouping} "
-        "--out {BASE_S}/holdout_{wildcards.grouping}/splits >> {log} 2>&1"
+        "--grouping {params.token} --run-name {params.stamp} "
+        "{params.label_sets} "
+        "--out {BASE_S}/{wildcards.run}/splits >> {log} 2>&1"
 
 
 rule cv:
     input:
         prepared=rules.prepare.output,
-        schemes=f"{BASE_S}/holdout_{{grouping}}/splits/schemes.json",
+        schemes=f"{BASE_S}/{{run}}/splits/schemes.json",
     output:
-        f"{BASE_S}/holdout_{{grouping}}/runs/{{label}}/{{scheme}}/status.json",
+        f"{BASE_S}/{{run}}/runs/{{label}}/{{scheme}}/status.json",
+    params:
+        token=lambda w: RUNS[w.run]["token"],
+        stamp=lambda w: RUNS[w.run]["stamp"],
     threads: RES("cv", "threads")
     retries: RETRIES("cv")
     resources:
         mem_mb=MEM("cv"),
         runtime=RUNTIME("cv"),
     log:
-        f"{BASE_S}/logs/cv_{{grouping}}_{{label}}_{{scheme}}.log",
+        f"{BASE_S}/logs/cv_{{run}}_{{label}}_{{scheme}}.log",
     shell:
         "{LOGHDR} "
         "{STEPS} cv --config {RESOLVED_S} "
         "--dataset {BASE_S}/prepared "
-        "--splits {BASE_S}/holdout_{wildcards.grouping}/splits "
-        "--grouping {wildcards.grouping} "
+        "--splits {BASE_S}/{wildcards.run}/splits "
+        "--grouping {params.token} --run-name {params.stamp} "
         "--label {wildcards.label} --scheme {wildcards.scheme} "
-        "--out {BASE_S}/holdout_{wildcards.grouping}/runs/"
+        "--out {BASE_S}/{wildcards.run}/runs/"
         "{wildcards.label}/{wildcards.scheme} "
         "--set cv.n_jobs={threads} >> {log} 2>&1"
 
 
 def all_runs(wildcards):
-    """Expand to one cv output per grouping x label x scheme (checkpoint)."""
+    """One cv output per run x label x scheme (resolved after the split)."""
     outs = []
-    for g in GROUPINGS:
-        schemes_file = checkpoints.split.get(grouping=g).output[0]
+    for run in RUN_NAMES:
+        schemes_file = checkpoints.split.get(run=run).output[0]
         schemes = json.loads(Path(schemes_file).read_text())
         for label, names in schemes.items():
             for scheme in names:
                 outs.append(
-                    f"{BASE_S}/holdout_{g}/runs/{label}/{scheme}/status.json"
+                    f"{BASE_S}/{run}/runs/{label}/{scheme}/status.json"
                 )
     if not outs:
-        raise WorkflowError("split produced no label/scheme to run")
+        raise WorkflowError(
+            "No label/scheme to run: every schemes.json is empty. If these "
+            "splits were produced with cv.enabled: false, the file says "
+            "'nothing to run' and Snakemake will not redo an existing "
+            "split -- re-run with -R split to regenerate them. Otherwise "
+            "no label survived the split (see the split logs)."
+        )
     return outs
 
+
+
+rule split_report:
+    # Ranked text summary of train/test label agreement across every
+    # holdout. Runs whether or not CV is enabled -- it is the point of a
+    # splits-only sweep.
+    input:
+        ALL_SCHEMES,
+    output:
+        f"{BASE_S}/holdout_distribution_summary.txt",
+    threads: 1
+    resources:
+        mem_mb=RES("collate", "mem_mb"),
+        runtime=RES("collate", "runtime"),
+    log:
+        f"{BASE_S}/logs/split_report.log",
+    shell:
+        "{LOGHDR} "
+        "{STEPS} split_report --out {BASE_S} >> {log} 2>&1"
 
 rule collate:
     input:

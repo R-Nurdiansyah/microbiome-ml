@@ -13,7 +13,16 @@ Example:
 
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import polars as pl
@@ -37,6 +46,18 @@ from microbiome_ml.train.results import CV_Result, LabelSchemeKey
 from microbiome_ml.wrangle.dataset import Dataset
 
 logger = logging.getLogger(__name__)
+
+
+class ComboMeta(NamedTuple):
+    """Per-combination data the CV loops need besides X and y.
+
+    Deliberately small: the joined DataFrame it replaces held a second
+    copy of the whole feature matrix.
+    """
+
+    fold: np.ndarray
+    feature_columns: List[str]
+
 
 # Mapping of model short names to their constructors
 # Canonical constructors keyed by short names (keeps compatibility with hyperparameters.yaml)
@@ -341,7 +362,9 @@ class CrossValidator:
         )
         params_grid = self.load_param_grids(param_path)
         logger.info(
-            f"Starting cross-validation with {len(mapping)} feature/label/scheme combinations and models: {self.models}"
+            "Starting cross-validation over feature/label/scheme "
+            "combinations with models: %s",
+            self.models,
         )
 
         scorers = {
@@ -349,101 +372,98 @@ class CrossValidator:
             "mse": make_scorer(mean_squared_error, greater_is_better=False),
         }
 
-        combo_payloads: List[
-            Tuple[
-                str,
-                Optional[str],
-                Optional[str],
-                Optional[str],
-                List[str],
-                np.ndarray,
-                np.ndarray,
-                PredefinedSplit,
+        def payloads() -> (
+            Iterator[
+                Tuple[
+                    str,
+                    Optional[str],
+                    Optional[str],
+                    Optional[str],
+                    List[str],
+                    np.ndarray,
+                    np.ndarray,
+                    PredefinedSplit,
+                ]
             ]
-        ] = []
+        ):
+            """Validate each combination and hand it straight to a worker.
 
-        for key, (X_np, y_np, joined) in mapping.items():
-            try:
-                feature_name, label_name, scheme_name = key.split("::")
-            except Exception:
-                feature_name = key
-                label_name = None
-                scheme_name = None
-
-            try:
-                fold_arr = np.array(joined.select("fold").to_numpy()).ravel()
-            except Exception:
+            A generator, so joblib pulls payloads as workers free up
+            (pre_dispatch) instead of every feature matrix being built
+            and held before the first fit starts.
+            """
+            for key, X_np, y_np, meta in mapping:
                 try:
-                    fold_arr = np.array([r["fold"] for r in joined.to_dicts()])
+                    feature_name, label_name, scheme_name = key.split("::")
+                except Exception:
+                    feature_name = key
+                    label_name = None
+                    scheme_name = None
+
+                try:
+                    fold_arr = np.asarray(meta.fold).ravel().astype(int)
                 except Exception:
                     logging.warning(
-                        "Could not extract fold assignments for %s; skipping",
+                        "Fold assignments for %s could not be cast to integers; skipping",
                         key,
                     )
                     continue
 
-            # ensure integer fold array and check per-fold sample counts
-            try:
-                fold_arr = np.asarray(fold_arr).ravel().astype(int)
-            except Exception:
-                logging.warning(
-                    "Fold assignments for %s could not be cast to integers; skipping",
-                    key,
-                )
-                continue
+                unique_folds, counts = np.unique(fold_arr, return_counts=True)
+                if len(unique_folds) < 2:
+                    logging.warning(
+                        "Not enough folds for %s (found %d); skipping",
+                        key,
+                        len(unique_folds),
+                    )
+                    continue
+                if np.min(counts) < 2:
+                    logging.getLogger(__name__).warning(
+                        "One or more folds for %s contain fewer than 2 samples; skipping",
+                        key,
+                    )
+                    continue
 
-            unique_folds, counts = np.unique(fold_arr, return_counts=True)
-            if len(unique_folds) < 2:
-                logging.warning(
-                    "Not enough folds for %s (found %d); skipping",
-                    key,
-                    len(unique_folds),
-                )
-                continue
-            if np.min(counts) < 2:
-                logging.getLogger(__name__).warning(
-                    "One or more folds for %s contain fewer than 2 samples; skipping",
-                    key,
-                )
-                continue
-
-            ps = PredefinedSplit(test_fold=fold_arr)
-            X_arr = np.asarray(X_np)
-            y_arr = np.asarray(y_np, dtype=float)
-            drop_cols = {"sample", "fold"}
-            if label_name:
-                drop_cols.add(label_name)
-            feature_columns = [c for c in joined.columns if c not in drop_cols]
-
-            combo_payloads.append(
-                (
+                yield (
                     key,
                     feature_name,
                     label_name,
                     scheme_name,
-                    feature_columns,
-                    X_arr,
-                    y_arr,
-                    ps,
+                    meta.feature_columns,
+                    np.asarray(X_np),
+                    np.asarray(y_np, dtype=float),
+                    PredefinedSplit(test_fold=fold_arr),
                 )
-            )
-
-        if not combo_payloads:
-            return results
 
         cpu_total = os.cpu_count() or 1
-        if n_jobs is None:
-            parallel_jobs = min(cpu_total, len(combo_payloads))
-        else:
-            parallel_jobs = max(1, min(int(n_jobs), len(combo_payloads)))
-        parallel_jobs = max(1, parallel_jobs)
+
+        def _n(value: Any, default: int) -> int:
+            if value is None:
+                return default
+            if isinstance(value, (list, tuple, set)):
+                return max(1, len(value))
+            return 1
+
+        # Upper bound on combinations: the exact count is only known while
+        # streaming, so bound it from the requested feature sets, labels
+        # and schemes rather than materialising them to count.
+        max_combos = (
+            _n(
+                self.feature_set,
+                max(1, len(getattr(self.dataset, "feature_sets", {}) or {})),
+            )
+            * _n(label_to_use, 1)
+            * _n(scheme_to_use, 1)
+        )
+        requested = cpu_total if n_jobs is None else int(n_jobs)
+        parallel_jobs = max(1, min(requested, max_combos))
 
         # Avoid nested over-subscription: only fan-out inside cross_validate when sequential
         inner_cv_jobs = -1 if parallel_jobs == 1 else 1
 
         logger.info(
-            "Dispatching %d CV combinations across %d worker(s) (inner_cv_jobs=%d)",
-            len(combo_payloads),
+            "Dispatching CV combinations across %d worker(s) "
+            "(inner_cv_jobs=%d)",
             parallel_jobs,
             inner_cv_jobs,
         )
@@ -457,7 +477,7 @@ class CrossValidator:
                 scorers,
                 inner_cv_jobs,
             )
-            for payload in combo_payloads
+            for payload in payloads()
         )
 
         for combo_key, partial_results, best_info in job_outputs:
@@ -645,23 +665,13 @@ class CrossValidator:
             "mse": make_scorer(mean_squared_error, greater_is_better=False),
         }
 
-        for key, (X_np, y_np, joined) in mapping.items():
+        for key, X_np, y_np, meta in mapping:
             try:
                 feature_name, label_name, scheme_name = key.split("::")
             except Exception:
                 feature_name, label_name, scheme_name = key, None, None
 
-            try:
-                fold_arr = np.array(joined.select("fold").to_numpy()).ravel()
-            except Exception:
-                try:
-                    fold_arr = np.array([r["fold"] for r in joined.to_dicts()])
-                except Exception:
-                    logging.warning(
-                        "Could not extract fold assignments for %s; skipping",
-                        key,
-                    )
-                    continue
+            fold_arr = meta.fold
 
             # ensure integer fold array and check per-fold sample counts
             try:
@@ -691,10 +701,7 @@ class CrossValidator:
             ps = PredefinedSplit(test_fold=fold_arr)
             X_arr = np.asarray(X_np)
             y_arr = np.asarray(y_np, dtype=float)
-            drop_cols = {"sample", "fold"}
-            if label_name:
-                drop_cols.add(label_name)
-            feature_columns = [c for c in joined.columns if c not in drop_cols]
+            feature_columns = meta.feature_columns
 
             for model in self.models:
                 if isinstance(model, str):
@@ -776,16 +783,14 @@ class CrossValidator:
         label: Optional[Union[str, List[str]]] = None,
         scheme: Optional[Union[str, List[str]]] = None,
         feature_set: Optional[Union[str, List[str]]] = None,
-    ) -> Dict[str, Tuple[np.ndarray, np.ndarray, Any]]:
-        """Prepares the input data for cross-validation by aligning feature
-        sets, labels, and CV schemes.
+    ) -> Iterator[Tuple[str, np.ndarray, np.ndarray, ComboMeta]]:
+        """Yield one (key, X float32, y, ComboMeta) per feature set x label
+        x CV scheme.
 
-        Returns a dictionary mapping each unique combination of feature set,
-        label, and scheme to its (X, y, joined DataFrame).
+        A generator on purpose: the feature matrices are the largest
+        objects in the run, and returning them in a dict kept every
+        combination alive at once. Callers iterate exactly once.
         """
-
-        results: Dict[str, Tuple[np.ndarray, np.ndarray, Any]] = {}
-
         # 1. Check if the dataset has feature sets, labels, and splits
         feature_sets = getattr(dataset, "feature_sets", None)
         if feature_sets is None:
@@ -817,21 +822,31 @@ class CrossValidator:
                         "Available feature sets: %s", list(feature_sets.keys())
                     )
             if not feature_names:
-                return results
+                return
         else:
             feature_names = list(feature_sets.keys())
 
         # 2. Materialize feature sets and labels into DataFrames
         for feat_name in feature_names:
             feat_obj = feature_sets[feat_name]
-            feat_df = feat_obj.to_df()
+            # Stay lazy: collecting the whole feature table here would
+            # hold every sample and taxon in memory for the entire
+            # label x scheme loop, when each combination only needs the
+            # rows of its own folds.
+            feat_lf = getattr(feat_obj, "features", None)
+            if not isinstance(feat_lf, pl.LazyFrame):
+                feat_lf = feat_obj.to_df().lazy()
+            feat_schema = feat_lf.collect_schema().names()
             acc_col = next(
-                (c for c in ("sample", "acc") if c in feat_df.columns), None
+                (c for c in ("sample", "acc") if c in feat_schema), None
             )
             if acc_col is None:
                 raise RuntimeError(
                     "featureset missing accession column ('sample' or 'acc')"
                 )
+            if acc_col != "sample":
+                feat_lf = feat_lf.rename({acc_col: "sample"})
+            feature_cols = [c for c in feat_schema if c != acc_col]
 
             label_keys: List[str] = []
 
@@ -1029,19 +1044,10 @@ class CrossValidator:
                         )
                         continue
 
-                    # 3. Align and combine feature, label, and cv DataFrames
-                    fdf = feat_df
+                    # 3. Join labels and folds FIRST (both tiny), so the
+                    # fold check can reject a combination before any
+                    # feature data is read.
                     ldf = label_df
-                    feature_cols = [c for c in fdf.columns if c != "sample"]
-                    if feature_cols:
-                        fdf = fdf.with_columns(
-                            [pl.col(c).fill_null(fillna) for c in feature_cols]
-                        )
-
-                    joined = cv_df.join(fdf, on="sample", how="left").join(
-                        ldf, on="sample", how="left"
-                    )
-
                     label_value_col = next(
                         (c for c in ldf.columns if c != "sample"), None
                     )
@@ -1049,13 +1055,11 @@ class CrossValidator:
                         raise RuntimeError(
                             "label DataFrame has no value column after materialize"
                         )
-
-                    # Delete null rows in label column
-                    joined = joined.filter(~pl.col(label_value_col).is_null())
-
-                    # Check number of folds after dropping null labels
+                    keys = cv_df.join(ldf, on="sample", how="left").filter(
+                        ~pl.col(label_value_col).is_null()
+                    )
                     n_folds_after = (
-                        joined.select(pl.col("fold"))
+                        keys.select(pl.col("fold"))
                         .drop_nulls()
                         .unique()
                         .height
@@ -1069,32 +1073,47 @@ class CrossValidator:
                         )
                         continue
 
-                    # 4. Extract X and y as numpy arrays
-                    drop_cols = ["sample", "fold", label_value_col]
-                    feat_only = joined.drop(drop_cols)
-                    try:
-                        X_np = feat_only.to_numpy()
-                    except Exception:
-                        X_np = np.asarray(feat_only)
-                    try:
-                        y_np = np.asarray(
-                            joined.select(pl.col(label_value_col))
-                            .to_numpy()
-                            .ravel(),
-                            dtype=float,
+                    # 4. Materialise the feature matrix ONCE, for these
+                    # samples only. Joining, filling and casting inside one
+                    # lazy plan means the full-width table is never held:
+                    # polars can also push the sample filter and column
+                    # selection into the scan when the features came from
+                    # disk. float32 matches what sklearn's tree code uses
+                    # internally, so float64 would only buy a conversion
+                    # copy per fit.
+                    joined = (
+                        keys.lazy()
+                        .join(feat_lf, on="sample", how="left")
+                        .with_columns(
+                            [
+                                pl.col(c)
+                                .fill_null(fillna)
+                                .cast(pl.Float32, strict=False)
+                                for c in feature_cols
+                            ]
                         )
-                    except Exception:
-                        y_np = np.asarray(
-                            joined.select(pl.col(label_value_col))
-                            .to_numpy()
-                            .ravel(),
-                            dtype=float,
-                        )
+                        .collect()
+                    )
 
-                    results[f"{feat_name}::{label_name}::{scheme_name}"] = (
-                        X_np,
-                        y_np,
-                        joined,
+                    drop_cols = ["sample", "fold", label_value_col]
+                    X_np = joined.drop(drop_cols).to_numpy()
+                    y_np = np.asarray(
+                        joined.select(pl.col(label_value_col))
+                        .to_numpy()
+                        .ravel(),
+                        dtype=float,
+                    )
+
+                    # Keep only what the CV loops need; retaining the frame
+                    # would double the cost of every combination.
+                    meta = ComboMeta(
+                        fold=joined.select("fold")
+                        .to_numpy()
+                        .ravel()
+                        .astype(int),
+                        feature_columns=[
+                            c for c in joined.columns if c not in drop_cols
+                        ],
                     )
                     logger.info(
                         "Prepared data for feature set '%s', label '%s', scheme '%s' with %d samples and %d features.",
@@ -1104,5 +1123,11 @@ class CrossValidator:
                         X_np.shape[0],
                         X_np.shape[1],
                     )
-
-        return results
+                    # Streamed, not accumulated: only this combination's
+                    # matrix is alive at a time.
+                    yield (
+                        f"{feat_name}::{label_name}::{scheme_name}",
+                        X_np,
+                        y_np,
+                        meta,
+                    )

@@ -570,9 +570,7 @@ def test_export_result_opt_out_models_and_fold_table(tmp_path):
     )
     res = cv.run(param_path=str(p))
     out_dir = tmp_path / "cv_export_trimmed"
-    CV_Result.export_result(
-        res, out_dir, save_models=False, fold_table=False
-    )
+    CV_Result.export_result(res, out_dir, save_models=False, fold_table=False)
 
     # Kept
     assert (out_dir / "manifest.json").exists()
@@ -586,9 +584,9 @@ def test_export_result_opt_out_models_and_fold_table(tmp_path):
 
     manifest = json.loads((out_dir / "manifest.json").read_text())
     assert "models" not in manifest["components"]
-    assert "results_folds.csv" not in manifest["components"]["results"][
-        "files"
-    ]
+    assert (
+        "results_folds.csv" not in manifest["components"]["results"]["files"]
+    )
 
 
 class TwoSchemeDummyDataset(DummyDataset):
@@ -688,3 +686,51 @@ def test_results_summary_sorted_best_to_worst(tmp_path):
     with (out_dir / "results.ndjson").open() as fh:
         ndjson_r2 = [json.loads(line)["avg_validation_r2"] for line in fh]
     assert ndjson_r2 == [0.9, 0.5, 0.1, None]
+
+
+def test_prepare_inputs_streams_one_matrix_at_a_time(tmp_path):
+    """_prepare_inputs is a generator: consuming it must not materialise
+    every combination's feature matrix at once (that was ~1 TB on the
+    large profiles), and X must come back float32."""
+    import inspect
+
+    samples = [f"s{i}" for i in range(8)]
+    X = np.arange(16).reshape(8, 2).astype(float)
+    y = X[:, 0] + np.random.RandomState(0).randn(8) * 0.01
+    ds = DummyDataset(samples, X, y)
+
+    cv = CrossValidator(ds, models=LinearRegression(), cv_folds=2)
+    gen = cv._prepare_inputs(ds, label="target", scheme="schemeA")
+    assert inspect.isgenerator(gen)
+
+    alive = []
+    for key, X_np, y_np, meta in gen:
+        assert X_np.dtype == np.float32
+        assert X_np.shape[0] == y_np.shape[0] == len(meta.fold)
+        assert "sample" not in meta.feature_columns
+        assert "fold" not in meta.feature_columns
+        alive.append(key)
+    assert alive, "generator yielded nothing"
+
+
+def test_run_still_returns_results_after_streaming(tmp_path):
+    """The streaming refactor must not change what run() produces."""
+    samples = [f"s{i}" for i in range(8)]
+    X = np.arange(16).reshape(8, 2).astype(float)
+    y = X[:, 0] + np.random.RandomState(1).randn(8) * 0.01
+    ds = DummyDataset(samples, X, y)
+
+    p = tmp_path / "params.json"
+    p.write_text(json.dumps({"linearregression": {"fit_intercept": [True]}}))
+
+    cv = CrossValidator(
+        ds,
+        models=LinearRegression(),
+        cv_folds=2,
+        label="target",
+        scheme="schemeA",
+    )
+    res = cv.run(param_path=str(p), n_jobs=1)
+    assert res and all(isinstance(v, CV_Result) for v in res.values())
+    assert cv.best_result is not None
+    assert cv.best_result_by_label_scheme

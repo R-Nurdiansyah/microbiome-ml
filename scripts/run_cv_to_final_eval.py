@@ -17,7 +17,13 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import matplotlib
 import yaml
+
+matplotlib.use("Agg")  # headless: these also run on compute nodes
+
+import matplotlib.pyplot as plt  # noqa: E402
+import polars as pl  # noqa: E402
 
 try:
     import microbiome_ml  # noqa: F401
@@ -152,6 +158,83 @@ def _log_best_combinations(cv: CrossValidator) -> None:
         )
 
 
+def plot_holdout_distributions(
+    splits_dir: Path,
+    vis_cfg: Dict[str, Any],
+    out_dir: Path,
+    holdout_grouping: Optional[str] = None,
+) -> None:
+    """Label distribution train vs test, one figure per label.
+
+    Driven by `visualise.holdout_distribution` in the config. `grouping:
+    auto` stacks by the column that defined the holdout when there is one
+    (so you can see which groups landed in test), falling back to no
+    stacking for a random or taxon holdout.
+    """
+    if not bool(vis_cfg.get("enabled", False)):
+        return
+    dist_cfg = vis_cfg.get("holdout_distribution")
+    if dist_cfg is None:
+        dist_cfg = {"enabled": True}
+    if isinstance(dist_cfg, bool):
+        dist_cfg = {"enabled": dist_cfg}
+    if not isinstance(dist_cfg, dict):
+        raise ValueError(
+            "visualise.holdout_distribution must be a mapping or a boolean"
+        )
+    if not bool(dist_cfg.get("enabled", True)):
+        return
+
+    holdouts = sorted(Path(splits_dir).glob("*/holdout.csv"))
+    if not holdouts:
+        LOGGER.warning(
+            "No holdout.csv under %s; no distribution plots", splits_dir
+        )
+        return
+
+    grouping_cfg = dist_cfg.get("grouping", "auto")
+    vis = Visualiser(out_dir, formats=list(vis_cfg.get("formats", ["png"])))
+    rows: List[Dict[str, Any]] = []
+    for path in holdouts:
+        label = path.parent.name
+        grouping = holdout_grouping if grouping_cfg == "auto" else grouping_cfg
+        # `auto` only works for a metadata grouping that is a real column
+        if grouping is not None:
+            header = pl.read_csv(path, n_rows=0).columns
+            if grouping not in header:
+                grouping = (
+                    "holdout_taxon_presence"
+                    if "holdout_taxon_presence" in header
+                    else None
+                )
+        try:
+            stats = vis.plot_holdout_distribution(
+                path,
+                label=label,
+                grouping=grouping,
+                bins=int(dist_cfg.get("bins", 30)),
+                stat=dist_cfg.get("stat", ("count", "probability")),
+                output=f"holdout_distribution_{label}",
+            )
+            rows.append(
+                {"holdout_grouping": holdout_grouping or "random", **stats}
+            )
+        except Exception as exc:  # one bad label must not stop the run
+            LOGGER.warning(
+                "Could not plot holdout distribution for '%s': %s", label, exc
+            )
+        finally:
+            plt.close("all")
+
+    if rows:
+        # Machine-readable twin of the figures; the sweep collates these
+        # into one ranked text report (looking at N figures does not scale).
+        pl.DataFrame(rows).write_csv(
+            Path(out_dir) / "holdout_distribution_stats.tsv", separator="\t"
+        )
+    LOGGER.info("Wrote holdout distribution plots to %s", out_dir)
+
+
 def _validate_grouping_references(
     cfg: Dict[str, Any], available: List[str]
 ) -> None:
@@ -268,7 +351,9 @@ def _sections(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def build_dataset(cfg: Dict[str, Any]) -> Dataset:
+def build_dataset(
+    cfg: Dict[str, Any], stream_dir: Optional[Path] = None
+) -> Dataset:
     """Stage 2: load inputs, build groupings, QC, and feature tables.
 
     Everything here is independent of how the data is later split, so a
@@ -351,10 +436,47 @@ def build_dataset(cfg: Dict[str, Any]) -> Dataset:
         )
 
     if feature_cfg.get("add_taxonomic_features", True):
+        ranks = feature_cfg.get("ranks")
+        build_all = bool(feature_cfg.get("all", True))
+        prefix = str(feature_cfg.get("prefix", "tax"))
+        # Building a rank CV will not train on costs the full feature
+        # table twice over: once in memory here, once on disk in the
+        # saved dataset. When cv.feature_set names the sets to use,
+        # build only those ranks.
+        wanted = sec["cv"].get("feature_set")
+        if wanted:
+            wanted = wanted if isinstance(wanted, list) else [wanted]
+            needed = [
+                str(name).split(f"{prefix}_", 1)[-1]
+                for name in wanted
+                if str(name).startswith(f"{prefix}_")
+            ]
+            if needed:
+                skipped = (
+                    [r for r in ranks if r not in needed]
+                    if ranks
+                    else "all other ranks"
+                )
+                LOGGER.info(
+                    "cv.feature_set names %s: building only rank(s) %s "
+                    "(skipping %s)",
+                    wanted,
+                    needed,
+                    skipped,
+                )
+                ranks, build_all = needed, False
+        # Stream each rank straight to the dataset directory when we know
+        # it: the wide table is then built a chunk of samples at a time
+        # and read back as a scan, instead of living in memory.
+        if stream_dir is not None:
+            Path(stream_dir).mkdir(parents=True, exist_ok=True)
         dataset = dataset.add_taxonomic_features(
-            ranks=feature_cfg.get("ranks"),
-            prefix=str(feature_cfg.get("prefix", "tax")),
-            all=bool(feature_cfg.get("all", True)),
+            ranks=ranks,
+            prefix=prefix,
+            all=build_all,
+            stream_dir=stream_dir,
+            chunk_samples=int(feature_cfg.get("chunk_samples", 5000)),
+            labelled_only=bool(feature_cfg.get("labelled_only", False)),
         )
 
     return dataset
@@ -455,6 +577,29 @@ def run_from_dataset(
             compress=bool(out_cfg.get("save_dataset_compress", False)),
         )
         LOGGER.info("Saved processed dataset to %s", save_dataset_path)
+
+    # Stage 3b: plot the label distribution either side of the holdout, so
+    # an unrepresentative split is visible before anything is trained.
+    plot_holdout_distributions(
+        splits_out,
+        vis_cfg,
+        base_dir / "split_visualisations",
+        holdout_grouping=(
+            f"taxon_{taxon_rank}"
+            if taxon_rank
+            else holdout_cfg.get("grouping")
+        ),
+    )
+
+    # Optional stop: inspect the split before spending CV on it.
+    if not bool(cv_cfg.get("enabled", True)):
+        LOGGER.info(
+            "cv.enabled is false: stopping after the holdout split. "
+            "Splits in %s, distribution plots in %s",
+            splits_out,
+            base_dir / "split_visualisations",
+        )
+        return base_dir
 
     # Stage 4: Run cross-validation and export CV artifacts.
     LOGGER.info("Running cross-validation")

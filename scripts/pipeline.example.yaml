@@ -72,6 +72,15 @@ features:
   ranks: null
   # Feature-set name prefix: tax -> tax_phylum, tax_class, ...
   prefix: tax
+  # Memory controls for building the wide feature tables. Under the
+  # Snakemake workflow each rank is streamed straight to the prepared
+  # dataset a chunk of samples at a time, so peak memory is roughly
+  # chunk_samples x number of taxa rather than the whole matrix.
+  chunk_samples: 5000
+  # Build features only for samples that have at least one non-null
+  # label. CV, the trainer and SHAP never touch an unlabelled sample, so
+  # this is free unless you want the saved dataset to cover everything.
+  labelled_only: false
 
 preprocessing:
   # Master switch for the QC steps below. false = use the data as given.
@@ -96,8 +105,10 @@ split:
     label: null
     # Fraction of samples held out as `test` (approximate when grouping set).
     test_size: 0.2
-    # Continuous labels are cut into this many quantile bins and the test set
-    # is stratified across them, so it spans the label's range.
+    # Continuous labels are cut into this many EQUAL-WIDTH bins (min..max
+    # by np.linspace, not quantiles) and the test set is stratified across
+    # them, so it spans the label's range. A skewed label therefore gets
+    # sparse bins at the tails; lower n_bins if one comes out near-empty.
     n_bins: 5
     # ONE grouping column, or null.
     #   null        -> stratified random split; the same bioproject/region
@@ -143,6 +154,10 @@ split:
     strict: true
 
 cv:
+  # Stage 2 switch. false = stop after the holdout split and its
+  # distribution plots; no CV, no best models, no holdout evaluation.
+  # Use it to check the splits are sane before paying for the models.
+  enabled: true
   # Models to evaluate. Short names: rf (random forest), gb (gradient
   # boosting), xgb / xgboost. Hyperparameters come from param_path.
   models:
@@ -204,6 +219,20 @@ visualise:
   formats:                         # any of png, svg, pdf, eps
     - png
   top_n: 20                        # features shown in importance plots
+  # Stage 1 figure: label distribution in holdout train vs test, side by
+  # side on shared bins, so an unrepresentative split shows up before
+  # anything is trained. Written to <base_dir>/split_visualisations/.
+  holdout_distribution:
+    enabled: true
+    # Column to stack the bars by. "auto" = whatever defined the holdout
+    # (the grouping column, or holdout_taxon_presence for a taxon split);
+    # a column name to force one; null for no stacking.
+    grouping: auto
+    bins: 30
+    # One row of panels per statistic. count = raw numbers (the 80/20
+    # size difference stays visible); probability = both sides on one
+    # scale so the shapes can be compared. A single string also works.
+    stat: [count, probability]
 
 # Optional SHAP attribution on each holdout TEST split. Requires the `shap`
 # package: run with `pixi run -e shap python scripts/run_cv_to_final_eval.py ...`
@@ -219,3 +248,36 @@ shap:
   max_background: 100
   # Features listed in holdout_metrics.json and shown in the SHAP plots.
   top_n: 20
+
+# How a sweep enumerates its runs (scripts/run_holdout_sweep.py and
+# workflow/Snakefile). Give ONE of these; `pairs` wins if both appear.
+sweep:
+  # Cross-product: every grouping is tried against every label.
+  #   random          stratified random holdout (the positive control)
+  #   <column>        group-aware holdout on that metadata column
+  #   "taxon:<rank>"  holdout by community membership at that rank --
+  #                   QUOTE it: inside [ ] an unquoted colon is a YAML error
+  holdout_groupings: []
+
+  # ...or pair each label with its own holdout grouping. One run per pair,
+  # pinned to that label at every stage, written to
+  # <base_dir>/holdout_<grouping>__<label>/. CV still covers every scheme.
+  # A label may name a LIST of groupings; each becomes its own run, so you
+  # can add one later without disturbing the runs already on disk.
+  # pairs:
+  #   geo_ph: [organism, bioproject]   # -> two runs
+  #   geo_temperature: realm           # -> one run
+  #   ph: "taxon:family"
+
+  # Summaries ACCUMULATE. `collate` rebuilds the sweep TSVs from every
+  # holdout_*/ directory under base_dir, not just the runs of this
+  # invocation, so adding a grouping and re-running extends the tables
+  # instead of replacing them. The flip side: deleting a run directory is
+  # how you drop it from the summaries.
+
+  # Retries and per-rule resources for the Snakemake workflow.
+  mem_scale: 2.0
+  retries: {prepare: 3}
+  resources:
+    prepare: {mem_mb: 256000, runtime: 600}
+    cv:      {threads: 16, mem_mb: 128000, runtime: 1440}

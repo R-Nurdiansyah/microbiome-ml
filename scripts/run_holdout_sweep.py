@@ -30,7 +30,7 @@ import logging
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import polars as pl
 
@@ -80,9 +80,17 @@ def _collate(
 
 def run_sweep(
     cfg: Dict[str, Any],
-    groupings: List[str],
+    runs: List[Tuple[str, Optional[str]]],
     output_dir: Optional[Path] = None,
 ) -> Path:
+    """Run one pipeline per (token, label) entry.
+
+    `label` None runs every label against that grouping (the
+    cross-product mode); a label restricts the run to it (sweep.pairs).
+    Entries are independent runs, so the same grouping may appear more
+    than once with different labels.
+    """
+    groupings = [token for token, _ in runs]
     out_cfg = cfg.get("outputs") or {}
     base_dir = output_dir or Path(str(out_cfg.get("base_dir", "out/pipeline")))
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -141,11 +149,19 @@ def run_sweep(
     all_frames: List[pl.DataFrame] = []
     holdout_frames: List[pl.DataFrame] = []
 
-    for token, (kind, value) in zip(groupings, specs):
+    for (token, label), (kind, value) in zip(runs, specs):
         name = _dir_name(token)
+        if label is not None:
+            name = f"{name}__{label}"
         run_dir = base_dir / f"holdout_{name}"
         run_cfg = copy.deepcopy(cfg)
         run_cfg.setdefault("split", {}).setdefault("holdout", {})
+        if label is not None:
+            # Pin every stage to this label, so a label without a holdout
+            # cannot trip up create_cv_folds(use_holdout=True).
+            run_cfg["split"]["holdout"]["label"] = label
+            run_cfg["split"].setdefault("cv", {})["label"] = label
+            run_cfg.setdefault("cv", {})["label"] = label
         if kind == "taxon":
             run_cfg["split"]["holdout"]["taxon_rank"] = value
             run_cfg["split"]["holdout"]["grouping"] = None
@@ -212,6 +228,8 @@ def run_sweep(
     if holdout_enabled:
         _collate(holdout_frames, "r2", base_dir / "holdout_sweep_summary.tsv")
 
+    steps.collate_split_report(base_dir)
+
     failed = [s["holdout_grouping"] for s in status if s["status"] != "ok"]
     if failed:
         LOGGER.warning("Failed grouping(s): %s (see sweep_status.tsv)", failed)
@@ -245,8 +263,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--groupings",
-        nargs="+",
-        required=True,
+        nargs="*",
+        default=[],
         metavar="GROUPING",
         help=(
             "Holdout strategies to sweep: 'random' (stratified random, the "
@@ -288,12 +306,39 @@ def main() -> None:
         pipeline._set_by_path(cfg, key, value)
         LOGGER.info("Config override: %s = %r", key, value)
 
+    # sweep.pairs maps label -> grouping (or a list of groupings); each
+    # pair is its own run, pinned to that label. --groupings is the
+    # cross-product mode, where every grouping sees every label.
+    pairs = (cfg.get("sweep") or {}).get("pairs") or {}
+    if pairs and not args.groupings:
+        runs: List[Tuple[str, Optional[str]]] = []
+        for label, tokens in pairs.items():
+            if tokens is None or isinstance(tokens, str):
+                tokens = [tokens]
+            elif not isinstance(tokens, (list, tuple)):
+                raise ValueError(
+                    f"sweep.pairs[{label}] must be a grouping or a list of "
+                    f"groupings, got {tokens!r}"
+                )
+            for token in tokens:
+                token = "random" if token is None else str(token).strip()
+                runs.append((token, str(label)))
+        run_sweep(cfg, runs, output_dir=args.output_dir)
+        return
+
     seen: List[str] = []
-    for g in args.groupings:
+    for g in args.groupings or []:
         canonical = _dir_name(g)
         if canonical not in [_dir_name(s) for s in seen]:
             seen.append(g.strip())
-    run_sweep(cfg, seen, output_dir=args.output_dir)
+    if not seen:
+        raise ValueError(
+            "Nothing to sweep: pass --groupings or add sweep.pairs to the "
+            "config"
+        )
+    run_sweep(
+        cfg, [(token, None) for token in seen], output_dir=args.output_dir
+    )
 
 
 if __name__ == "__main__":

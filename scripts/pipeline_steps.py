@@ -21,12 +21,22 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_cv_to_final_eval as pipeline  # noqa: E402
+
+# Token parsing lives in a dependency-free module so the Snakefile can use
+# it without importing microbiome_ml (whose setup_logging() would duplicate
+# every Snakemake log line). Re-exported here for callers and tests.
+from sweep_tokens import (  # noqa: E402,F401
+    RANDOM,
+    TAXON_PREFIX,
+    holdout_spec,
+    spec_dir_name,
+)
 
 from microbiome_ml.train.cv import CrossValidator  # noqa: E402
 from microbiome_ml.train.results import CV_Result  # noqa: E402
@@ -36,8 +46,6 @@ from microbiome_ml.wrangle.dataset import Dataset  # noqa: E402
 from microbiome_ml.wrangle.splits import SplitManager  # noqa: E402
 
 LOGGER = logging.getLogger("steps")
-
-RANDOM = "random"  # directory/CLI name for "no holdout grouping"
 
 
 # ----------------------------------------------------------------------------
@@ -50,35 +58,6 @@ def _load_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         pipeline._set_by_path(cfg, key, value)
         LOGGER.info("Config override: %s = %r", key, value)
     return cfg
-
-
-TAXON_PREFIX = "taxon_"  # dir-safe form of the "taxon:<rank>" token
-
-
-def holdout_spec(name: str) -> Tuple[str, Optional[str]]:
-    """Interpret a sweep token as a holdout strategy.
-
-    random | null | none  -> ("column", None)   stratified random
-    taxon:family          -> ("taxon", "family") community membership
-    taxon_family          -> ("taxon", "family") (dir-safe spelling)
-    <anything else>       -> ("column", <name>) metadata grouping
-    """
-    text = name.strip()
-    if text.lower() in {RANDOM, "null", "none", ""}:
-        return ("column", None)
-    if text.startswith("taxon:"):
-        return ("taxon", text.split(":", 1)[1])
-    if text.startswith(TAXON_PREFIX):
-        return ("taxon", text[len(TAXON_PREFIX) :])
-    return ("column", text)
-
-
-def spec_dir_name(name: str) -> str:
-    """Directory/wildcard-safe name for a sweep token."""
-    kind, value = holdout_spec(name)
-    if kind == "taxon":
-        return f"{TAXON_PREFIX}{value}"
-    return RANDOM if value is None else value
 
 
 def _grouping_value(name: str) -> Optional[str]:
@@ -140,7 +119,10 @@ def _write_json(path: Path, payload: Any) -> None:
 def step_prepare(args: argparse.Namespace) -> None:
     cfg = _load_cfg(args)
     out = Path(args.out)
-    dataset = pipeline.build_dataset(cfg)
+    # Feature tables are streamed straight into the dataset directory, so
+    # the wide matrices are never held in memory and Dataset.save finds
+    # them already in place.
+    dataset = pipeline.build_dataset(cfg, stream_dir=out / "features")
     LOGGER.info("Saving prepared dataset to %s", out)
     dataset.save(out)
     LOGGER.info("prepare done: %s", out / "manifest.json")
@@ -153,6 +135,7 @@ def step_split(args: argparse.Namespace) -> None:
     split_cv_cfg = sec["split"].get("cv") or {}
     cv_cfg = sec["cv"]
     kind, value = holdout_spec(args.grouping)
+    run_name = getattr(args, "run_name", None) or spec_dir_name(args.grouping)
     out = Path(args.out)
 
     dataset = Dataset.load(args.dataset)
@@ -192,6 +175,14 @@ def step_split(args: argparse.Namespace) -> None:
     )
     dataset.save_cv_folds(out)
 
+    # Label distribution either side of the holdout, per label.
+    pipeline.plot_holdout_distributions(
+        out,
+        sec["visualise"],
+        out.parent / "split_visualisations",
+        holdout_grouping=run_name,
+    )
+
     # What the cv step should actually train, honouring cv.label / cv.scheme.
     want_labels = cv_cfg.get("label")
     want_labels = (
@@ -220,6 +211,15 @@ def step_split(args: argparse.Namespace) -> None:
         ]
         if names:
             schemes[label] = sorted(names)
+    if not bool(cv_cfg.get("enabled", True)):
+        # Record the schemes even when CV is off: the workflow gates on
+        # cv.enabled itself, and writing an empty list here would make
+        # schemes.json say "nothing to run" to a later run with CV on
+        # (the file already exists, so split would not be redone).
+        LOGGER.info(
+            "cv.enabled is false: stopping after the split "
+            "(schemes recorded for a later run)"
+        )
     _write_json(out / "schemes.json", schemes)
     LOGGER.info("split done (grouping=%s): %s", args.grouping, schemes)
 
@@ -231,13 +231,15 @@ def step_cv(args: argparse.Namespace) -> None:
     cv_cfg, out_cfg = sec["cv"], sec["outputs"]
     vis_cfg, shap_cfg = sec["visualise"], sec["shap"]
     holdout_enabled = bool(sec["holdout_evaluation"].get("enabled", True))
-    holdout_grouping = spec_dir_name(args.grouping)
+    holdout_grouping = getattr(args, "run_name", None) or spec_dir_name(
+        args.grouping
+    )
     label, scheme = args.label, args.scheme
     run_dir = Path(args.out)
     cv_out, best_out = run_dir / "cv_results", run_dir / "best_models"
     holdout_out = run_dir / "holdout"
     status: Dict[str, Any] = {
-        "holdout_grouping": args.grouping,
+        "holdout_grouping": holdout_grouping,
         "label": label,
         "scheme": scheme,
         "status": "ok",
@@ -605,46 +607,162 @@ def write_summaries(
     return headline
 
 
+def _num(value: Any, width: int, spec: str) -> str:
+    """Right-aligned number for the text report; 'n/a' when unusable.
+
+    Values can arrive as strings when a per-run stats file was written
+    with an all-null column, so never assume the type.
+    """
+    if value is None:
+        return "n/a".rjust(width)
+    try:
+        number = int(value) if spec == "d" else float(value)
+    except (TypeError, ValueError):
+        return str(value).rjust(width)
+    if number != number:  # NaN
+        return "n/a".rjust(width)
+    return f"{number:>{width}{spec}}"
+
+
+def collate_split_report(root: Union[str, Path]) -> Optional[Path]:
+    """One ranked text report of every holdout's train/test agreement.
+
+    Reads the per-run holdout_distribution_stats.tsv files and writes
+    `holdout_distribution_summary.txt` at the sweep root: per label, the
+    holdout strategies sorted by KS (smallest first = train and test most
+    alike), so the figures only need opening for the interesting ones.
+    """
+    root = Path(root)
+    files = sorted(root.glob("holdout_*/split_visualisations/*_stats.tsv"))
+    if not files:
+        LOGGER.warning("No holdout_distribution_stats.tsv under %s", root)
+        return None
+    frames = [pl.read_csv(f, separator="\t") for f in files]
+    df = pl.concat(frames, how="diagonal_relaxed")
+    # A run whose stats are all-null reads back as String, and the relaxed
+    # concat then widens the whole column to String -- so re-impose the
+    # numeric types before sorting or formatting them.
+    numeric = ["ks", "p", "median_train", "median_test", "sd_train", "sd_test"]
+    counts = ["n_train", "n_test"]
+    df = df.with_columns(
+        [
+            pl.col(c).cast(pl.Float64, strict=False)
+            for c in numeric
+            if c in df.columns
+        ]
+        + [
+            pl.col(c).cast(pl.Int64, strict=False).fill_null(0)
+            for c in counts
+            if c in df.columns
+        ]
+    )
+    tsv = root / "holdout_distribution_stats.tsv"
+    df.write_csv(tsv, separator="\t")
+
+    lines = [
+        "Holdout train/test label agreement",
+        "=" * 78,
+        "KS = largest gap between the train and test cumulative label",
+        "distributions (0 = identical). p = chance of a gap that large if",
+        "both sides came from the same distribution.",
+        "",
+        "A random holdout SHOULD agree (small KS, large p). A grouped or",
+        "taxon holdout is expected to disagree -- whole groups are held out,",
+        "and groups differ in the label; there KS measures how far the model",
+        "has to extrapolate, it is not a defect.",
+        "",
+    ]
+    for label in sorted(df["label"].unique().to_list()):
+        sub = df.filter(pl.col("label") == label).sort(
+            "ks", descending=False, nulls_last=True
+        )
+        lines.append(f"--- {label} " + "-" * max(0, 74 - len(label)))
+        lines.append(
+            f"{'holdout':<22}{'KS':>8}{'p':>12}{'n_train':>9}"
+            f"{'n_test':>8}{'med_train':>11}{'med_test':>10}"
+        )
+        for r in sub.to_dicts():
+            lines.append(
+                f"{str(r.get('holdout_grouping')):<22}"
+                f"{_num(r.get('ks'), 8, '.3f')}"
+                f"{_num(r.get('p'), 12, '.3g')}"
+                f"{_num(r.get('n_train'), 9, 'd')}"
+                f"{_num(r.get('n_test'), 8, 'd')}"
+                f"{_num(r.get('median_train'), 11, '.3g')}"
+                f"{_num(r.get('median_test'), 10, '.3g')}"
+            )
+        lines.append("")
+
+    out = root / "holdout_distribution_summary.txt"
+    out.write_text("\n".join(lines), encoding="utf-8")
+    LOGGER.info("Wrote %s", out)
+    LOGGER.info("\n%s", "\n".join(lines))
+    return out
+
+
+def step_split_report(args: argparse.Namespace) -> None:
+    collate_split_report(Path(args.out))
+
+
+def _grouping_from_path(path: Path) -> str:
+    """Run name from a path inside <root>/holdout_<run>/..."""
+    for parent in path.parents:
+        if parent.name.startswith("holdout_"):
+            return parent.name[len("holdout_") :]
+    return "unknown"
+
+
+def _gather(root: Path, pattern: str, stamp: bool) -> List[pl.DataFrame]:
+    """Read every file matching *pattern* under the sweep root.
+
+    Globbing the directories rather than reading only the runs of this
+    invocation means a later sweep that adds a grouping extends the
+    summaries instead of replacing them -- earlier runs are still on
+    disk, so they are still collated.
+    """
+    frames: List[pl.DataFrame] = []
+    for path in sorted(root.glob(pattern)):
+        frame = _read_csv_or_none(path)
+        if frame is None:
+            continue
+        if stamp and "holdout_grouping" not in frame.columns:
+            frame = frame.with_columns(
+                pl.lit(_grouping_from_path(path)).alias("holdout_grouping")
+            ).select(["holdout_grouping", *frame.columns])
+        frames.append(frame)
+    return frames
+
+
 def step_collate(args: argparse.Namespace) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    collate_split_report(out)
+
+    # Every run directory present, not just the ones this invocation
+    # happened to execute, so reruns accumulate.
     statuses: List[Dict[str, Any]] = []
-    best_frames: List[pl.DataFrame] = []
-    all_frames: List[pl.DataFrame] = []
-    holdout_frames: List[pl.DataFrame] = []
-
-    for status_file in args.runs:
-        status_path = Path(status_file)
-        run_dir = status_path.parent
-        status = json.loads(status_path.read_text(encoding="utf-8"))
-        statuses.append(status)
-        if status.get("status") != "ok":
-            continue
-        grouping = status["holdout_grouping"]
-        tag = pl.lit(grouping).alias("holdout_grouping")
-        best = _read_csv_or_none(
-            run_dir / "best_models" / "best_models_summary.csv"
-        )
-        if best is not None:
-            best_frames.append(
-                best.with_columns(tag).select(
-                    ["holdout_grouping", *best.columns]
-                )
+    for status_path in sorted(out.glob("holdout_*/**/status.json")):
+        try:
+            statuses.append(
+                json.loads(status_path.read_text(encoding="utf-8"))
             )
-        every = _read_csv_or_none(
-            run_dir / "cv_results" / "results_summary.csv"
+        except Exception as exc:
+            LOGGER.warning("Could not read %s: %s", status_path, exc)
+    if args.runs:
+        LOGGER.info(
+            "Collating %d run(s) on disk (%d ran in this invocation)",
+            len(statuses),
+            len(args.runs),
         )
-        if every is not None:
-            all_frames.append(
-                every.with_columns(tag).select(
-                    ["holdout_grouping", *every.columns]
-                )
-            )
-        hold = _read_csv_or_none(run_dir / "holdout" / "holdout_summary.csv")
-        if hold is not None:
-            holdout_frames.append(hold)
 
-    pl.DataFrame(statuses).write_csv(out / "sweep_status.tsv", separator="\t")
+    best_frames = _gather(out, "holdout_*/**/best_models_summary.csv", True)
+    all_frames = _gather(out, "holdout_*/**/results_summary.csv", True)
+    holdout_frames = _gather(out, "holdout_*/**/holdout_summary.csv", False)
+
+    if statuses:
+        pl.DataFrame(statuses).write_csv(
+            out / "sweep_status.tsv", separator="\t"
+        )
     # Not written out: it is cv_sweep_all.tsv reduced to the top row per
     # grouping/label/scheme, and cv_sweep_headline.tsv is built from it.
     best_df = _concat_sorted(best_frames, "avg_validation_r2")
@@ -714,6 +832,13 @@ def main() -> None:
     _add_common(p)
     p.add_argument("--dataset", required=True, help="prepared dataset dir")
     p.add_argument("--grouping", required=True, help="column or 'random'")
+    p.add_argument(
+        "--run-name",
+        default=None,
+        help="Name this run is stamped with in every summary table "
+        "(default: the grouping). The sweep uses it to keep a "
+        "label-paired run distinct from a plain grouping run.",
+    )
     p.add_argument("--out", required=True, help="splits directory")
     p.set_defaults(func=step_split)
 
@@ -722,6 +847,7 @@ def main() -> None:
     p.add_argument("--dataset", required=True, help="prepared dataset dir")
     p.add_argument("--splits", required=True, help="splits directory")
     p.add_argument("--grouping", required=True, help="column or 'random'")
+    p.add_argument("--run-name", default=None, help="stamp for the tables")
     p.add_argument("--label", required=True)
     p.add_argument("--scheme", required=True)
     p.add_argument("--out", required=True, help="run directory")
@@ -730,10 +856,23 @@ def main() -> None:
     p = sub.add_parser("collate", help="stack run summaries into TSVs")
     p.add_argument("--out", required=True, help="sweep root directory")
     p.add_argument(
-        "--runs", nargs="+", required=True, help="status.json of every run"
+        "--runs",
+        nargs="*",
+        default=[],
+        help="status.json of the runs this invocation produced. Used for "
+        "ordering only -- the summaries are built from every run "
+        "directory present, so earlier sweeps keep contributing.",
     )
     p.add_argument("--log-level", default="INFO")
     p.set_defaults(func=step_collate)
+
+    p = sub.add_parser(
+        "split_report",
+        help="rank every holdout by train/test label agreement (KS)",
+    )
+    p.add_argument("--out", required=True, help="sweep root directory")
+    p.add_argument("--log-level", default="INFO")
+    p.set_defaults(func=step_split_report)
 
     args = parser.parse_args()
     pipeline.setup_logging(args.log_level)

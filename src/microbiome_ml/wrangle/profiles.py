@@ -1,6 +1,7 @@
 """Core data models for microbiome data structures."""
 
 import logging
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Any, List, Optional, Set, Type, Union
@@ -11,6 +12,33 @@ from microbiome_ml.utils.taxonomy import TaxonomicRanks
 from microbiome_ml.wrangle.features import SampleFeatureSet
 
 logger = logging.getLogger(__name__)
+
+
+def _sink_or_collect(frame: pl.LazyFrame, path: Path) -> None:
+    """Write a LazyFrame to CSV, streaming when the plan allows it.
+
+    `sink_csv` keeps memory flat; it raises on plans polars cannot
+    stream, in which case fall back to the eager write.
+
+    Writes to a sibling temporary file and moves it into place, because
+    the frame is usually a scan of a CSV and may be a scan of this one
+    (saving a dataset back over the directory it was loaded from).
+    Writing in place would truncate the source mid-read.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        try:
+            frame.sink_csv(tmp)
+        except Exception as exc:  # pragma: no cover - version/plan dependent
+            logger.debug(
+                "sink_csv unavailable for %s (%s); collecting", path, exc
+            )
+            frame.collect().write_csv(tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 class Fields(Enum):
@@ -301,15 +329,19 @@ class TaxonomicProfiles:
     def save(self, path: Union[Path, str]) -> None:
         """Save TaxonomicProfiles to CSV files in a directory.
 
+        Written by streaming (`sink_csv`): the profile table is the
+        largest object in a dataset, and collecting it just to copy it to
+        disk was the single biggest allocation in `prepare`.
+
         Args:
             path: Directory path to save files (will be created if doesn't exist)
         """
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
 
-        self.profiles.collect().write_csv(path / "profiles.csv")
+        _sink_or_collect(self.profiles, path / "profiles.csv")
         if self.root is not None:
-            self.root.collect().write_csv(path / "root.csv")
+            _sink_or_collect(self.root, path / "root.csv")
 
     @classmethod
     def load(
@@ -744,13 +776,27 @@ class TaxonomicProfiles:
         return new_instance
 
     def create_features(
-        self, rank: Union[str, TaxonomicRanks]
+        self,
+        rank: Union[str, TaxonomicRanks],
+        stream_path: Optional[Union[str, Path]] = None,
+        chunk_samples: int = 5000,
+        samples: Optional[List[str]] = None,
     ) -> SampleFeatureSet:
-        """Create a SampleFeatureSet from the taxonomic profiles at a specified
-        rank.
+        """Create a SampleFeatureSet from the taxonomic profiles at a rank.
+
+        With `stream_path`, the wide table is built a chunk of samples at
+        a time and appended to that CSV, and the returned feature set
+        scans the file. Peak memory is then `chunk_samples x n_taxa`
+        instead of the whole matrix: polars has no lazy pivot, so the
+        eager path has to hold the long-format profile and the full wide
+        table at once -- the dominant cost of `prepare` on large data.
 
         Args:
             rank: Taxonomic rank to extract features from
+            stream_path: Write the wide table here, chunk by chunk, and
+                return a scan of it. None keeps the in-memory behaviour.
+            chunk_samples: Samples per chunk when streaming.
+            samples: Restrict to these samples (e.g. the labelled ones).
         Returns:
             SampleFeatureSet instance with features at the specified rank
         """
@@ -775,8 +821,8 @@ class TaxonomicProfiles:
         # regex that captures the token at the requested rank anywhere in the taxonomy string
         pattern = f"(?:^|;)((?:{rank.prefix}[^;]+))(?:;|$)"
 
-        # Extract features at the specified rank
-        features = (
+        # Long-format view: one row per (sample, taxon at this rank).
+        long_lf = (
             profiles_lf.filter(
                 pl.col("taxonomy").str.contains(rank.get_regex())
             )
@@ -788,15 +834,107 @@ class TaxonomicProfiles:
             )
             .filter(pl.col("taxonomy").is_not_null())
             .select(["sample", "taxonomy", "relabund"])
-            .collect()
-            .pivot(
+        )
+        if samples is not None:
+            long_lf = long_lf.filter(pl.col("sample").is_in(list(samples)))
+
+        if stream_path is None:
+            features = long_lf.collect().pivot(
                 values="relabund",
                 index="sample",
                 on="taxonomy",
                 aggregate_function="first",
             )
+            return SampleFeatureSet.from_df(
+                df=features, name=f"{rank.name.lower()}_features"
+            )
+
+        return self._stream_features(
+            long_lf=long_lf,
+            rank=rank,
+            stream_path=Path(stream_path),
+            chunk_samples=max(1, int(chunk_samples)),
         )
 
-        return SampleFeatureSet.from_df(
-            df=features, name=f"{rank.name.lower()}_features"
+    def _stream_features(
+        self,
+        long_lf: pl.LazyFrame,
+        rank: TaxonomicRanks,
+        stream_path: Path,
+        chunk_samples: int,
+    ) -> SampleFeatureSet:
+        """Pivot a rank to `stream_path` a chunk of samples at a time.
+
+        Two cheap passes first -- the taxa that become columns, and the
+        samples that become rows -- then one chunk of the wide matrix is
+        alive at a time. Each chunk is reindexed onto the full column
+        list so every appended block has the same schema.
+        """
+        taxa = (
+            long_lf.select("taxonomy")
+            .unique()
+            .collect()
+            .get_column("taxonomy")
+            .sort()
+            .to_list()
+        )
+        sample_ids = (
+            long_lf.select("sample")
+            .unique()
+            .collect()
+            .get_column("sample")
+            .sort()
+            .to_list()
+        )
+        if not taxa or not sample_ids:
+            logger.warning(
+                "No %s features found; nothing to stream", rank.name.lower()
+            )
+            return SampleFeatureSet.from_df(
+                df=pl.DataFrame({"sample": []}),
+                name=f"{rank.name.lower()}_features",
+            )
+
+        logger.info(
+            "Streaming %s features: %d samples x %d taxa, "
+            "chunks of %d -> %s",
+            rank.name.lower(),
+            len(sample_ids),
+            len(taxa),
+            chunk_samples,
+            stream_path,
+        )
+        stream_path.parent.mkdir(parents=True, exist_ok=True)
+        columns = ["sample", *taxa]
+        first = True
+        with stream_path.open("wb") as handle:
+            for start in range(0, len(sample_ids), chunk_samples):
+                batch = sample_ids[start : start + chunk_samples]
+                wide = (
+                    long_lf.filter(pl.col("sample").is_in(batch))
+                    .collect()
+                    .pivot(
+                        values="relabund",
+                        index="sample",
+                        on="taxonomy",
+                        aggregate_function="first",
+                    )
+                )
+                # A chunk only carries the taxa its samples have; pad the
+                # rest so every block written shares one schema.
+                missing = [c for c in taxa if c not in wide.columns]
+                if missing:
+                    wide = wide.with_columns(
+                        [
+                            pl.lit(None, dtype=pl.Float64).alias(c)
+                            for c in missing
+                        ]
+                    )
+                wide = wide.select(columns)
+                wide.write_csv(handle, include_header=first)
+                first = False
+                del wide
+
+        return SampleFeatureSet.scan(
+            stream_path, name=f"{rank.name.lower()}_features"
         )
