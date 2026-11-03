@@ -40,16 +40,23 @@ The four things worth knowing before you start:
 | **Grouping is the whole point** | `grouping: bioproject` sends each bioproject wholly to train or wholly to test. Comparing that against `random` is how you tell real signal from leaked group structure. |
 | **Work up in stages** | `cv.enabled: false` stops after the split and its distribution plots, so you can check the splits are sane before paying for models. Faster still: `scripts/check_holdout_metadata.py` answers "which grouping gives a representative holdout?" from the metadata alone, in seconds. |
 | **Config changes do not re-trigger Snakemake** | Rules re-run on missing *files*, not changed settings. After editing `features`/`preprocessing`, force the stage: `-R prepare`. |
+| **One transform per prepared dataset** | `features.transform` is a single value and the feature sets are listed in `manifest.json`, so a second `prepare` into the same `base_dir` orphans the first. Use [the transform sweep](#comparing-transforms-in-one-sweep) to compare them. |
 
-Everything below is detail. The two sections to jump to are
+Everything below is detail. The sections to jump to are
 [Big Data Script](#big-data-script-no-notebook) for the config-driven
-pipeline and [Parallel sweep with Snakemake](#parallel-sweep-with-snakemake-large-data)
-for the cluster workflow.
+pipeline, [Parallel sweep with Snakemake](#parallel-sweep-with-snakemake-large-data)
+for the cluster workflow, and
+[Comparing transforms in one sweep](#comparing-transforms-in-one-sweep) when
+you want to know whether CLR or presence/absence buys you anything.
 
 ## Features
 
 - **Dataset Management**: Unified handling of taxonomic profiles, metadata, and labels with builder pattern API
 - **Taxonomic Features**: Generate features from taxonomic profiles at different ranks (phylum to species)
+  - three transforms: relative abundance, **CLR**, and **presence/absence**
+  - prevalence filtering, counted over samples or over **distinct studies**
+  - **per-taxon ICC**: rank every taxon by how much of its variance is its bioproject, to see the protocol artefacts before they reach a tree
+  - **shadow features**: shuffled copies of real columns, giving the importance ranking a measured noise floor
 - **Species-to-Sample Aggregation**: Convert species-level features to sample-level data
   - 8 aggregation methods: arithmetic/geometric/harmonic mean, median, presence/absence, top-k abundant, min/max
   - 3 weighting strategies: none, abundance-weighted, sqrt abundance-weighted
@@ -60,12 +67,16 @@ for the cluster workflow.
 - **Split Management**: Stratified train/test splits with group awareness to prevent data leakage
   - by metadata grouping: whole bioprojects / regions / years held out together
   - by **community membership**: the taxon at a chosen rank whose prevalence is nearest the target test size defines the split, so training never sees a community carrying it
-- **Cross-Validation**: K-fold CV with multiple schemes per label (random, grouped, stratified)
+- **Cross-Validation**: multiple schemes per label (random, grouped, stratified)
+  - k-fold and/or **leave-one-group-out** (sklearn `LeaveOneGroupOut`), toggled per run
   - best model kept per label **and** per scheme, so grouped schemes can be compared against the `random` control rather than discarded
   - a fold profile per scheme (`min_train_n`, `max_fold_pct`, `verdict`) saying whether the split was usable at all
+- **Full-fit diagnostics**: score the model fitted on the *whole* training pool, not k-1 folds — in-sample R2 as a ceiling, out-of-bag R2, and the overfit gap against the CV score
 - **Final Holdout Evaluation**: refit the CV winners on holdout-train, score once on holdout-test
+- **Feature report and recursive pruning**: how concentrated the importance is, which taxa carry it, and how far you can prune before the score moves
 - **SHAP** (optional): per-sample attribution with **direction**, so a taxon that pushes the label *down* is visible, not just one with a large effect
 - **Config-driven pipeline**: one YAML runs build → split → CV → holdout → SHAP, with `--set dotted.key=value` overrides
+- **Transform sweep**: one full run per transform into its own directory, feature-set names derived rather than hand-written, with one summary and one figure per label across the runs
 - **Sweeps**: compare every way of holding data out in one submission — serially in one process, or as a Snakemake workflow with one job per holdout × label × scheme, per-rule resources, and retries that escalate RAM
 - **Large data**: feature tables are streamed to disk a chunk of samples at a time and read back as scans, so peak memory is `chunk_samples × n_taxa` instead of the whole matrix
 - **Type Safety**: Full mypy type checking with strict configuration for reliable development
@@ -100,7 +111,8 @@ pixi run pre-commit install
 | **feature_set** | A named collection of features that can be used as model input, e.g. `tax_genus` (genus-level abundances) or `pathway_features_arithmetic_mean_none` (aggregated pathway features). Each feature set is a matrix of samples × features. |
 | **label** | The continuous target variable to predict, e.g. `temperature`, `ph`, or `oxygen`. One model is trained per label. |
 | **scheme** | The cross-validation partitioning strategy that defines how samples are assigned to folds, e.g. `random` (no grouping), `bioproject` (group by sequencing project), or `ecoregion` (group by biome). Grouped schemes prevent samples from the same group appearing in both train and validation splits. |
-| **fold** | A single train/validation split within a CV scheme. The number of folds is set by `n_folds` in `create_cv_folds`. |
+| **fold** | A single train/validation split within a CV scheme. For k-fold the count is `n_folds`; for leave-one-group-out it is the number of groups. A fold of `-1` means "training only, never validated". |
+| **LOGO** | Leave-one-group-out: each group takes a turn as the sole validation fold (sklearn's `LeaveOneGroupOut`). Scheme named `<grouping>_logo`. |
 | **grouping** | A categorical sample attribute (e.g. `bioproject`, `biome`) used to define CV schemes or holdout splits, preventing data leakage across related samples. |
 | **holdout** | A reserved test set that is withheld from all CV training and used only for the final evaluation. Created via `create_holdout_split` (stratified random, or group-aware on a metadata column) or `create_taxon_holdout_split` (defined by one taxon's presence/absence). |
 | **taxon holdout** | A holdout defined by community membership instead of metadata: the taxon at a chosen rank whose prevalence across the labelled samples is nearest `test_size` separates carriers from non-carriers. Recorded in `holdout.csv` as `holdout_taxon`, `holdout_rank` and `holdout_taxon_presence` (per sample: does it carry the taxon). |
@@ -449,7 +461,10 @@ set and model each of them selected:
 |---|---|
 | `control_scheme/feature_set/model/r2/mse` | the `random` winner for that grouping × label |
 | `best_grouped_scheme/feature_set/model/r2/mse` | the best non-random CV scheme |
-| `r2_gap` | `control_r2 − best_grouped_r2`; large = the signal is mostly within-group |
+| `r2_gap` | control − best grouped, on pooled R² when available, else the mean; large = the signal is mostly within-group |
+| `control_pooled_r2` / `best_grouped_pooled_r2` | the variance-weighted score each one earned |
+| `best_grouped_median_r2`, `_iqr_r2`, `_frac_folds_negative_r2` | the spread behind that single number |
+| `best_grouped_n_folds_evaluable` / `_n_folds` | how many of its folds could be scored |
 
 It is written by both sweep paths. To rebuild it (and the fold profile) from a
 sweep directory without recomputing anything:
@@ -465,6 +480,46 @@ print(s.write_summaries(s.load_sweep_best(d), d))
 
 `load_sweep_best` gathers the per-run `best_models_summary.csv` files directly,
 so this also works while jobs are still finishing.
+
+**How a scheme's folds are summarised.** An unweighted mean of per-fold R² is
+the wrong summary once folds are small, and leave-one-group-out makes them
+small by construction. Every result therefore carries five more columns:
+
+| column | meaning |
+|---|---|
+| `pooled_validation_r2` | `1 − ΣSSE/ΣSST` over evaluable folds — each fold's R² weighted by the variance it had to explain. **This is what the headline ranks on.** |
+| `median_validation_r2` | median per-fold R², evaluable folds only |
+| `iqr_validation_r2` | interquartile range of per-fold R² |
+| `frac_folds_negative_r2` | share of evaluable folds scoring below zero |
+| `n_folds_evaluable` / `n_folds` | how many folds could be scored at all |
+
+`avg_validation_r2` is still written, so nothing that read it breaks.
+
+**Why pooled.** A held-out group whose label barely varies has SST ≈ 0, so its
+R² explodes while the model may have done nothing unusual. One real run: 26
+leave-one-group-out folds, one with SST = 0.008 scoring −824,781, mean R²
+−32,730 — set almost entirely by that one fold. Pooled R², weighting each fold
+by its SST, gives −17.7 while still charging that fold's actual error.
+
+**Evaluable folds.** When a held-out group's label is *constant*, SST is
+exactly zero, R² is undefined, and scikit-learn returns `0.0` — which reads as
+"mediocre but fine". Those folds are excluded from all five columns and
+counted in `n_folds_evaluable`. In that same run six of 26 folds were like
+this, and dropping them moved the share of folds below zero from 77 % to
+100 %: the zeros had been flattering the result.
+
+Per-fold `SSE` and `SST` are recorded by two extra scorers in
+`cross_validate`, so they are exact rather than reconstructed. They need the
+`cv` jobs re-run — `collate` only stacks what those jobs wrote.
+
+**Selection uses the same number.** `CV_Result.rank_score` is pooled R²
+when the run recorded it and the mean otherwise, and every "best result"
+decision reads it: the global best, best-per-label,
+best-per-label/scheme, the row order in `results_summary.csv` and
+`best_models_summary.csv`, and the sweep headline. So the model exported
+as best for a scheme is the one the headline then ranks. A result from an
+older run has no SSE/SST and falls back to the mean, so a sweep mixing old
+and new directories still collates.
 
 **`cv_sweep_fold_profile.tsv`** says whether each CV scheme's split was usable
 at all, so a grouped R² can be judged rather than taken at face value. A group
@@ -575,7 +630,7 @@ as far as it is worth running:
 | stage | does | switch | outputs |
 |---|---|---|---|
 | 1 split | holdout split + CV folds, then the label distribution plot | always | `splits/`, `split_visualisations/` |
-| 2 CV | cross-validation on holdout-train, best model per scheme, CV bars | `cv.enabled` | `cv_results/`, `best_models/`, `cv_visualisations/` |
+| 2 CV | cross-validation on holdout-train (k-fold and/or leave-one-group-out), best model per scheme, CV bars | `cv.enabled` | `cv_results/`, `best_models/`, `cv_visualisations/` |
 | 3 holdout | refit the winners, score on test, feature importance, SHAP | `holdout_evaluation.enabled` | `holdout/` |
 
 ```yaml
@@ -667,6 +722,53 @@ Related helper: `Dataset.taxon_prevalence(rank)` returns
 `{taxon, n_present, n_samples, prevalence}` so you can see the candidates
 before committing to a split.
 
+### Leave-one-group-out CV
+
+A grouped k-fold scheme packs the groups into `n_folds` folds, so each
+validation fold mixes several groups. **Leave-one-group-out** instead gives
+every group a turn as the sole validation set — one CV iteration per group,
+training on all the others. It answers a sharper question: *does the model
+transfer to this particular bioproject?*, and it shows you the spread across
+groups rather than an average over arbitrary bundles of them.
+
+Toggle it per run; `methods` takes one or both:
+
+```yaml
+split:
+  cv:
+    grouping: all
+    n_folds: 5
+    methods: [kfold, logo]   # kfold (default), logo, or both
+    logo_max_groups: 50
+```
+
+Both gives two schemes per grouping — `bioproject` (k-fold) and
+`bioproject_logo` — which are trained and reported independently, so
+`cv_sweep_headline.tsv` can pick whichever did better as the best grouped
+scheme. From Python:
+
+```python
+dataset.create_cv_folds(methods=["kfold", "logo"])
+dataset.create_cv_folds(grouping="bioproject", methods="logo")
+```
+
+The splitter is sklearn's `LeaveOneGroupOut`; the fold table it produces is
+stored as `{sample, fold}` like every other scheme and replayed through
+`PredefinedSplit`, so nothing downstream needs to know which kind it is.
+
+Three things to know:
+
+| | |
+|---|---|
+| **`random` never gets a LOGO variant** | Without a grouping column every sample would be its own group, which is leave-one-out, not LOGO. The ungrouped baseline stays k-fold. |
+| **One-sample groups are training-only** | R² is undefined on a single point, so a singleton group cannot be a validation fold. Those samples get fold `-1` — `PredefinedSplit` keeps them in training for every iteration rather than discarding them. The log says how many. |
+| **Cost scales with group count** | LOGO fits one model per group, per model type, per parameter set. `logo_max_groups` (default 50) refuses the scheme above that and tells you the count, rather than quietly queueing 500 fits. Singletons do not count toward it. |
+
+LOGO suits a grouping with few, well-populated groups — `realm`, `biome`,
+`organism`. For something like `bioproject` with hundreds of levels, k-fold
+is the practical choice, and `cv_sweep_fold_profile.tsv` will tell you if its
+folds came out lopsided.
+
 ### Keeping memory down on large data
 
 The expensive stage is `prepare`, and the expensive part of it is the pivot
@@ -724,6 +826,259 @@ feature set in the dataset, in one process. Adding a rank therefore makes each
 `cv` job bigger rather than adding jobs, so size `sweep.resources.cv.mem_mb`
 accordingly or pin `cv.feature_set`.
 
+### Parquet feature tables
+
+CSV is the default and is fine at order level. At genus it is the single
+biggest cost, because **text has no dtype**: every `0` is one byte on disk and
+eight bytes once polars reads it back as Float64, and every job re-parses the
+whole file.
+
+```yaml
+features:
+  format: parquet     # csv (default) | parquet
+```
+
+Measured on one 16S soil dataset, 245,464 samples x 59,443 genera:
+
+| | CSV | parquet |
+|---|---|---|
+| on disk | 18.6 GB | a fraction of it — a 99%-sparse column compresses hard |
+| dtype on read | Float64 (inferred) | Float32 (stored) |
+| read into memory | ~117 GB | ~58 GB, and only the columns asked for |
+
+Written as a **directory** of row-group parts, `tax_genus.parquet/part_00000.parquet`
+— one per sample chunk, since the pivot only ever holds a chunk at a time and
+parquet cannot be appended to in place without pyarrow. Everything downstream
+reads it through `scan_parquet("<dir>/*.parquet")`; `manifest.json` records the
+name, so nothing else needs to know.
+
+### Prevalence filter
+
+Drop taxa that are present in too few samples. Absent means absent from the
+table, not zero-filled:
+
+```yaml
+features:
+  min_prevalence: 0.01    # null or absent = keep every taxon
+```
+
+Measured on that same genus table:
+
+| keep if present in | genera | % of columns | abundance kept |
+|---|---|---|---|
+| any sample | 59,443 | 100 % | 100 % |
+| **≥ 1 %** | **8,563** | 14.4 % | **97.6 %** |
+| ≥ 2 % | 5,177 | 8.7 % | 94.9 % |
+| ≥ 5 % | 2,510 | 4.2 % | 88.7 % |
+| ≥ 10 % | 1,340 | 2.3 % | 77.2 % |
+
+1 % is the usual choice: an 85 % cut in columns for 2.4 % of the abundance.
+Most of what goes is genera seen in a handful of samples out of a quarter of a
+million — artifacts that can never support a tree split.
+
+**It is not leakage.** The filter reads abundances only, never a label, so
+unlike supervised feature selection it cannot inflate R². It is counted once,
+on the long-format profiles before the pivot — a `group_by` over sparse rows,
+not a pass over the wide matrix — and **not per CV fold**, which would give
+each fold a different feature space and make the folds incomparable. One
+caveat for your methods section: counting over all samples, holdout included,
+is technically transductive.
+
+### Transforms: relative abundance, CLR, presence/absence
+
+How the abundances are expressed. One value per run — see the warning below.
+
+```yaml
+features:
+  transform: relabund        # relabund (default) | clr | presence
+  clr_pseudocount: 1.0e-6    # only read under clr
+  presence_threshold: 0.0    # only read under presence
+```
+
+| value | the cell holds | names the set |
+|---|---|---|
+| `relabund` | relative abundance, a constant-sum composition | `tax_genus` |
+| `clr` | `ln(x + p)` minus the mean of those logs, per sample across the taxa kept at that rank | `tax_genus_clr` |
+| `presence` | `1` where the value exceeds `presence_threshold`, else `0` | `tax_genus_pa` |
+
+`clr` moves the features onto an additive scale, which trees and correlations
+handle more sensibly than proportions. The pseudocount exists because the table
+is mostly zeros and `log(0)` is undefined; it sets how far below the smallest
+real value a zero lands.
+
+`presence` throws the abundance away. That is the point: sequencing depth and
+library protocol shift *how much* of a taxon you see far more than they shift
+*whether* you see it, so binarising sheds much of the between-study artefact
+that a leave-one-bioproject-out split has to survive. Raise
+`presence_threshold` (say `1.0e-4`) to ignore barcode bleed; `0.0` counts any
+non-zero value, matching how `min_prevalence` counts.
+
+Accepted spellings for `presence`: `pa`, `binary`, `presence_absence`.
+
+> **One transform per prepared dataset.** `transform` is a single value, and
+> `Dataset.load` reads its feature sets from `manifest.json` — so a second
+> `prepare` into the same `base_dir` rewrites the manifest and orphans the
+> first transform's table on disk. Comparing transforms means one run each into
+> its own `base_dir`; [the transform sweep](#comparing-transforms-in-one-sweep)
+> drives that loop.
+
+Changing the transform needs the dataset rebuilt: `-R prepare`.
+
+### Counting prevalence by group
+
+`min_prevalence` counts samples by default. Point `prevalence_by` at a grouping
+column and it counts **distinct groups** instead:
+
+```yaml
+features:
+  min_prevalence: 0.01
+  prevalence_by: bioproject    # must exist under `groupings`
+```
+
+The question changes from "in how many samples does this taxon appear" to "in
+how many independent studies", so one large project can no longer make a taxon
+look common on its own. Names the set `tax_genus_bio`. It has no effect without
+`min_prevalence`, and the pipeline warns if you set it alone.
+
+### Feature-set names
+
+Every build option that changes the matrix leaves a suffix, and `cv.feature_set`
+has to name the result exactly or CV silently finds nothing to train on:
+
+| built with | set name |
+|---|---|
+| defaults | `tax_genus` |
+| `transform: clr` | `tax_genus_clr` |
+| `transform: presence` | `tax_genus_pa` |
+| `transform: presence` + `prevalence_by` | `tax_genus_pa_bio` |
+| any of the above + `shadow` | the same, plus `tax_genus_pa_bio_shad` |
+
+> `presence` names its sets **`_pa`**, not `_presence`. A hand-written
+> `tax_genus_presence_bio` does not exist. The transform sweep derives these
+> names from the package itself for exactly this reason.
+
+Two options deliberately leave *no* mark: `min_prevalence` and the ICC filter.
+Runs at `min_prevalence: 0.01` and `0.05`, or at `max_icc: null` and `0.9`,
+produce sets with identical names — keep them in separate `base_dir`s.
+
+### Study markers: per-taxon ICC
+
+Intraclass correlation asks, for one taxon, what fraction of its variance
+across samples is explained by knowing which study the sample came from.
+
+```yaml
+features:
+  icc:
+    enabled: false
+    group: bioproject   # any column under `groupings`
+    report: true        # write the ranked table
+    max_icc: null       # rank only; a number drops taxa above it
+```
+
+A taxon at **ICC ≈ 1** is flat within every study and differs between them:
+knowing the bioproject tells you the abundance. That is the signature of a
+protocol artefact — primer bias, extraction kit, depth, a lab's contaminant —
+and a tree splitting on it is learning which study it is looking at, which
+earns nothing under a grouped split. A taxon at **ICC ≈ 0** moves as much
+inside a study as across studies.
+
+Writes `<base_dir>/prepared/diagnostics/<set>_icc.tsv`, ranked ICC-descending
+so the study markers are at the top. Two columns matter: `icc` is the
+variance-components estimate and `icc_raw` the plain sum-of-squares ratio.
+Prefer `icc` — a one-sample study can only push the raw ratio up, and with
+every group a singleton the raw ratio reads 1.00 for every taxon while `icc`
+correctly reports nothing.
+
+Like the prevalence filter it is unsupervised: it reads abundances and the
+grouping, never a label. It is always measured on **relative abundance**,
+whatever `transform` is set to — it runs on the long table, before the pivot
+and before `clr`/`presence` — and after the prevalence filter, so it describes
+the taxa that will actually reach the model.
+
+> **`max_icc` defaults to off, and should usually stay off.** Every label in
+> this kind of data carries most of its variance between bioprojects, so a
+> taxon that genuinely predicts the label *must* also vary between studies and
+> will also score a high ICC. Variance structure alone cannot separate batch
+> from signal under that confound. Reading the table and excluding named
+> contaminants is a safer move than a blind threshold.
+
+### Shadow features: a measured noise floor
+
+A shadow is a real feature column with its values shuffled across samples: same
+distribution, same sparsity, same scale, every relationship to the label
+destroyed. Whatever importance it earns is what the model hands out for
+nothing.
+
+```yaml
+features:
+  shadow:
+    enabled: false
+    n: 200        # ~2% of the column count is usually enough
+    seed: 1234    # fixes which columns are copied and how they shuffle
+
+cv:
+  feature_set: [tax_genus, tax_genus_shad]   # both, to compare them
+```
+
+This is the comparison the importance report cannot otherwise make: "the forest
+used 1,155 of 4,260 columns" and "1,155 columns the tree had to split on
+something" look identical without a null.
+
+`<set>_shad` holds **every real column plus** the shadows — the comparison only
+means anything inside one fit — and the clean set is left untouched. A mapping
+of which real column each shadow was copied from goes to
+`<base_dir>/prepared/diagnostics/<set>_shadow_map.tsv`. The feature report
+gains a `shadow_floor.tsv` and a section reading it.
+
+> Because `_shad` is a *superset* of its clean twin, the two are expected to
+> score about the same, and which one edges ahead is fold noise. Matching
+> scores are a sanity check passing, not a finding. The question "did the model
+> lean on the shuffled columns" is answered by importances in
+> `shadow_floor.tsv`, never by the scores.
+
+This is **not** Boruta. Boruta shadows every feature and repeats ~100 forest
+fits with a binomial test per feature; this adds a sample of shadows to one
+ordinary run, which costs almost nothing and calibrates the ranking, but gives
+no per-feature p-value. One caveat travels with any number read off it: with
+`n` shadows against `m` real columns the largest shadow importance is the max
+of `n` draws from the null, not `m`, so counting real features above it
+over-counts when `n < m`. Prefer the reported high quantile, and raise `n` when
+the answer is close.
+
+### Converting an existing dataset
+
+Switching `features.format` does **not** mean rebuilding. The expensive part of
+`prepare` is the pivot, and that is already in the CSVs:
+
+```bash
+pixi run python scripts/convert_features.py <base_dir>/prepared --dry-run
+pixi run python scripts/convert_features.py <base_dir>/prepared
+```
+
+It writes `features/<name>.parquet/` beside each CSV and rewrites
+`manifest.json` to point at it. The manifest is written **last**, so a crash
+part-way leaves a working CSV dataset rather than a half-converted one. The
+CSVs are kept unless you pass `--delete-csv`.
+
+Then re-run the sweep. Because `manifest.json` is now newer than the splits,
+Snakemake redoes `split` (minutes, and deterministic at the same
+`random_state`, so the folds are identical) and then `cv`:
+
+```bash
+pixi run sweep --configfile pipeline.yaml --cores 16 --jobs 10
+```
+
+To keep the existing splits and redo only the CV jobs:
+
+```bash
+pixi run sweep --configfile pipeline.yaml --touch
+pixi run sweep --configfile pipeline.yaml -R cv --cores 16 --jobs 10
+```
+
+`min_prevalence` is the exception: prevalence is counted during the pivot, so
+turning it on needs `-R prepare`. Convert to parquet first and measure — it may
+be enough on its own.
+
 Other levers, in the order worth trying:
 
 | | |
@@ -731,6 +1086,8 @@ Other levers, in the order worth trying:
 | `features.labelled_only: true` | drops unlabelled samples before the pivot |
 | `features.chunk_samples` | lower = flatter memory, more passes |
 | `cv.feature_set` | fewer ranks built *and* fewer trained |
+| `features.format: parquet` | typed and columnar; no Float64 widening on read |
+| `features.min_prevalence` | drops the rare taxa that dominate the column count |
 | `cv.n_jobs` | each worker holds one feature matrix; halving it roughly halves CV peak |
 | `sweep.resources` / `mem_scale` | per-rule request, and what a retry escalates to |
 
@@ -759,7 +1116,10 @@ groupings:
   community membership*); it needs no grouping column.
 - `split.cv.grouping: all` builds a fold scheme for every grouping column;
   `cv.scheme: [random, month, zone]` then limits which schemes are actually
-  trained. `random` is the ungrouped baseline.
+  trained. `random` is the ungrouped baseline. With
+  `split.cv.methods: [kfold, logo]` each grouping yields two schemes,
+  `<grouping>` and `<grouping>_logo` (see *Leave-one-group-out CV*), both
+  nameable in `cv.scheme`.
 - Any name that is not a grouping column fails immediately after the groupings
   are built, before feature engineering, with the list of available columns.
 
@@ -779,6 +1139,210 @@ table instead of merging.
 
 Older configs using `features.create_default_groupings` and `data.groupings`
 still work; they map onto `groupings.defaults` and `groupings.file`.
+
+## Comparing transforms in one sweep
+
+Because a prepared dataset holds one transform, comparing them means one full
+run each into its own `base_dir`. `scripts/sweep_transforms.py` drives that
+loop, derives the feature-set names, and writes one summary across the runs:
+
+```bash
+pixi run python scripts/sweep_transforms.py \
+    --config pipeline.yaml --out out/transform_sweep --cores 24
+```
+
+What is an axis here and what is not:
+
+| | |
+|---|---|
+| `transform` | a real axis — one run per value (default: all three) |
+| `--icc-max 0.9 0.75` | one *extra* run per transform per cutoff |
+| `shadow` | **not** an axis — `<set>_shad` is built beside the clean set and both train in the same run, so it is one flag |
+
+So the grid is `len(transforms) × (1 + len(icc-max))` runs. With no `--icc-max`
+that is three. Note that `icc.enabled: true, max_icc: null` returns the feature
+frame *untouched* — report-only ICC is a diagnostic, not a variant, so it never
+forks the grid.
+
+Each combination gets its own directory holding a derived `config.yaml`, its
+prepared dataset, splits and CV outputs, so nothing collides and any one can be
+rerun alone. `cv.feature_set` is **derived** rather than copied from your
+template, which is the point: the template's value was written for whatever
+transform it had set.
+
+```
+out/transform_sweep/
+  relabund/   config.yaml  prepared/  holdout_*/  cv_sweep_headline.tsv
+  clr/        …
+  presence/   …
+  summary/    SUMMARY.txt  headline.tsv  all_models.tsv  combo_status.tsv
+```
+
+`summary/SUMMARY.txt` is the one file to read — one block per label, the
+combinations ranked, the winner starred. A combination that fails does not stop
+the sweep or poison the summary: it is absent from the tables and named with
+its exit code.
+
+Useful flags: `--dry-run` writes every `config.yaml` and prints the commands
+without running anything; `--summary-only` re-reads what is on disk and
+rewrites the summary; `--stop-on-error` abandons the sweep at the first
+failure; `--extra` passes everything after it to the runner (must be last).
+
+### Sending a transform sweep to a cluster
+
+Two ways. Let Snakemake submit each rule, with the driver on the login node:
+
+```bash
+nohup pixi run python scripts/sweep_transforms.py --config pipeline.yaml --out out/transform_sweep --extra --executor cluster-generic --cluster-generic-submit-cmd "mqsub -t {threads} -m 64 --hours 12 --" --jobs 20 > sweep.log 2>&1 &
+```
+
+The driver drops its own `--cores` when `--extra` sets `--jobs`, and `--extra`
+reaches `subprocess` as a list, so a quoted submit command stays one argument.
+
+Or submit each combination as its own job, which is the only way to get
+combination-level parallelism — the driver's own loop is serial:
+
+```bash
+pixi run python scripts/sweep_transforms.py --config pipeline.yaml --out out/transform_sweep --dry-run
+for d in out/transform_sweep/*/; do mqsub -t 24 -m 64 --hours 24 -- pixi run snakemake -s workflow/Snakefile --configfile "$d/config.yaml" --cores 24; done
+pixi run python scripts/sweep_transforms.py --config pipeline.yaml --out out/transform_sweep --summary-only
+```
+
+### Plotting a transform sweep
+
+```bash
+pixi run python scripts/plot_transform_sweep.py \
+    --summary out/transform_sweep/summary --formats png svg
+```
+
+One figure per label — they do not share a useful y axis, and putting them in
+one panel hides the comparison inside each. Three panels, left to right:
+
+- **(a) which CV scheme** — pooled R² for every scheme at full range. Drawn
+  first and unzoomed because it is usually the largest effect in the table by
+  an order of magnitude. A scheme that leaves the same studies on both sides of
+  a fold scores well; one that does not can go deeply negative. No transform
+  rescues that, so reading (b) without (a) is how a sweep gets misread.
+- **(b) which transform** — the same scores zoomed to the best-scoring scheme,
+  each transform's clean set beside its `_shad` set.
+- **(c) how stable** — per-fold R², one dot per fold, with the median and the
+  pooled score marked. A pooled 0.74 built from folds spanning 0.07 to 0.92 is
+  a different claim from twelve folds at 0.74.
+
+## Scoring the fit on the whole training pool
+
+Every CV number comes from a model trained on k−1 folds. The model you would
+actually ship is trained on *all* of the training pool — the CV stage already
+fits it, and until now only read feature importances off it.
+
+```yaml
+final_fit:
+  enabled: false
+  oob: true      # out-of-bag R2; random-forest only
+  top_n: 20
+```
+
+Writes `<base_dir>/final_fit/full_fit_metrics.csv`, one row per label × scheme,
+plus `full_fit_importances.csv`. **No model is retrained** — this scores the
+fit that already happens, and the out-of-bag score is requested *before* that
+fit so it rides along instead of costing a refit. The only extra work is one
+`predict` per combination.
+
+| column | what it is |
+|---|---|
+| `cv_pooled_r2` | the held-out score you already have |
+| `in_sample_r2` | the fit scored on its own training rows — a **ceiling**, not an estimate. A random forest lands near 1.0 on almost anything |
+| `oob_r2` | out-of-bag: each row scored by the trees that did not draw it. Empty for XGBoost, and for a forest with `bootstrap=False` |
+| `overfit_gap` | `in_sample_r2 − cv_pooled_r2` — how much of the fit is memorisation |
+
+> **Read `oob_r2` like a random split.** Bootstrap samples rows, not groups, so
+> a row's own study is almost always represented among the trees scoring it.
+> Where study identity predicts the label, OOB will look like the `random`
+> scheme and far better than `bioproject_logo`. It says the fit converged, not
+> that it transfers to a new study.
+
+This is independent of `holdout_evaluation`: it describes the training fit, not
+the test set, so it still runs with the holdout stage switched off.
+
+## Feature report and recursive pruning
+
+### The report (cheap, on by default)
+
+One extra Snakemake rule at the end of a sweep, reading CV exports that already
+exist — no model is refitted or unpickled, so it costs seconds.
+
+```yaml
+feature_report:
+  enabled: true
+  coverage: [0.5, 0.9, 0.95]   # shares of total importance, one column each
+  top: 25                      # features printed per combination
+```
+
+Writes `<base_dir>/feature_report/`:
+
+| file | holds |
+|---|---|
+| `rank_comparison.tsv` | pooled R² per rank, coarse → fine, so you can see whether genus beats order |
+| `importance_concentration.tsv` | how many features carry each share of the total importance, and how many the model never split on |
+| `importance_kept_taxa.tsv` | those features named, with cumulative share, for the largest `coverage` |
+| `shadow_floor.tsv` | the noise floor, when the run had shadow sets |
+| `feature_report.txt` | all of it, readable |
+
+Run it alone against any finished output directory:
+
+```bash
+pixi run python scripts/rank_feature_report.py --root out/pipeline
+```
+
+Two columns people ask about: **`n_zero`** is how many features came back with
+importance exactly zero — the model never split on them. **`n_for_95pct`** is
+the smallest number of features carrying 95 % of the total importance. Both are
+about *split work*, not contribution to R²: tree importance is impurity
+reduction, so a feature can be heavily used and still not help the score.
+Shadow columns are excluded from these statistics, so the numbers stay
+comparable with a shadow-free run.
+
+### Recursive pruning (costs real compute, off by default)
+
+Each round runs CV, drops features by the chosen criterion, and runs the same
+CV again on what is left. It stops early when a round drops nothing.
+
+```yaml
+feature_pruning:
+  enabled: false
+  iterations: 1        # rounds after the baseline; 0 = baseline only
+  prune: zero          # zero | coverage
+  coverage: 0.95       # only read under `prune: coverage`
+  min_features: 10     # a round never leaves fewer than this
+```
+
+`zero` keeps every feature with importance above zero — it drops only what the
+model never split on, and settles after a round or two. `coverage` keeps the
+smallest set reaching that share of total importance; it is far more aggressive,
+it *does* drop features the model used, and because it takes a fraction of
+whatever is left each round it keeps shrinking until `min_features` stops it.
+Set that on purpose.
+
+It runs against a prepared dataset and one label x scheme, not the whole
+config, so `--dataset`, `--splits`, `--out`, `--label` and `--scheme` are all
+required; `--config` only supplies the defaults above.
+
+```bash
+pixi run python scripts/prune_iterate_cv.py --dataset out/pipeline/prepared --splits out/pipeline/holdout_bioproject/splits --label ph --scheme bioproject_logo --out out/prune_ph --config pipeline.yaml --iterations 5
+```
+
+```bash
+pixi run python scripts/plot_prune_history.py --history out/prune_ph/prune_history.tsv --out out/prune_ph/figures
+```
+
+`--iterations` on the command line overrides `enabled` either way. The plot
+draws score against features retained, log-scaled and inverted so reading left
+to right follows the pruning; pass several `prune_history.tsv` files and they
+overlay, which is how you compare criteria.
+
+> Scores along a pruning trajectory come from the folds the pruning was derived
+> from, so the figure says how much is *droppable*, not that a pruned model is
+> better. Confirm on the holdout.
 
 ## Feature Engineering Examples
 
@@ -1337,13 +1901,22 @@ pixi run pre-commit run --all-files
 | Path | |
 |---|---|
 | `src/microbiome_ml/wrangle/` | `Dataset`, metadata/profiles/features components, splitting |
+| `src/microbiome_ml/wrangle/icc.py` | per-taxon intraclass correlation against a grouping |
+| `src/microbiome_ml/wrangle/shadow.py` | shuffled shadow columns and the noise floor they measure |
 | `src/microbiome_ml/train/` | `CrossValidator`, `ModelTrainer`, `CV_Result`, `SHAPAnalyser` |
+| `src/microbiome_ml/train/full_fit.py` | diagnostics for the model fitted on the whole training pool |
 | `src/microbiome_ml/visualise/` | `Visualiser` |
 | `scripts/run_cv_to_final_eval.py` | the whole pipeline in one process, driven by the YAML |
 | `scripts/run_holdout_sweep.py` | the same pipeline once per holdout grouping, serially |
 | `scripts/pipeline_steps.py` | the pipeline split into `prepare` / `split` / `cv` / `collate` / `split_report` CLI steps |
 | `scripts/sweep_tokens.py` | token parsing (`random`, `<column>`, `taxon:<rank>`), dependency-free so the Snakefile can import it without pulling in the package |
 | `scripts/check_holdout_metadata.py` | holdout groupings from a metadata table alone |
+| `scripts/sweep_transforms.py` | one full run per transform into its own directory, then one summary across them |
+| `scripts/plot_transform_sweep.py` | one figure per label from a transform sweep |
+| `scripts/rank_feature_report.py` | rank comparison, importance concentration and the shadow floor, from finished CV exports |
+| `scripts/prune_iterate_cv.py` | the prune/re-run loop |
+| `scripts/plot_prune_history.py` | score against features retained, one line per pruning criterion |
+| `scripts/convert_features.py` | CSV feature tables to parquet, in place, without rebuilding |
 | `scripts/pipeline.example.yaml` | annotated config — every key, with what it does |
 | `workflow/Snakefile` | the parallel sweep |
 | `test/tests/` | pytest suite (excluded from type checking) |

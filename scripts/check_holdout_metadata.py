@@ -175,6 +175,7 @@ def run_check(
             vis_cfg,
             run_dir / "split_visualisations",
             holdout_grouping=token,
+            stack_by=grouping,
         )
 
     steps.collate_split_report(out_dir)

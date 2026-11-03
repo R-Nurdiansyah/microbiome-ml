@@ -18,6 +18,23 @@ from microbiome_ml.utils.taxonomy import TaxonomicRanks
 ERR_FEATURESET_NAME_UNDEFINED = "FeatureSet name must be defined"
 
 
+def is_parquet(path: Union[str, Path]) -> bool:
+    """True when *path* is a parquet file or a directory of parquet parts.
+
+    A wide table is written as a directory of row-group parts, because the
+    pivot that builds it only ever holds a chunk of samples at a time and
+    parquet cannot be appended to in place without pyarrow.
+    """
+    p = Path(path)
+    return p.suffix == ".parquet" or (p.is_dir() and any(p.glob("*.parquet")))
+
+
+def parquet_source(path: Union[str, Path]) -> Any:
+    """What to hand ``pl.scan_parquet`` for *path*."""
+    p = Path(path)
+    return str(p / "*.parquet") if p.is_dir() else p
+
+
 class FeatureSet(ABC):
     """Abstract base class for feature sets.
 
@@ -144,21 +161,28 @@ class FeatureSet(ABC):
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.tmp")
         try:
+            parquet = path.suffix == ".parquet"
             frame = getattr(self, "features", None)
             wrote = False
             if isinstance(frame, pl.LazyFrame):
                 try:
-                    frame.sink_csv(tmp)
+                    if parquet:
+                        frame.sink_parquet(tmp)
+                    else:
+                        frame.sink_csv(tmp)
                     wrote = True
                 except Exception as exc:  # plan not streamable here
                     logging.debug(
-                        "sink_csv unavailable for %s (%s); collecting "
-                        "instead",
+                        "sink unavailable for %s (%s); collecting instead",
                         getattr(self, "name", path.name),
                         exc,
                     )
             if not wrote:
-                self.collect().write_csv(tmp)
+                df = self.collect()
+                if parquet:
+                    df.write_parquet(tmp)
+                else:
+                    df.write_csv(tmp)
             os.replace(tmp, path)
         finally:
             if tmp.exists():
@@ -217,6 +241,11 @@ class SampleFeatureSet(FeatureSet):
         # Set by `scan`: where this feature set reads from, so Dataset.save
         # can tell when a write would land on its own source file.
         self.source_path: Optional[Path] = None
+
+        # A derived set (a shadow set, say) has no source file to read a
+        # format from, so whoever built it records the suffix to save
+        # under here. None = let Dataset.save pick its default.
+        self.preferred_suffix: Optional[str] = None
 
     @property
     def features(self) -> pl.LazyFrame:
@@ -283,7 +312,12 @@ class SampleFeatureSet(FeatureSet):
             SampleFeatureSet instance (lazy-loaded)
         """
         acc_column = kwargs.get("acc_column")
-        lf = pl.scan_csv(path)
+        parquet = is_parquet(path)
+        lf = (
+            pl.scan_parquet(parquet_source(path))
+            if parquet
+            else pl.scan_csv(path)
+        )
         schema = lf.collect_schema()
 
         # Auto-detect accession column
@@ -297,30 +331,28 @@ class SampleFeatureSet(FeatureSet):
                     "No accession column found. Expected 'sample' or 'acc' column, or specify acc_column"
                 )
 
-        # Extract accessions (requires collecting just that column)
-        accessions = lf.select(acc_column).collect().to_series().to_list()
         feature_names = [col for col in schema.names() if col != acc_column]
 
-        # Feature values are numeric. CSV type inference only reads the first
-        # rows, so a column that is empty there -- a taxon absent from the
-        # first samples, or absent everywhere -- comes back as String and
-        # breaks arithmetic and comparisons downstream. Cast lazily so a
-        # reloaded FeatureSet has the same dtypes as the in-memory one.
-        non_numeric = [
-            col for col in feature_names if not schema[col].is_numeric()
-        ]
-        if non_numeric:
-            logging.debug(
-                "%s: casting %d non-numeric feature column(s) to Float64",
-                name,
-                len(non_numeric),
+        # Feature values are numeric, and Float32 is what the models use.
+        # Parquet carries its own dtypes, so only CSV needs help: text has
+        # no dtype, so polars infers Float64 (8 bytes for every zero in a
+        # 99%-sparse table) and infers String for any column that is empty
+        # in the inference window. Declaring the schema up front makes the
+        # parser emit Float32 directly instead of widening then casting.
+        if not parquet and feature_names:
+            lf = pl.scan_csv(
+                path,
+                schema_overrides={c: pl.Float32 for c in feature_names},
             )
-            lf = lf.with_columns(
-                [
-                    pl.col(col).cast(pl.Float64, strict=False)
-                    for col in non_numeric
-                ]
-            )
+        elif parquet:
+            wide = [c for c in feature_names if schema[c] != pl.Float32]
+            if wide:
+                lf = lf.with_columns(
+                    pl.col(wide).cast(pl.Float32, strict=False)
+                )
+
+        # Extract accessions (requires collecting just that column)
+        accessions = lf.select(acc_column).collect().to_series().to_list()
 
         obj = cls(
             accessions=accessions,

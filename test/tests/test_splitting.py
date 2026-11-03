@@ -3,8 +3,10 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
+from sklearn.model_selection import LeaveOneGroupOut
 
 from microbiome_ml.wrangle.dataset import Dataset
+from microbiome_ml.wrangle.splits import SplitManager
 
 
 @pytest.fixture
@@ -560,9 +562,11 @@ def test_feature_set_reload_casts_sparse_columns(tmp_path):
 
     # Plain scan_csv infers String for this column (its inference window is
     # all empty); not asserted here, as that is polars behaviour, not ours.
+    # scan declares the feature schema as Float32, so the parser never
+    # widens a 99%-sparse table to 8 bytes a cell and then casts back.
     loaded = SampleFeatureSet.load(path, name="tax_family").to_df()
-    assert loaded["f__sparse"].dtype == pl.Float64
-    assert loaded["f__dense"].dtype == pl.Float64
+    assert loaded["f__sparse"].dtype == pl.Float32
+    assert loaded["f__dense"].dtype == pl.Float32
     # the real values survived the cast
     assert loaded["f__sparse"].sum() == pytest.approx(0.5 * (n - 120))
     # and a comparison against a float no longer raises
@@ -700,3 +704,214 @@ def test_sweep_pairs_list_expands_to_one_run_each():
     ]
     # distinct directories, so adding a grouping later never overwrites
     assert len(set(runs)) == len(runs)
+
+
+# ---------------------------------------------------------------------------
+# Leave-one-group-out CV (split.cv.methods: [kfold, logo])
+# ---------------------------------------------------------------------------
+def _logo_frame(groups):
+    """{sample, y, grp} with one row per entry of *groups*."""
+    return pl.DataFrame(
+        {
+            "sample": [f"s{i:02d}" for i in range(len(groups))],
+            "y": [float(i) for i in range(len(groups))],
+            "grp": list(groups),
+        }
+    )
+
+
+def _logo_dataset(groups=("a", "a", "b", "b", "c", "c")):
+    frame = _logo_frame(groups)
+    ds = Dataset()
+    ds.add_labels(frame.select(["sample", "y"]))
+    ds.add_groupings(frame.select(["sample", "grp"]))
+    return ds
+
+
+def test_logo_gives_each_group_its_own_fold():
+    groups = ["a", "a", "b", "b", "c", "c"]
+    sm = SplitManager("y")
+    sm.create_cv_folds(
+        data=_logo_frame(groups),
+        grouping="grp",
+        scheme_name="grp_logo",
+        method="logo",
+    )
+
+    cv = sm.cv_schemes["grp_logo"]
+    assert cv.height == len(groups)
+    assert sorted(set(cv["fold"].to_list())) == [0, 1, 2]
+    # every group sits wholly inside one fold -- that is the point
+    per_group = (
+        cv.join(_logo_frame(groups), on="sample")
+        .group_by("grp")
+        .agg(pl.col("fold").n_unique().alias("n"))
+    )
+    assert per_group["n"].to_list() == [1, 1, 1]
+
+
+def test_logo_matches_sklearn_leave_one_group_out():
+    """The fold table must reproduce LeaveOneGroupOut exactly."""
+    groups = ["a", "a", "b", "b", "c", "c", "c"]
+    sm = SplitManager("y")
+    sm.create_cv_folds(
+        data=_logo_frame(groups),
+        grouping="grp",
+        scheme_name="s",
+        method="logo",
+    )
+    fold = np.asarray(sm.cv_schemes["s"]["fold"].to_list())
+
+    ours = sorted(
+        sorted(np.flatnonzero(fold == f).tolist()) for f in set(fold.tolist())
+    )
+    theirs = sorted(
+        sorted(test.tolist())
+        for _, test in LeaveOneGroupOut().split(
+            np.zeros((len(groups), 1)), groups=groups
+        )
+    )
+    assert ours == theirs
+
+
+def test_logo_parks_single_sample_groups_in_training():
+    """A one-sample group gets fold -1 rather than a fold of its own.
+
+    R2 is undefined on one point and CrossValidator drops any scheme
+    holding a one-sample fold, so without this a single singleton group
+    would throw away the whole scheme.
+    """
+    sm = SplitManager("y")
+    sm.create_cv_folds(
+        data=_logo_frame(["a", "a", "b", "b", "lonely"]),
+        grouping="grp",
+        scheme_name="s",
+        method="logo",
+    )
+
+    cv = sm.cv_schemes["s"]
+    assert cv.height == 5, "the singleton stays in the table"
+    folds = dict(zip(cv["sample"].to_list(), cv["fold"].to_list()))
+    assert folds["s04"] == -1
+    assert sorted({f for f in folds.values() if f >= 0}) == [0, 1]
+
+
+def test_logo_needs_two_usable_groups():
+    sm = SplitManager("y")
+    sm.create_cv_folds(
+        data=_logo_frame(["a", "a", "b"]),  # only 'a' has 2+ samples
+        grouping="grp",
+        scheme_name="s",
+        method="logo",
+    )
+    assert "s" not in sm.cv_schemes
+
+
+def test_logo_refuses_too_many_groups():
+    sm = SplitManager("y")
+    sm.create_cv_folds(
+        data=_logo_frame([g for g in "abcdef" for _ in range(2)]),
+        grouping="grp",
+        scheme_name="s",
+        method="logo",
+        max_groups=3,
+    )
+    assert "s" not in sm.cv_schemes
+
+
+def test_logo_without_grouping_is_skipped():
+    sm = SplitManager("y")
+    sm.create_cv_folds(
+        data=_logo_frame(["a", "a", "b", "b"]),
+        grouping=None,
+        scheme_name="random_logo",
+        method="logo",
+    )
+    assert "random_logo" not in sm.cv_schemes
+
+
+def test_unknown_cv_method_raises():
+    sm = SplitManager("y")
+    with pytest.raises(ValueError, match="kfold"):
+        sm.create_cv_folds(
+            data=_logo_frame(["a", "a"]), grouping="grp", method="bogus"
+        )
+
+
+def test_dataset_methods_both_builds_kfold_and_logo():
+    ds = _logo_dataset()
+    ds.create_cv_folds(
+        n_folds=2, grouping="all", methods=["kfold", "logo"], force=True
+    )
+
+    schemes = set(ds.splits["y"].cv_schemes)
+    assert "random" in schemes  # kfold, ungrouped baseline
+    assert "grp" in schemes  # kfold, grouped
+    assert "grp_logo" in schemes  # leave-one-group-out
+    assert "random_logo" not in schemes  # LOGO needs a grouping column
+
+
+def test_dataset_methods_logo_only():
+    ds = _logo_dataset()
+    ds.create_cv_folds(n_folds=2, grouping="grp", methods="logo", force=True)
+    assert set(ds.splits["y"].cv_schemes) == {"grp_logo"}
+
+
+def test_dataset_defaults_to_kfold_only():
+    ds = _logo_dataset()
+    ds.create_cv_folds(n_folds=2, grouping="grp", force=True)
+    assert set(ds.splits["y"].cv_schemes) == {"grp"}
+
+
+def test_dataset_rejects_unknown_method():
+    ds = _logo_dataset()
+    with pytest.raises(ValueError, match="Unknown CV method"):
+        ds.create_cv_folds(methods=["kfold", "loo"])
+
+
+def test_feature_set_naming_round_trips():
+    """A build suffix must not hide which rank a set holds.
+
+    Two places parse the rank back out of the name: the taxon holdout
+    (_rank_feature_set) and build_dataset, which uses cv.feature_set to
+    decide which ranks to build at all. Both broke on tax_genus_clr.
+    """
+    from microbiome_ml.wrangle.dataset import (
+        feature_set_name,
+        rank_from_feature_set,
+    )
+
+    cases = {
+        ("relabund", None): "tax_genus",
+        ("clr", None): "tax_genus_clr",
+        ("presence", None): "tax_genus_pa",
+        ("relabund", "bioproject"): "tax_genus_bio",
+        ("clr", "bioproject"): "tax_genus_clr_bio",
+        ("presence", "bioproject"): "tax_genus_pa_bio",
+        # an alias must land on the same name as the canonical spelling
+        ("pa", None): "tax_genus_pa",
+    }
+    for (transform, by), expected in cases.items():
+        name = feature_set_name("tax", "genus", transform, by)
+        assert name == expected
+        assert rank_from_feature_set(name) == "genus"
+
+    # A shadow set is named by add_shadow_features, not feature_set_name,
+    # but the rank still has to survive the extra suffix.
+    assert rank_from_feature_set("tax_genus_shad") == "genus"
+    assert rank_from_feature_set("tax_genus_clr_shad") == "genus"
+    assert rank_from_feature_set("tax_genus_pa_bio_shad") == "genus"
+
+    assert rank_from_feature_set("pathway_features_mean") is None
+
+
+def test_taxon_holdout_finds_a_suffixed_feature_set(taxon_dataset):
+    """create_taxon_holdout_split must still locate a CLR set."""
+    ds = taxon_dataset
+    original = next(iter(ds.feature_sets))
+    ds.feature_sets[f"{original}_clr"] = ds.feature_sets.pop(original)
+
+    from microbiome_ml.utils.taxonomy import TaxonomicRanks
+
+    found = ds._rank_feature_set(TaxonomicRanks.FAMILY)
+    assert found == f"{original}_clr"

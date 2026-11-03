@@ -7,7 +7,7 @@ import pytest
 from sklearn.ensemble import RandomForestRegressor
 
 from microbiome_ml.train.results import CV_Result, HoldoutEvaluation
-from microbiome_ml.visualise.visualisations import Visualiser
+from microbiome_ml.visualise.visualisations import Visualiser, _fmt_r2
 
 matplotlib.use("Agg")
 
@@ -309,3 +309,82 @@ def test_plot_holdout_distribution_multiple_stats(tmp_path):
 
     with pytest.raises(ValueError, match="at least one statistic"):
         vis.plot_holdout_distribution(df, stat=[], output="none")
+
+
+def test_fmt_r2_switches_to_thousands_separated_integers():
+    """A blown-up leave-one-group-out fold must stay readable."""
+    assert _fmt_r2(0.068) == "0.068"
+    assert _fmt_r2(-0.5) == "-0.500"
+    assert _fmt_r2(-838149.7527739108) == "-838,150"
+    assert _fmt_r2(float("nan")) == "n/a"
+
+
+def test_plot_cv_bars_clamps_an_off_scale_fold(tmp_path):
+    """One fold at -838,150 must not flatten the rest onto the baseline."""
+    ndjson = tmp_path / "results.ndjson"
+    _write_records(
+        ndjson,
+        [
+            {
+                "feature_set": "tax_genus",
+                "label": "geo_temperature",
+                "scheme": "bioproject_logo",
+                "model": "RandomForestRegressor",
+                "validation_r2_per_fold": [-838149.75, 0.068, -1.51, 0.0],
+                "avg_validation_r2": -33302.54,
+            }
+        ],
+    )
+    out = tmp_path / "plots"
+    Visualiser(out=tmp_path / "figs").plot_cv_bars(results=ndjson, out_dir=out)
+    assert list(out.glob("*.png"))
+
+
+def test_plot_cv_bars_uses_pooled_and_skips_unevaluable_folds(tmp_path):
+    """The reference line is pooled R2, and an SST=0 fold is not a score.
+
+    scikit-learn reports 0.0 for a fold whose held-out group has a
+    constant label. Drawn as a normal bar it reads as a real, mediocre
+    result; pooled R2 excludes it, so the chart must too.
+    """
+    ndjson = tmp_path / "results.ndjson"
+    _write_records(
+        ndjson,
+        [
+            {
+                "feature_set": "tax_order",
+                "label": "geo_ph",
+                "scheme": "biome_logo",
+                "model": "XGBRegressor",
+                "validation_r2_per_fold": [0.52, 0.0, 0.47, 0.61],
+                "validation_sst_per_fold": [80.0, 0.0, 95.0, 110.0],
+                "avg_validation_r2": 0.4,
+                "pooled_validation_r2": 0.507,
+                "avg_validation_mse": 2.1,
+            }
+        ],
+    )
+    out = tmp_path / "plots"
+    Visualiser(out=tmp_path / "figs").plot_cv_bars(results=ndjson, out_dir=out)
+    assert list(out.glob("*.png"))
+
+
+def test_plot_cv_bars_falls_back_to_the_mean_for_older_runs(tmp_path):
+    """A record written before pooled existed still plots."""
+    ndjson = tmp_path / "old.ndjson"
+    _write_records(
+        ndjson,
+        [
+            {
+                "feature_set": "tax_order",
+                "label": "ph",
+                "scheme": "random",
+                "model": "RandomForestRegressor",
+                "validation_r2_per_fold": [0.4, 0.5, 0.6],
+                "avg_validation_r2": 0.5,
+            }
+        ],
+    )
+    out = tmp_path / "plots"
+    Visualiser(out=tmp_path / "figs").plot_cv_bars(results=ndjson, out_dir=out)
+    assert list(out.glob("*.png"))

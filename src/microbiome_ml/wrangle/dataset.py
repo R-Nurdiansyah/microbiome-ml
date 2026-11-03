@@ -24,7 +24,11 @@ from microbiome_ml.wrangle.features import (
     SpeciesFeatureSet,
 )
 from microbiome_ml.wrangle.metadata import SampleMetadata
-from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+from microbiome_ml.wrangle.profiles import (
+    TaxonomicProfiles,
+    canonical_transform,
+)
+from microbiome_ml.wrangle.shadow import SHADOW_SUFFIX, add_shadow_columns
 from microbiome_ml.wrangle.splits import SplitManager
 
 logger = logging.getLogger(__name__)
@@ -49,6 +53,46 @@ def _as_rank(rank: Union[str, TaxonomicRanks]) -> TaxonomicRanks:
             f"Invalid taxonomic rank {rank!r}; use a name like 'family' or "
             "a prefix like 'f__'"
         )
+
+
+# Suffixes a feature set name can carry after its rank, in this order.
+# They record how the table was built so several variants can live side
+# by side in one dataset: tax_genus, tax_genus_clr, tax_genus_pa_bio.
+FEATURE_SUFFIXES = ("clr", "pa", "bio", SHADOW_SUFFIX)
+
+# One entry per canonical transform in wrangle/profiles.TRANSFORMS; a
+# transform added there without a suffix here raises a KeyError below
+# rather than silently naming two different tables the same thing.
+_TRANSFORM_SUFFIX = {"relabund": "", "clr": "_clr", "presence": "_pa"}
+
+
+def feature_set_name(
+    prefix: str,
+    rank: str,
+    transform: str = "relabund",
+    prevalence_by: Optional[str] = None,
+) -> str:
+    """`tax_genus`, `tax_genus_clr`, `tax_genus_pa`, `tax_genus_clr_bio`."""
+    name = (
+        f"{prefix}_{rank}{_TRANSFORM_SUFFIX[canonical_transform(transform)]}"
+    )
+    if prevalence_by:
+        name += "_bio"
+    return name
+
+
+def rank_from_feature_set(name: str, prefix: str = "tax") -> Optional[str]:
+    """The rank in a feature set name, ignoring any build suffixes.
+
+    `tax_genus_clr_bio` -> `genus`. Returns None for a name that does not
+    look like one of ours, so callers can skip it rather than guess.
+    """
+    if not name.startswith(f"{prefix}_"):
+        return None
+    parts = name[len(prefix) + 1 :].split("_")
+    while parts and parts[-1] in FEATURE_SUFFIXES:
+        parts.pop()
+    return "_".join(parts) or None
 
 
 class Dataset:
@@ -1062,6 +1106,26 @@ class Dataset:
         )
         return self
 
+    def _grouping_pairs(self, column: str, setting: str) -> pl.DataFrame:
+        """`{sample, column}` for a configured grouping column, or raise.
+
+        Checked here rather than deep in the feature build so a typo in
+        the config fails before the pivot, not hours into it.
+        """
+        groupings = self.groupings
+        available = (
+            [c for c in groupings.columns if c != "sample"]
+            if groupings is not None
+            else []
+        )
+        if groupings is None or column not in available:
+            raise ValueError(
+                f"{setting}='{column}' is not a grouping column. "
+                f"Available: {sorted(available)}. Add it under "
+                "groupings.columns."
+            )
+        return groupings.select(["sample", column]).drop_nulls()
+
     def add_taxonomic_features(
         self,
         ranks: Optional[List[Union[str, TaxonomicRanks]]] = None,
@@ -1070,6 +1134,15 @@ class Dataset:
         stream_dir: Optional[Union[str, Path]] = None,
         chunk_samples: int = 5000,
         labelled_only: bool = False,
+        file_format: str = "csv",
+        min_prevalence: Optional[float] = None,
+        transform: str = "relabund",
+        clr_pseudocount: float = 1e-6,
+        presence_threshold: float = 0.0,
+        prevalence_by: Optional[str] = None,
+        icc_by: Optional[str] = None,
+        max_icc: Optional[float] = None,
+        icc_report_dir: Optional[Union[str, Path]] = None,
     ) -> "Dataset":
         """Generate FeatureSets from TaxonomicProfiles at specified ranks.
 
@@ -1085,6 +1158,30 @@ class Dataset:
             labelled_only: Build features only for samples that have a
                 non-null value for at least one label. Nothing downstream
                 uses an unlabelled sample's features.
+            file_format: ``"csv"`` (default) or ``"parquet"`` for the
+                streamed tables. Parquet keeps its dtypes, so a reload
+                does not widen every zero to 8 bytes, and it compresses a
+                sparse table to a fraction of the CSV.
+            min_prevalence: Drop taxa present in fewer than this fraction
+                of samples (0.01 = 1%). None keeps every taxon.
+            transform: ``"relabund"`` (default), ``"clr"`` or
+                ``"presence"``. Each gets its own name suffix
+                (``_clr``, ``_pa``), so a transformed set sits beside the
+                untransformed one rather than replacing it.
+            clr_pseudocount: Added before the log; only used for ``clr``.
+            presence_threshold: Relative abundance a taxon must exceed to
+                count as present; only used for ``presence``.
+            prevalence_by: Count prevalence across the distinct values of
+                this grouping column (e.g. ``bioproject``) instead of
+                across samples. Names the set ``..._bio``. None = count
+                samples, the old behaviour.
+            icc_by: Grouping column to compute each taxon's intraclass
+                correlation against (e.g. ``bioproject``). Required by
+                ``max_icc`` and ``icc_report_dir``.
+            max_icc: Drop taxa whose ICC exceeds this. None = keep all.
+            icc_report_dir: Write ``<feature set>_icc.tsv`` here, ranked
+                by ICC. Works with ``max_icc`` unset, which is the
+                intended first use.
             all: If True, run all standard ranks (phylum to species), ignoring
                  the ``ranks`` argument. Defaults to False.
 
@@ -1157,10 +1254,41 @@ class Dataset:
                 )
 
         # Generate feature sets for each requested rank
+        fmt = str(file_format).strip().lower().lstrip(".")
+        if fmt not in ("csv", "parquet"):
+            raise ValueError(
+                f"file_format must be 'csv' or 'parquet', got {fmt!r}"
+            )
+
+        # Prevalence counted by group needs the group of each sample, and
+        # only the Dataset has the groupings table.
+        prevalence_groups = None
+        if prevalence_by:
+            prevalence_groups = self._grouping_pairs(
+                prevalence_by, "features.prevalence_by"
+            )
+            if not min_prevalence:
+                logger.warning(
+                    "features.prevalence_by='%s' has no effect without "
+                    "features.min_prevalence",
+                    prevalence_by,
+                )
+
+        icc_groups = None
+        if icc_by:
+            icc_groups = self._grouping_pairs(icc_by, "features.icc.group")
+        elif max_icc is not None or icc_report_dir is not None:
+            raise ValueError(
+                "features.icc needs a group column: set features.icc."
+                "group (e.g. bioproject)"
+            )
+
         for rank in ranks_list:
-            feature_name = f"{prefix}_{rank.name.lower()}"
+            feature_name = feature_set_name(
+                prefix, rank.name.lower(), transform, prevalence_by
+            )
             stream_path = (
-                Path(stream_dir) / f"{feature_name}.csv"
+                Path(stream_dir) / f"{feature_name}.{fmt}"
                 if stream_dir is not None
                 else None
             )
@@ -1169,6 +1297,18 @@ class Dataset:
                 stream_path=stream_path,
                 chunk_samples=chunk_samples,
                 samples=keep_samples,
+                min_prevalence=min_prevalence,
+                transform=transform,
+                clr_pseudocount=clr_pseudocount,
+                presence_threshold=presence_threshold,
+                prevalence_groups=prevalence_groups,
+                icc_groups=icc_groups,
+                max_icc=max_icc,
+                icc_report=(
+                    Path(icc_report_dir) / f"{feature_name}_icc.tsv"
+                    if icc_report_dir is not None
+                    else None
+                ),
             )
 
             if not feature_set.feature_names:
@@ -1199,6 +1339,104 @@ class Dataset:
 
         self._sync_accessions()
         logger.info("Added taxonomic feature sets for ranks: %s", added_ranks)
+        return self
+
+    def add_shadow_features(
+        self,
+        sources: Optional[List[str]] = None,
+        n_shadow: int = 200,
+        seed: int = 0,
+        mapping_dir: Optional[Union[str, Path]] = None,
+    ) -> "Dataset":
+        """Add a shadow-augmented copy of each named feature set.
+
+        A shadow column is a real column shuffled across samples: same
+        values, same sparsity, no relationship to any label. Including a
+        sample of them in a run gives the importance table a measured
+        noise floor, which is the one thing it currently lacks -- see
+        wrangle/shadow.py.
+
+        The clean set is left untouched; the augmented one is registered
+        as ``<source>_shad`` and holds every real column *plus* the
+        shadows, because the comparison only means anything within a
+        single fit. Name it in ``cv.feature_set`` to use it.
+
+        Args:
+            sources: Feature sets to shadow. None takes every set that is
+                not already a shadow set.
+            n_shadow: How many shadow columns to add per set.
+            seed: Fixes which columns are copied and how they shuffle.
+            mapping_dir: Write ``<name>_shadow_map.tsv`` here, recording
+                which real column each shadow was copied from.
+
+        Returns:
+            Self for chaining.
+        """
+        if sources is None:
+            sources = [
+                name
+                for name in self.feature_sets
+                if not name.endswith(f"_{SHADOW_SUFFIX}")
+            ]
+        added = []
+        for source in sources:
+            if source not in self.feature_sets:
+                logger.warning(
+                    "Cannot shadow '%s': no such feature set. Available: "
+                    "%s",
+                    source,
+                    sorted(self.feature_sets),
+                )
+                continue
+            original = self.feature_sets[source]
+            frame = getattr(original, "features", None)
+            if not isinstance(frame, pl.LazyFrame):
+                frame = original.to_df().lazy()
+            schema = frame.collect_schema().names()
+            acc_col = next((c for c in ("sample", "acc") if c in schema), None)
+            if acc_col is None:
+                logger.warning(
+                    "Cannot shadow '%s': no 'sample' or 'acc' column",
+                    source,
+                )
+                continue
+
+            name = f"{source}_{SHADOW_SUFFIX}"
+            augmented, mapping = add_shadow_columns(
+                frame,
+                acc_col,
+                [c for c in schema if c != acc_col],
+                n_shadow=n_shadow,
+                seed=seed,
+            )
+            if not mapping:
+                logger.warning("No shadows added for '%s'; skipped", source)
+                continue
+            shadow_set = SampleFeatureSet.from_lf(augmented, name=name)
+            # Derived, so there is no source file for Dataset.save to take
+            # a format from; follow whatever the set we copied uses.
+            source_path = getattr(original, "source_path", None)
+            shadow_set.preferred_suffix = (
+                Path(source_path).suffix if source_path else None
+            )
+            self.feature_sets[name] = shadow_set
+            if mapping_dir is not None:
+                target = Path(mapping_dir) / f"{name}_shadow_map.tsv"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                pl.DataFrame(
+                    {
+                        "shadow": [m[0] for m in mapping],
+                        "copied_from": [m[1] for m in mapping],
+                    }
+                ).write_csv(target, separator="	")
+                logger.info("Wrote shadow mapping to %s", target)
+            added.append(f"{name} (+{len(mapping)})")
+
+        if not added:
+            logger.warning("add_shadow_features added nothing")
+            return self
+        self._sync_accessions()
+        logger.info("Added shadow feature set(s): %s", added)
         return self
 
     def create_default_groupings(
@@ -1455,9 +1693,14 @@ class Dataset:
 
     def _rank_feature_set(self, rank: TaxonomicRanks) -> str:
         """Name of the feature set holding *rank* (e.g. 'tax_family')."""
-        suffix = f"_{rank.name.lower()}"
+        wanted = rank.name.lower()
+        # A set may carry build suffixes (tax_genus_clr_bio), so match on
+        # the rank the name encodes rather than on how it ends.
         candidates = [
-            name for name in self.feature_sets if name.endswith(suffix)
+            name
+            for name in self.feature_sets
+            if rank_from_feature_set(name) == wanted
+            or name.endswith(f"_{wanted}")
         ]
         if not candidates:
             raise ValueError(
@@ -1938,8 +2181,10 @@ class Dataset:
         use_holdout: bool = False,
         force: bool = False,
         strict: bool = False,
+        methods: Union[str, List[str]] = "kfold",
+        logo_max_groups: int = 50,
     ) -> "Dataset":
-        """Create k-fold cross-validation splits for one or all labels.
+        """Create cross-validation splits for one or all labels.
 
         By default, creates CV folds for ALL available groupings plus a random baseline.
         Use grouping="random" to create only random splits, or specify a specific grouping.
@@ -1958,7 +2203,16 @@ class Dataset:
             strict: If True, skip and log a warning for any scheme where the data
                     produces fewer populated folds than ``n_folds``. If False
                     (default), the scheme is created with however many folds
-                    have data.
+                    have data. Applies to ``kfold`` only.
+            methods: Which kind of fold to build, ``"kfold"`` (default),
+                ``"logo"``, or both as a list. ``kfold`` packs the groups
+                into ``n_folds`` stratified folds; ``logo`` gives each group
+                a fold of its own (sklearn ``LeaveOneGroupOut``) and is named
+                ``<grouping>_logo``. LOGO needs a grouping column, so the
+                ``random`` baseline never gets a LOGO variant.
+            logo_max_groups: Skip a LOGO scheme whose grouping has more than
+                this many usable groups -- it would mean one CV iteration
+                each.
 
         Returns:
             Self for chaining
@@ -1966,6 +2220,12 @@ class Dataset:
         Examples:
             # Create all CV schemes (random + all groupings) for all labels
             dataset.create_cv_folds()
+
+            # k-fold and leave-one-group-out for every grouping
+            dataset.create_cv_folds(methods=["kfold", "logo"])
+
+            # only leave-one-group-out, on one grouping
+            dataset.create_cv_folds(grouping="bioproject", methods="logo")
 
             # Create all CV schemes for specific label
             dataset.create_cv_folds(label="pH")
@@ -1978,6 +2238,17 @@ class Dataset:
         """
         if self.labels is None:
             raise ValueError("Labels must be added before creating CV folds")
+
+        method_list = [methods] if isinstance(methods, str) else list(methods)
+        method_list = [str(m).strip().lower() for m in method_list]
+        unknown = [m for m in method_list if m not in ("kfold", "logo")]
+        if unknown:
+            raise ValueError(
+                f"Unknown CV method(s) {unknown}; expected 'kfold' and/or "
+                "'logo'"
+            )
+        if not method_list:
+            raise ValueError("methods must name at least one of kfold, logo")
 
         # Get all label columns
         all_label_cols = [c for c in self.labels.columns if c != "sample"]
@@ -2028,13 +2299,32 @@ class Dataset:
                 )
             groupings_to_use = [(grouping, grouping)]
 
+        # One spec per grouping x method. LOGO without a grouping column
+        # would put every sample in its own fold, so it is skipped there.
+        scheme_specs: List[Tuple[str, Optional[str], str]] = []
+        for scheme_name, grouping_col in groupings_to_use:
+            if "kfold" in method_list:
+                scheme_specs.append((scheme_name, grouping_col, "kfold"))
+            if "logo" in method_list and grouping_col is not None:
+                scheme_specs.append(
+                    (f"{scheme_name}_logo", grouping_col, "logo")
+                )
+        if not scheme_specs:
+            logger.warning(
+                "No CV scheme to build: methods=%s with grouping=%r leaves "
+                "nothing (leave-one-group-out needs a grouping column)",
+                method_list,
+                grouping,
+            )
+            return self
+
         # Create CV folds for each label × grouping combination
         for lbl in label_list:
             # Initialize SplitManager if needed
             if lbl not in self.splits:
                 self.splits[lbl] = SplitManager(lbl)
 
-            for scheme_name, grouping_col in groupings_to_use:
+            for scheme_name, grouping_col, method in scheme_specs:
                 # Check if scheme already exists
                 if scheme_name in self.splits[lbl].cv_schemes and not force:
                     logger.warning(
@@ -2043,9 +2333,17 @@ class Dataset:
                     )
                     continue
 
-                logger.info(
-                    f"Creating {n_folds}-fold CV (scheme: {scheme_name}) for label: {lbl}"
-                )
+                if method == "logo":
+                    logger.info(
+                        "Creating leave-one-group-out CV (scheme: %s) for "
+                        "label: %s",
+                        scheme_name,
+                        lbl,
+                    )
+                else:
+                    logger.info(
+                        f"Creating {n_folds}-fold CV (scheme: {scheme_name}) for label: {lbl}"
+                    )
 
                 # Prepare data
                 data = self.labels.select(["sample", lbl])
@@ -2104,6 +2402,8 @@ class Dataset:
                     scheme_name=scheme_name,
                     use_holdout=use_holdout,
                     strict=strict,
+                    method=method,
+                    max_groups=logo_max_groups,
                 )
 
         return self
@@ -2350,7 +2650,22 @@ class Dataset:
             manifest["components"]["features"] = {}
 
             for name, feature_set in self.feature_sets.items():
-                fs_path = features_dir / f"{name}.csv"
+                # Keep the format the set is already stored in, so a
+                # parquet dataset is not silently rewritten as CSV. A
+                # derived set (a shadow set, say) is a scan of nothing and
+                # has no source to read a format from, so it carries a
+                # hint instead -- defaulting a full-width table to CSV
+                # turns a compact parquet dataset into gigabytes of text.
+                src = getattr(feature_set, "source_path", None)
+                suffix = (
+                    Path(src).suffix
+                    if src
+                    else (
+                        getattr(feature_set, "preferred_suffix", None)
+                        or ".csv"
+                    )
+                )
+                fs_path = features_dir / f"{name}{suffix or '.csv'}"
                 source = getattr(feature_set, "source_path", None)
                 same_file = False
                 if source is not None:
@@ -2369,7 +2684,7 @@ class Dataset:
                 else:
                     feature_set.save(fs_path)
                 manifest["components"]["features"][name] = {
-                    "file": f"{name}.csv",
+                    "file": fs_path.name,
                     "n_samples": len(feature_set.accessions),
                     "n_features": len(feature_set.feature_names),
                 }

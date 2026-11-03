@@ -204,6 +204,72 @@ class TestDatasetTaxonomicFeatures:
 
         assert "custom_genus" in sample_dataset.feature_sets
 
+
+class TestDatasetShadowFeatures:
+    """Shadow sets sit beside the clean ones, never replace them."""
+
+    def test_shadow_set_is_added_without_touching_the_original(
+        self, sample_dataset
+    ):
+        sample_dataset.add_taxonomic_features(ranks=[TaxonomicRanks.GENUS])
+        before = list(sample_dataset.feature_sets["tax_genus"].feature_names)
+
+        sample_dataset.add_shadow_features(n_shadow=3, seed=1)
+
+        assert "tax_genus" in sample_dataset.feature_sets
+        assert "tax_genus_shad" in sample_dataset.feature_sets
+        assert (
+            list(sample_dataset.feature_sets["tax_genus"].feature_names)
+            == before
+        ), "the clean set must be left alone"
+
+    def test_shadow_set_keeps_every_real_column_too(self, sample_dataset):
+        """The comparison only means anything inside a single fit."""
+        sample_dataset.add_taxonomic_features(ranks=[TaxonomicRanks.GENUS])
+        real = set(sample_dataset.feature_sets["tax_genus"].feature_names)
+
+        sample_dataset.add_shadow_features(n_shadow=2, seed=1)
+        names = set(
+            sample_dataset.feature_sets["tax_genus_shad"].feature_names
+        )
+
+        assert real <= names
+        shadows = {n for n in names if n.startswith("shadow__")}
+        assert len(shadows) == 2
+        assert names == real | shadows
+
+    def test_shadowing_twice_does_not_shadow_the_shadows(self, sample_dataset):
+        sample_dataset.add_taxonomic_features(ranks=[TaxonomicRanks.GENUS])
+        sample_dataset.add_shadow_features(n_shadow=2, seed=1)
+        sample_dataset.add_shadow_features(n_shadow=2, seed=1)
+
+        assert "tax_genus_shad_shad" not in sample_dataset.feature_sets
+
+    def test_unknown_source_warns_rather_than_raising(self, sample_dataset):
+        sample_dataset.add_taxonomic_features(ranks=[TaxonomicRanks.GENUS])
+        result = sample_dataset.add_shadow_features(sources=["nope"])
+
+        assert result is sample_dataset
+        assert "nope_shad" not in sample_dataset.feature_sets
+
+
+class TestDatasetICCConfig:
+    """features.icc has to fail loudly on a grouping that isn't there."""
+
+    def test_max_icc_without_a_group_is_an_error(self, sample_dataset):
+        with pytest.raises(ValueError, match="features.icc"):
+            sample_dataset.add_taxonomic_features(
+                ranks=[TaxonomicRanks.GENUS], max_icc=0.9
+            )
+
+    def test_unknown_icc_group_is_an_error(self, sample_dataset):
+        with pytest.raises(ValueError, match="not a grouping column"):
+            sample_dataset.add_taxonomic_features(
+                ranks=[TaxonomicRanks.GENUS],
+                icc_by="definitely_not_a_column",
+                max_icc=0.9,
+            )
+
     def test_add_taxonomic_features_requires_profiles(
         self, sample_dataset_empty
     ):

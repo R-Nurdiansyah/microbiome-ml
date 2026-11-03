@@ -1,10 +1,12 @@
 """Split management for train/test and cross-validation."""
 
 import logging
+from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import polars as pl
+from sklearn.model_selection import LeaveOneGroupOut
 
 logger = logging.getLogger(__name__)
 
@@ -71,23 +73,45 @@ class SplitManager:
         scheme_name: Optional[str] = None,
         use_holdout: bool = False,
         strict: bool = False,
+        method: str = "kfold",
+        max_groups: int = 50,
     ) -> None:
-        """Create k-fold cross-validation splits.
+        """Create cross-validation splits.
 
         Args:
             data: DataFrame with sample, label, and optional grouping columns
             grouping: Column name for grouping samples (prevents group leakage)
-            n_folds: Number of folds
-            n_bins: Number of bins for continuous targets
+            n_folds: Number of folds (``method="kfold"`` only)
+            n_bins: Number of bins for continuous targets (``kfold`` only)
             random_state: Random seed for reproducibility
             scheme_name: Name for this CV scheme (defaults to grouping value or "random")
             use_holdout: If True, only use training samples from holdout split, must be created first with create_holdout_split()
             strict: If True, skip creating the scheme when fewer than n_folds
                     folds contain samples, and log a warning instead.
+                    ``kfold`` only -- LOGO's fold count comes from the data.
+            method: ``"kfold"`` (default) packs the groups into ``n_folds``
+                stratified folds. ``"logo"`` gives every group a fold of
+                its own -- sklearn's ``LeaveOneGroupOut`` -- so each
+                iteration validates on exactly one group. Needs ``grouping``.
+            max_groups: ``logo`` only. Refuse the scheme above this many
+                groups, since LOGO runs one CV iteration per group.
         """
         # Default scheme_name based on grouping
         if scheme_name is None:
             scheme_name = grouping if grouping is not None else "random"
+
+        if method not in ("kfold", "logo"):
+            raise ValueError(
+                f"method must be 'kfold' or 'logo', got {method!r}"
+            )
+        if method == "logo":
+            self._create_logo_folds(
+                data=data,
+                grouping=grouping,
+                scheme_name=scheme_name,
+                max_groups=max_groups,
+            )
+            return
 
         # Shuffle data
         df = data.sample(fraction=1.0, shuffle=True, seed=random_state)
@@ -235,6 +259,119 @@ class SplitManager:
 
         # Store CV scheme
         self.cv_schemes[scheme_name] = cv_df
+
+    def _create_logo_folds(
+        self,
+        data: pl.DataFrame,
+        grouping: Optional[str],
+        scheme_name: str,
+        max_groups: int,
+    ) -> None:
+        """Leave-one-group-out folds: one fold per group.
+
+        The enumeration is sklearn's ``LeaveOneGroupOut``, so the fold
+        table reproduces exactly what that splitter would do. It is stored
+        as ``{sample, fold}`` like every other scheme, and replayed through
+        ``PredefinedSplit`` by ``CrossValidator``.
+        """
+        if grouping is None:
+            logger.warning(
+                "CV scheme '%s': leave-one-group-out needs a grouping "
+                "column (every sample would be its own fold); skipping",
+                scheme_name,
+            )
+            return
+        if data.height == 0:
+            logger.warning(
+                "CV scheme '%s' for label '%s' has no samples; skipping",
+                scheme_name,
+                self.label,
+            )
+            return
+
+        # Dataset.create_cv_folds drops these already, but a caller using
+        # SplitManager directly may not have: a null group is not a group,
+        # and pooling the nulls into one fold would mix unrelated samples.
+        usable = data.drop_nulls(subset=[grouping])
+        if usable.height < data.height:
+            logger.warning(
+                "CV scheme '%s': dropped %d sample(s) with no '%s' value",
+                scheme_name,
+                data.height - usable.height,
+                grouping,
+            )
+        if usable.height == 0:
+            logger.warning(
+                "CV scheme '%s' for label '%s': no sample has a '%s' "
+                "value; skipping",
+                scheme_name,
+                self.label,
+                grouping,
+            )
+            return
+
+        samples = usable["sample"].to_list()
+        groups = usable[grouping].cast(pl.Utf8).to_list()
+        counts = Counter(groups)
+
+        # A one-sample group cannot be a validation fold: R2 is undefined
+        # on a single point, and CrossValidator skips a scheme that has a
+        # one-sample fold. PredefinedSplit reads -1 as "always train, never
+        # validate", so those samples still inform every iteration instead
+        # of being thrown away.
+        testable = sorted(g for g, n in counts.items() if n >= 2)
+        singletons = len(counts) - len(testable)
+
+        if len(testable) < 2:
+            logger.warning(
+                "CV scheme '%s' for label '%s': only %d group(s) of '%s' "
+                "have 2+ samples, need 2; skipping",
+                scheme_name,
+                self.label,
+                len(testable),
+                grouping,
+            )
+            return
+        if len(testable) > max_groups:
+            logger.warning(
+                "CV scheme '%s' for label '%s': '%s' has %d usable groups, "
+                "over max_groups=%d. LOGO runs one CV iteration per group, "
+                "so this would be %d fits per model and parameter set; "
+                "skipping. Raise split.cv.logo_max_groups to allow it.",
+                scheme_name,
+                self.label,
+                grouping,
+                len(testable),
+                max_groups,
+                len(testable),
+            )
+            return
+
+        group_arr = np.asarray(groups, dtype=object)
+        keep = np.isin(group_arr, testable)
+        kept_idx = np.flatnonzero(keep)
+
+        fold = np.full(len(samples), -1, dtype=int)
+        logo = LeaveOneGroupOut()
+        for fold_id, (_, test_idx) in enumerate(
+            logo.split(np.zeros((len(kept_idx), 1)), groups=group_arr[keep])
+        ):
+            fold[kept_idx[test_idx]] = fold_id
+
+        self.cv_schemes[scheme_name] = pl.DataFrame(
+            {"sample": samples, "fold": fold.tolist()}
+        )
+        logger.info(
+            "CV scheme '%s' for label '%s': leave-one-group-out over '%s' "
+            "-- %d folds; %d sample(s) in %d single-sample group(s) are "
+            "training-only (fold -1)",
+            scheme_name,
+            self.label,
+            grouping,
+            len(testable),
+            int((fold < 0).sum()),
+            singletons,
+        )
 
     def _stratified_split(
         self,

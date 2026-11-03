@@ -42,6 +42,7 @@ from sklearn.model_selection import (
 # from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
 
+from microbiome_ml.train.full_fit import enable_oob, full_fit_diagnostics
 from microbiome_ml.train.results import CV_Result, LabelSchemeKey
 from microbiome_ml.wrangle.dataset import Dataset
 
@@ -119,6 +120,23 @@ def _normalize_alias(name: str) -> str:
     return s
 
 
+def _sse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Sum of squared error on a fold."""
+    return float(np.sum((np.asarray(y_true) - np.asarray(y_pred)) ** 2))
+
+
+def _sst(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Total sum of squares on a fold, around that fold's own mean.
+
+    Recorded per fold because a mean of per-fold R2 cannot be reweighted
+    afterwards: pooled R2 needs the numerator and denominator separately.
+    Zero when the fold's label is constant, which is how a fold with no
+    variance to explain is told apart from one the model got wrong.
+    """
+    y = np.asarray(y_true, dtype=float)
+    return float(np.sum((y - y.mean()) ** 2))
+
+
 def _resolve_model_alias(name: str) -> str:
     """Return canonical short key for a model alias (e.g. 'random forest' ->
     'rf').
@@ -152,10 +170,11 @@ class CrossValidator:
         self,
         dataset: Dataset,
         models: Union[object, List[object]],
-        cv_folds: int = 5,
         label: Optional[Union[str, List[str]]] = None,
         scheme: Optional[Union[str, List[str]]] = None,
         feature_set: Optional[Union[str, List[str]]] = None,
+        full_fit: bool = False,
+        full_fit_oob: bool = True,
     ) -> None:
         if isinstance(dataset, Dataset):
             self.dataset = dataset
@@ -173,10 +192,14 @@ class CrossValidator:
             self.models = models
         else:
             self.models = [models]
-        self.cv_folds = cv_folds
         self.label: Optional[Union[str, List[str]]] = label
         self.scheme: Optional[Union[str, List[str]]] = scheme
         self.feature_set: Optional[Union[str, List[str]]] = feature_set
+        # Score the model that is already fitted on the whole CV pool.
+        # Off by default: it costs one extra predict per combination,
+        # and with `full_fit_oob` an out-of-bag pass on every fit.
+        self.full_fit: bool = bool(full_fit)
+        self.full_fit_oob: bool = bool(full_fit_oob)
         self._best_validation_r2: float = float("-inf")
         self.best_result_key: Optional[str] = None
         self.best_result: Optional[CV_Result] = None
@@ -222,14 +245,14 @@ class CrossValidator:
             model_name = (
                 model.__class__.__name__ if model is not None else "None"
             )
-            avg_r2 = cv_result.avg_validation_r2
+            avg_r2 = cv_result.rank_score
             avg_r2_text = (
                 f"{float(avg_r2):.6f}" if avg_r2 is not None else "None"
             )
             label_text = "None" if label is None else str(label)
             best_key = self.best_result_key_by_label.get(label, "")
             print(
-                f"[best][label={label_text}] model={model_name} avg_r2={avg_r2_text} key={best_key}"
+                f"[best][label={label_text}] model={model_name} r2={avg_r2_text} key={best_key}"
             )
 
         for (label, scheme), cv_result in sorted(
@@ -243,7 +266,7 @@ class CrossValidator:
             model_name = (
                 model.__class__.__name__ if model is not None else "None"
             )
-            avg_r2 = cv_result.avg_validation_r2
+            avg_r2 = cv_result.rank_score
             avg_r2_text = (
                 f"{float(avg_r2):.6f}" if avg_r2 is not None else "None"
             )
@@ -254,7 +277,7 @@ class CrossValidator:
             )
             print(
                 f"[best][label={label_text}][scheme={scheme_text}] "
-                f"model={model_name} avg_r2={avg_r2_text} key={best_key}"
+                f"model={model_name} r2={avg_r2_text} key={best_key}"
             )
 
     @staticmethod
@@ -270,8 +293,10 @@ class CrossValidator:
         cv_result: CV_Result,
         estimator: Optional[Any] = None,
     ) -> None:
-        # Update global best model and per-label best model by average R².
-        avg_r2 = cv_result.avg_validation_r2
+        # Which result wins a label/scheme: pooled R2 when the run has it,
+        # else the mean. Same property the sweep headline ranks on, so the
+        # exported best model and the headline cannot disagree.
+        avg_r2 = cv_result.rank_score
         if avg_r2 is None:
             return
         if avg_r2 > self._best_validation_r2:
@@ -370,6 +395,8 @@ class CrossValidator:
         scorers = {
             "r2": "r2",
             "mse": make_scorer(mean_squared_error, greater_is_better=False),
+            "sse": make_scorer(_sse, greater_is_better=True),
+            "sst": make_scorer(_sst, greater_is_better=True),
         }
 
         def payloads() -> (
@@ -410,6 +437,12 @@ class CrossValidator:
                     continue
 
                 unique_folds, counts = np.unique(fold_arr, return_counts=True)
+                # PredefinedSplit reads -1 as "always train, never validate";
+                # leave-one-group-out parks single-sample groups there. It is
+                # not a fold, so it must not be counted as one nor trip the
+                # fold-size check below.
+                _keep = unique_folds >= 0
+                unique_folds, counts = unique_folds[_keep], counts[_keep]
                 if len(unique_folds) < 2:
                     logging.warning(
                         "Not enough folds for %s (found %d); skipping",
@@ -476,6 +509,8 @@ class CrossValidator:
                 params_grid,
                 scorers,
                 inner_cv_jobs,
+                self.full_fit,
+                self.full_fit_oob,
             )
             for payload in payloads()
         )
@@ -512,6 +547,8 @@ class CrossValidator:
         params_grid: Dict[str, Any],
         scorers: Dict[str, Any],
         inner_cv_jobs: int,
+        full_fit: bool = False,
+        full_fit_oob: bool = True,
     ) -> Tuple[
         str,
         Dict[str, CV_Result],
@@ -548,9 +585,15 @@ class CrossValidator:
                     )
                     per_r2 = list(cvres["test_r2"])
                     per_mse = [-m for m in cvres["test_mse"]]
+                    per_sse = list(cvres["test_sse"])
+                    per_sst = list(cvres["test_sst"])
                     result_key = (
                         f"{key}::{estimator.__class__.__name__}::{params}"
                     )
+                    # Asked for before the fit, so the out-of-bag pass
+                    # rides along with it instead of costing a refit.
+                    if full_fit and full_fit_oob:
+                        enable_oob(estimator)
                     estimator.fit(X_arr, y_arr)
                     cv_result = CV_Result(
                         feature_set=feature_name,
@@ -559,12 +602,15 @@ class CrossValidator:
                         cross_val_scores=per_r2,
                         validation_r2_per_fold=per_r2,
                         validation_mse_per_fold=per_mse,
+                        validation_sse_per_fold=per_sse,
+                        validation_sst_per_fold=per_sst,
                         best_params=dict(params),
                         trained_model=estimator,
                         feature_names=feature_names,
+                        n_label=len(y_arr),
                     )
                     results[result_key] = cv_result
-                    avg_r2 = cv_result.avg_validation_r2
+                    avg_r2 = cv_result.rank_score
                     if avg_r2 is not None and (
                         best_info is None or avg_r2 > best_info[3]
                     ):
@@ -590,7 +636,11 @@ class CrossValidator:
                 )
                 per_r2 = list(cvres["test_r2"])
                 per_mse = [-v for v in cvres["test_mse"]]
+                per_sse = list(cvres["test_sse"])
+                per_sst = list(cvres["test_sst"])
                 result_key = f"{key}::{estimator.__class__.__name__}::{params}"
+                if full_fit and full_fit_oob:
+                    enable_oob(estimator)
                 estimator.fit(X_arr, y_arr)
                 cv_result = CV_Result(
                     feature_set=feature_name,
@@ -599,12 +649,15 @@ class CrossValidator:
                     cross_val_scores=per_r2,
                     validation_r2_per_fold=per_r2,
                     validation_mse_per_fold=per_mse,
+                    validation_sse_per_fold=per_sse,
+                    validation_sst_per_fold=per_sst,
                     best_params=dict(params),
                     trained_model=estimator,
                     feature_names=feature_names,
+                    n_label=len(y_arr),
                 )
                 results[result_key] = cv_result
-                avg_r2 = cv_result.avg_validation_r2
+                avg_r2 = cv_result.rank_score
                 if avg_r2 is not None and (
                     best_info is None or avg_r2 > best_info[3]
                 ):
@@ -612,6 +665,16 @@ class CrossValidator:
                 logger.info(
                     f"Completed CV for {result_key} with params {params}"
                 )
+
+        # Only the combination's own winner is diagnosed. Every config
+        # was already fitted on the full pool above, but scoring all of
+        # them would cost a predict over the whole training set per
+        # config to describe models nothing downstream will look at.
+        if full_fit and best_info is not None:
+            _, best_cv_result, best_estimator, best_score = best_info
+            best_cv_result.full_fit = full_fit_diagnostics(
+                best_estimator, X_arr, y_arr, cv_score=best_score
+            )
 
         return key, results, best_info
 
@@ -663,6 +726,8 @@ class CrossValidator:
         scorers = {
             "r2": "r2",
             "mse": make_scorer(mean_squared_error, greater_is_better=False),
+            "sse": make_scorer(_sse, greater_is_better=True),
+            "sst": make_scorer(_sst, greater_is_better=True),
         }
 
         for key, X_np, y_np, meta in mapping:
@@ -684,6 +749,12 @@ class CrossValidator:
                 continue
 
             unique_folds, counts = np.unique(fold_arr, return_counts=True)
+            # PredefinedSplit reads -1 as "always train, never validate";
+            # leave-one-group-out parks single-sample groups there. It is
+            # not a fold, so it must not be counted as one nor trip the
+            # fold-size check below.
+            _keep = unique_folds >= 0
+            unique_folds, counts = unique_folds[_keep], counts[_keep]
             if len(unique_folds) < 2:
                 logging.warning(
                     "Not enough folds for %s (found %d); skipping",
@@ -738,6 +809,12 @@ class CrossValidator:
                     refit="r2",
                     n_jobs=n_jobs_use,
                 )
+                if self.full_fit and self.full_fit_oob:
+                    # Set on the base estimator: GridSearchCV clones it,
+                    # so this reaches the refit that produces
+                    # best_estimator_ (and every candidate, which is the
+                    # price of not refitting afterwards).
+                    enable_oob(estimator)
                 gs.fit(X_arr, y_arr)
                 cvres = gs.cv_results_
                 best_idx = gs.best_index_
@@ -750,6 +827,14 @@ class CrossValidator:
                     -cvres[f"split{i}_test_mse"][best_idx]
                     for i in range(n_splits)
                 ]  # negate because scorer is neg MSE
+                per_sse = [
+                    cvres[f"split{i}_test_sse"][best_idx]
+                    for i in range(n_splits)
+                ]
+                per_sst = [
+                    cvres[f"split{i}_test_sst"][best_idx]
+                    for i in range(n_splits)
+                ]
 
                 result_key = f"{key}::{gs.best_estimator_.__class__.__name__}"
                 best_params = getattr(gs, "best_params_", None)
@@ -760,10 +845,20 @@ class CrossValidator:
                     cross_val_scores=per_r2,
                     validation_r2_per_fold=per_r2,
                     validation_mse_per_fold=per_mse,
+                    validation_sse_per_fold=per_sse,
+                    validation_sst_per_fold=per_sst,
                     best_params=best_params,
                     trained_model=gs.best_estimator_,
                     feature_names=feature_columns,
+                    n_label=len(y_arr),
                 )
+                if self.full_fit:
+                    cv_result.full_fit = full_fit_diagnostics(
+                        gs.best_estimator_,
+                        X_arr,
+                        y_arr,
+                        cv_score=cv_result.rank_score,
+                    )
                 results[result_key] = cv_result
                 self._update_best_model(
                     result_key, cv_result, estimator=gs.best_estimator_
@@ -1084,13 +1179,14 @@ class CrossValidator:
                     joined = (
                         keys.lazy()
                         .join(feat_lf, on="sample", how="left")
+                        # One expression over all the feature columns,
+                        # not one per column: a genus table has ~60k of
+                        # them, and polars' optimiser walking 60k
+                        # expression nodes is itself a memory problem.
                         .with_columns(
-                            [
-                                pl.col(c)
-                                .fill_null(fillna)
-                                .cast(pl.Float32, strict=False)
-                                for c in feature_cols
-                            ]
+                            pl.col(feature_cols)
+                            .fill_null(fillna)
+                            .cast(pl.Float32, strict=False)
                         )
                         .collect()
                     )

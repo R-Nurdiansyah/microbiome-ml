@@ -25,6 +25,7 @@ import json
 import logging
 import pickle
 import re
+import statistics
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -73,13 +74,19 @@ class CV_Result:
         cross_val_scores: Optional[List[float]] = None,
         validation_r2_per_fold: Optional[List[float]] = None,
         validation_mse_per_fold: Optional[List[float]] = None,
+        validation_sse_per_fold: Optional[List[float]] = None,
+        validation_sst_per_fold: Optional[List[float]] = None,
         best_params: Optional[Dict[str, Any]] = None,
         trained_model: Optional[Any] = None,
         feature_names: Optional[List[str]] = None,
+        n_label: Optional[int] = None,
     ) -> None:
         self.feature_set = feature_set
         self.label = label
         self.scheme = scheme
+        # Samples with a non-null value for this label that reached CV --
+        # the n behind every score in the row.
+        self.n_label: Optional[int] = None if n_label is None else int(n_label)
 
         # store lists defensively
         self.cross_val_scores = (
@@ -91,6 +98,15 @@ class CV_Result:
         self.validation_mse_per_fold = (
             list(validation_mse_per_fold) if validation_mse_per_fold else []
         )
+        # Sum of squared error and total sum of squares per fold, each
+        # around that fold's own mean. Kept because a mean of per-fold R2
+        # cannot be reweighted after the fact.
+        self.validation_sse_per_fold = (
+            list(validation_sse_per_fold) if validation_sse_per_fold else []
+        )
+        self.validation_sst_per_fold = (
+            list(validation_sst_per_fold) if validation_sst_per_fold else []
+        )
 
         # optional: best hyperparameters (None when not provided)
         self.best_params: Optional[Dict[str, Any]] = (
@@ -99,6 +115,13 @@ class CV_Result:
 
         # optional: trained estimator associated with this result
         self.model: Optional[Any] = trained_model
+
+        # Diagnostics for `self.model`, which is fitted on the whole CV
+        # pool rather than on k-1 folds. Filled by the CV stage when
+        # `final_fit.enabled`; see microbiome_ml.train.full_fit. Declared
+        # here so every result has the attribute whether or not the
+        # stage ran.
+        self.full_fit: Optional[Dict[str, Any]] = None
         self.feature_names: List[str] = (
             list(feature_names) if feature_names is not None else []
         )
@@ -106,7 +129,27 @@ class CV_Result:
         # derived values
         self.avg_validation_r2: Optional[float] = None
         self.avg_validation_mse: Optional[float] = None
+        self.pooled_validation_r2: Optional[float] = None
+        self.median_validation_r2: Optional[float] = None
+        self.iqr_validation_r2: Optional[float] = None
+        self.frac_folds_negative_r2: Optional[float] = None
+        self.n_folds: int = 0
+        self.n_folds_evaluable: int = 0
         self._compute_averages()
+
+    @property
+    def rank_score(self) -> Optional[float]:
+        """The number every "best result" decision is made on.
+
+        Pooled R2 when the run recorded per-fold SSE/SST, else the old
+        mean of per-fold R2 so a result loaded from an earlier run still
+        ranks. Selection and the sweep headline read the same property,
+        so the model exported as best for a scheme is the one the
+        headline then ranks.
+        """
+        if self.pooled_validation_r2 is not None:
+            return self.pooled_validation_r2
+        return self.avg_validation_r2
 
     def _compute_averages(self) -> None:
         """Compute and cache mean per-fold metrics (or None if unavailable)."""
@@ -125,6 +168,61 @@ class CV_Result:
             )
         else:
             self.avg_validation_mse = None
+
+        self._compute_fold_distribution()
+
+    def _compute_fold_distribution(self) -> None:
+        """Summaries that survive a fold with no variance to explain.
+
+        A leave-one-group-out fold whose label is constant has SST = 0:
+        R2 is undefined there and scikit-learn returns 0.0, which reads
+        as "mediocre but fine" when it means "not evaluable". Those folds
+        are excluded here and counted separately.
+
+        pooled_validation_r2 is 1 - sum(SSE)/sum(SST) across the
+        evaluable folds, i.e. each fold's R2 weighted by how much
+        variance it had to explain. A near-constant fold can no longer
+        set the headline number the way an unweighted mean lets it.
+        """
+        # Reset first: _compute_averages runs again on every _to_dict, and
+        # a branch below that does not assign would otherwise leave a
+        # stale value behind.
+        self.pooled_validation_r2 = None
+        self.median_validation_r2 = None
+        self.iqr_validation_r2 = None
+        self.frac_folds_negative_r2 = None
+
+        r2 = self.validation_r2_per_fold
+        sse, sst = self.validation_sse_per_fold, self.validation_sst_per_fold
+        self.n_folds = len(r2)
+
+        if len(sse) == len(sst) == len(r2) and r2:
+            keep = [i for i, t in enumerate(sst) if t and t > 0]
+        else:
+            # No SSE/SST recorded (an older run): fall back to treating an
+            # exact 0.0 as scikit-learn's constant-target case.
+            keep = [i for i, v in enumerate(r2) if v != 0.0]
+        self.n_folds_evaluable = len(keep)
+
+        if not keep:
+            return
+
+        if len(sse) == len(sst) == len(r2):
+            total_sst = sum(sst[i] for i in keep)
+            if total_sst > 0:
+                self.pooled_validation_r2 = float(
+                    1.0 - sum(sse[i] for i in keep) / total_sst
+                )
+
+        kept = sorted(r2[i] for i in keep)
+        self.median_validation_r2 = float(statistics.median(kept))
+        if len(kept) >= 4:
+            self.iqr_validation_r2 = float(
+                kept[(3 * len(kept)) // 4] - kept[len(kept) // 4]
+            )
+        self.frac_folds_negative_r2 = float(
+            sum(1 for v in kept if v < 0) / len(kept)
+        )
 
     def _serialize_value(self, v: Any) -> Any:
         """Make values JSON/Polars-friendly.
@@ -172,6 +270,25 @@ class CV_Result:
             "avg_validation_mse": self._serialize_value(
                 self.avg_validation_mse
             ),
+            "validation_sse_per_fold": self._serialize_value(
+                self.validation_sse_per_fold
+            ),
+            "validation_sst_per_fold": self._serialize_value(
+                self.validation_sst_per_fold
+            ),
+            "pooled_validation_r2": self._serialize_value(
+                self.pooled_validation_r2
+            ),
+            "median_validation_r2": self._serialize_value(
+                self.median_validation_r2
+            ),
+            "iqr_validation_r2": self._serialize_value(self.iqr_validation_r2),
+            "frac_folds_negative_r2": self._serialize_value(
+                self.frac_folds_negative_r2
+            ),
+            "n_folds": self._serialize_value(self.n_folds),
+            "n_folds_evaluable": self._serialize_value(self.n_folds_evaluable),
+            "n_label": self._serialize_value(self.n_label),
             "feature_names": self._serialize_value(self.feature_names),
         }
 
@@ -278,12 +395,13 @@ class CV_Result:
     ) -> List[Tuple[Any, "CV_Result"]]:
         """Return (key, result) pairs ordered best -> worst by avg R².
 
-        Results without an average (no folds) sort last; ties keep the original
-        insertion order.
+        Sorted by ``rank_score`` -- pooled R2 where the run recorded it,
+        else the mean. Results without one (no folds) sort last; ties keep
+        the original insertion order.
         """
 
         def _score(item: Tuple[Any, "CV_Result"]) -> Tuple[int, float]:
-            avg = item[1].avg_validation_r2
+            avg = item[1].rank_score
             if avg is None:
                 return (1, 0.0)
             return (0, -float(avg))
@@ -355,6 +473,13 @@ class CV_Result:
                     model.__class__.__name__ if model is not None else None,
                     result.avg_validation_r2,
                     result.avg_validation_mse,
+                    result.pooled_validation_r2,
+                    result.median_validation_r2,
+                    result.iqr_validation_r2,
+                    result.frac_folds_negative_r2,
+                    result.n_folds_evaluable,
+                    result.n_folds,
+                    result.n_label,
                     best_key,
                     str(out_dir.relative_to(base_dir)),
                 ]
@@ -371,6 +496,13 @@ class CV_Result:
                     "model",
                     "avg_validation_r2",
                     "avg_validation_mse",
+                    "pooled_validation_r2",
+                    "median_validation_r2",
+                    "iqr_validation_r2",
+                    "frac_folds_negative_r2",
+                    "n_folds_evaluable",
+                    "n_folds",
+                    "n_label",
                     "result_key",
                     "path",
                 ]
@@ -408,7 +540,7 @@ class CV_Result:
         # Accept either:
         # 1) label -> CV_Result
         # 2) arbitrary_key -> CV_Result (full CV results map)
-        # For (2), reduce to one best result per label by avg_validation_r2.
+        # For (2), reduce to one best result per label by rank_score.
         by_label: Dict[Optional[str], CV_Result] = {}
         if raw_map:
             looks_like_label_map = all(
@@ -426,7 +558,7 @@ class CV_Result:
                 best_score_by_label: Dict[Optional[str], float] = {}
                 for raw_key, result in raw_map.items():
                     label = result.label
-                    avg_r2 = result.avg_validation_r2
+                    avg_r2 = result.rank_score
                     score = float("-inf") if avg_r2 is None else float(avg_r2)
                     prev = best_score_by_label.get(label, float("-inf"))
                     if label not in by_label or score > prev:
@@ -648,6 +780,13 @@ class CV_Result:
                     "model",
                     "avg_validation_r2",
                     "avg_validation_mse",
+                    "pooled_validation_r2",
+                    "median_validation_r2",
+                    "iqr_validation_r2",
+                    "frac_folds_negative_r2",
+                    "n_folds_evaluable",
+                    "n_folds",
+                    "n_label",
                     "cross_val_scores",
                 ]
             )
@@ -697,6 +836,13 @@ class CV_Result:
                         model_name,
                         out_record.get("avg_validation_r2"),
                         out_record.get("avg_validation_mse"),
+                        out_record.get("pooled_validation_r2"),
+                        out_record.get("median_validation_r2"),
+                        out_record.get("iqr_validation_r2"),
+                        out_record.get("frac_folds_negative_r2"),
+                        out_record.get("n_folds_evaluable"),
+                        out_record.get("n_folds"),
+                        out_record.get("n_label"),
                         json.dumps(
                             out_record.get("cross_val_scores", []), default=str
                         ),

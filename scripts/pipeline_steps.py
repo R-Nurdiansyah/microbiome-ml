@@ -172,6 +172,8 @@ def step_split(args: argparse.Namespace) -> None:
         use_holdout=bool(split_cv_cfg.get("use_holdout", True)),
         force=True,
         strict=bool(split_cv_cfg.get("strict", True)),
+        methods=split_cv_cfg.get("methods", "kfold"),
+        logo_max_groups=int(split_cv_cfg.get("logo_max_groups", 50)),
     )
     dataset.save_cv_folds(out)
 
@@ -180,7 +182,11 @@ def step_split(args: argparse.Namespace) -> None:
         out,
         sec["visualise"],
         out.parent / "split_visualisations",
+        # run_name is the directory stamp (e.g. bioproject__temperature)
+        # and names the run in the report; the bars stack by the metadata
+        # column, which is what `value` holds.
         holdout_grouping=run_name,
+        stack_by=value if kind == "column" else None,
     )
 
     # What the cv step should actually train, honouring cv.label / cv.scheme.
@@ -227,7 +233,7 @@ def step_split(args: argparse.Namespace) -> None:
 def step_cv(args: argparse.Namespace) -> None:
     cfg = _load_cfg(args)
     sec = pipeline._sections(cfg)
-    split_cv_cfg = sec["split"].get("cv") or {}
+    sec["split"].get("cv") or {}
     cv_cfg, out_cfg = sec["cv"], sec["outputs"]
     vis_cfg, shap_cfg = sec["visualise"], sec["shap"]
     holdout_enabled = bool(sec["holdout_evaluation"].get("enabled", True))
@@ -255,7 +261,6 @@ def step_cv(args: argparse.Namespace) -> None:
     cv = CrossValidator(
         dataset=dataset,
         models=models,
-        cv_folds=int(split_cv_cfg.get("n_folds", 5)),
         label=label,
         scheme=scheme,
         feature_set=cv_cfg.get("feature_set"),
@@ -402,6 +407,19 @@ _HEADLINE_NEEDS = (
 )
 
 
+# Carried into the headline when the run produced them. pooled_validation_r2
+# is the ranking key: an unweighted mean of per-fold R2 lets one fold with
+# almost no variance to explain set the whole number.
+_HEADLINE_EXTRAS = (
+    "pooled_validation_r2",
+    "median_validation_r2",
+    "iqr_validation_r2",
+    "frac_folds_negative_r2",
+    "n_folds_evaluable",
+    "n_folds",
+)
+
+
 def headline_table(best: pl.DataFrame) -> Optional[pl.DataFrame]:
     """One row per holdout grouping x label: `random` vs the best grouped CV
     scheme, with the feature set and model each of them chose.
@@ -416,13 +434,25 @@ def headline_table(best: pl.DataFrame) -> Optional[pl.DataFrame]:
         LOGGER.warning("headline table skipped; missing columns %s", missing)
         return None
 
+    numeric = ["avg_validation_r2", *(_HEADLINE_EXTRAS)]
     df = best.with_columns(
-        pl.col("avg_validation_r2").cast(pl.Float64, strict=False)
+        [
+            pl.col(c).cast(pl.Float64, strict=False)
+            for c in numeric
+            if c in best.columns
+        ]
+    )
+    # Rank on pooled R2 where the run recorded it, else the old mean, so a
+    # sweep collated from a mix of old and new runs still produces a table.
+    rank_on = (
+        "pooled_validation_r2"
+        if "pooled_validation_r2" in df.columns
+        else "avg_validation_r2"
     )
 
     def _top(frame: pl.DataFrame, prefix: str) -> pl.DataFrame:
         picked = (
-            frame.sort("avg_validation_r2", descending=True, nulls_last=True)
+            frame.sort(rank_on, descending=True, nulls_last=True)
             .group_by(["holdout_grouping", "label"], maintain_order=True)
             .first()
         )
@@ -436,6 +466,10 @@ def headline_table(best: pl.DataFrame) -> Optional[pl.DataFrame]:
         if "avg_validation_mse" in picked.columns:
             rename["avg_validation_mse"] = f"{prefix}_mse"
             keep.append("avg_validation_mse")
+        for col in _HEADLINE_EXTRAS:
+            if col in picked.columns:
+                rename[col] = f"{prefix}_{col.replace('_validation', '')}"
+                keep.append(col)
         return picked.select(keep).rename(rename)
 
     control = _top(df.filter(pl.col("scheme") == "random"), "control")
@@ -444,15 +478,34 @@ def headline_table(best: pl.DataFrame) -> Optional[pl.DataFrame]:
     table = control.join(
         grouped, on=["holdout_grouping", "label"], how="full", coalesce=True
     )
-    if {"control_r2", "best_grouped_r2"} <= set(table.columns):
+    # n_label is a property of the label, not of either scheme, so it is
+    # carried once rather than prefixed onto both sides.
+    if "n_label" in df.columns:
+        table = table.join(
+            df.group_by(["holdout_grouping", "label"]).agg(
+                pl.col("n_label").max().alias("n_label")
+            ),
+            on=["holdout_grouping", "label"],
+            how="left",
+        )
+    gap_on = (
+        "pooled_r2"
+        if {"control_pooled_r2", "best_grouped_pooled_r2"}
+        <= set(table.columns)
+        else "r2"
+    )
+    if {f"control_{gap_on}", f"best_grouped_{gap_on}"} <= set(table.columns):
         table = table.with_columns(
-            (pl.col("control_r2") - pl.col("best_grouped_r2")).alias("r2_gap")
+            (
+                pl.col(f"control_{gap_on}") - pl.col(f"best_grouped_{gap_on}")
+            ).alias("r2_gap")
         )
     order = [
         c
         for c in (
             "holdout_grouping",
             "label",
+            "n_label",
             "control_scheme",
             "control_feature_set",
             "control_model",
@@ -463,7 +516,14 @@ def headline_table(best: pl.DataFrame) -> Optional[pl.DataFrame]:
             "best_grouped_model",
             "best_grouped_r2",
             "best_grouped_mse",
+            "control_pooled_r2",
+            "best_grouped_pooled_r2",
             "r2_gap",
+            "best_grouped_median_r2",
+            "best_grouped_iqr_r2",
+            "best_grouped_frac_folds_negative_r2",
+            "best_grouped_n_folds_evaluable",
+            "best_grouped_n_folds",
         )
         if c in table.columns
     ]
@@ -531,8 +591,18 @@ def fold_profile(root: Union[str, Path]) -> Optional[pl.DataFrame]:
         df = pl.read_csv(path)
         if "fold" not in df.columns or not df.height:
             continue
-        sizes = df.group_by("fold").len().sort("fold")["len"].to_list()
-        total = sum(sizes)
+        # fold -1 is leave-one-group-out's training-only pool, not a fold:
+        # out of `sizes`, but still in `total`, because it does train.
+        sizes = (
+            df.filter(pl.col("fold") >= 0)
+            .group_by("fold")
+            .len()
+            .sort("fold")["len"]
+            .to_list()
+        )
+        if not sizes:
+            continue
+        total = df.height
         min_train = total - max(sizes)
         max_pct = round(100.0 * max(sizes) / total, 1)
         reasons = []

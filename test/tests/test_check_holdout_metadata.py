@@ -163,3 +163,95 @@ def test_collate_accumulates_runs_already_on_disk(tmp_path):
     assert set(both["holdout_grouping"]) == {"random", "bioproject"}
     status = pl.read_csv(tmp_path / "sweep_status.tsv", separator="\t")
     assert status.height == 2
+
+
+def test_stack_by_is_a_column_not_the_run_stamp(tmp_path, monkeypatch):
+    """The Snakemake run stamp is not a column, so it cannot stack bars.
+
+    step_split names a run `bioproject__temperature` and passed that as
+    the thing to stack by, so the pipeline's figures silently came out
+    unstacked while the standalone script's were stacked. The two
+    arguments do different jobs and are now separate.
+    """
+    import run_cv_to_final_eval as pipeline
+
+    splits = tmp_path / "splits" / "temperature"
+    splits.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "sample": [f"s{i}" for i in range(8)],
+            "split": ["train"] * 6 + ["test"] * 2,
+            "temperature": [1.0, 2, 3, 4, 5, 6, 7, 8],
+            "bioproject": ["A"] * 4 + ["B"] * 4,
+        }
+    ).write_csv(splits / "holdout.csv")
+
+    seen = {}
+
+    class Spy:
+        def __init__(self, *a, **k):
+            pass
+
+        def plot_holdout_distribution(self, path, **kw):
+            seen["grouping"] = kw.get("grouping")
+            return {
+                "label": "temperature",
+                "n_train": 6,
+                "n_test": 2,
+                "ks": 0.5,
+                "p": 0.1,
+            }
+
+    monkeypatch.setattr(pipeline, "Visualiser", Spy)
+
+    pipeline.plot_holdout_distributions(
+        tmp_path / "splits",
+        {"enabled": True, "holdout_distribution": {"enabled": True}},
+        tmp_path / "figs",
+        holdout_grouping="bioproject__temperature",
+        stack_by="bioproject",
+    )
+    assert seen["grouping"] == "bioproject", "must stack by the column"
+
+
+def test_stack_by_falls_back_when_the_column_is_absent(tmp_path, monkeypatch):
+    """A taxon holdout stacks by carrier/non-carrier; random not at all."""
+    import run_cv_to_final_eval as pipeline
+
+    splits = tmp_path / "splits" / "ph"
+    splits.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "sample": [f"s{i}" for i in range(6)],
+            "split": ["train"] * 4 + ["test"] * 2,
+            "ph": [6.0, 6.5, 7.0, 7.5, 8.0, 8.5],
+            "holdout_taxon_presence": [False] * 4 + [True] * 2,
+        }
+    ).write_csv(splits / "holdout.csv")
+
+    seen = {}
+
+    class Spy:
+        def __init__(self, *a, **k):
+            pass
+
+        def plot_holdout_distribution(self, path, **kw):
+            seen["grouping"] = kw.get("grouping")
+            return {
+                "label": "ph",
+                "n_train": 4,
+                "n_test": 2,
+                "ks": 0.5,
+                "p": 0.1,
+            }
+
+    monkeypatch.setattr(pipeline, "Visualiser", Spy)
+
+    pipeline.plot_holdout_distributions(
+        tmp_path / "splits",
+        {"enabled": True, "holdout_distribution": {"enabled": True}},
+        tmp_path / "figs",
+        holdout_grouping="taxon_family",
+        stack_by=None,
+    )
+    assert seen["grouping"] == "holdout_taxon_presence"

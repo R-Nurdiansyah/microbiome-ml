@@ -2,16 +2,40 @@
 
 import logging
 import os
+import shutil
 from enum import Enum
 from pathlib import Path
-from typing import Any, List, Optional, Set, Type, Union
+from typing import Any, List, Optional, Set, Tuple, Type, Union
 
 import polars as pl
 
 from microbiome_ml.utils.taxonomy import TaxonomicRanks
 from microbiome_ml.wrangle.features import SampleFeatureSet
+from microbiome_ml.wrangle.icc import taxon_icc
 
 logger = logging.getLogger(__name__)
+
+# How a feature table's values are expressed. The key is canonical -- it
+# is what the feature set name is built from -- and the tuple is what a
+# config may say instead. Adding one here means adding its name suffix
+# to _TRANSFORM_SUFFIX in wrangle/dataset.py.
+TRANSFORMS = {
+    "relabund": ("relabund",),
+    "clr": ("clr",),
+    "presence": ("presence", "pa", "binary", "presence_absence"),
+}
+
+
+def canonical_transform(transform: str) -> str:
+    """Resolve a configured transform name to its canonical spelling."""
+    text = str(transform).strip().lower()
+    for canonical, aliases in TRANSFORMS.items():
+        if text in aliases:
+            return canonical
+    raise ValueError(
+        f"transform must be one of {', '.join(sorted(TRANSFORMS))}, "
+        f"got {transform!r}"
+    )
 
 
 def _sink_or_collect(frame: pl.LazyFrame, path: Path) -> None:
@@ -781,6 +805,14 @@ class TaxonomicProfiles:
         stream_path: Optional[Union[str, Path]] = None,
         chunk_samples: int = 5000,
         samples: Optional[List[str]] = None,
+        min_prevalence: Optional[float] = None,
+        transform: str = "relabund",
+        clr_pseudocount: float = 1e-6,
+        presence_threshold: float = 0.0,
+        prevalence_groups: Optional[pl.DataFrame] = None,
+        icc_groups: Optional[pl.DataFrame] = None,
+        max_icc: Optional[float] = None,
+        icc_report: Optional[Union[str, Path]] = None,
     ) -> SampleFeatureSet:
         """Create a SampleFeatureSet from the taxonomic profiles at a rank.
 
@@ -797,6 +829,34 @@ class TaxonomicProfiles:
                 return a scan of it. None keeps the in-memory behaviour.
             chunk_samples: Samples per chunk when streaming.
             samples: Restrict to these samples (e.g. the labelled ones).
+            min_prevalence: Drop taxa present (non-zero) in fewer than
+                this fraction of samples, e.g. 0.01 for 1%. None (the
+                default) keeps every taxon.
+            transform: ``"relabund"`` (default) leaves the values as
+                relative abundance. ``"clr"`` applies the centred
+                log-ratio per sample across the taxa kept at this rank,
+                which puts the features on an additive scale instead of a
+                constant-sum one. ``"presence"`` keeps only whether each
+                taxon is there, dropping abundance entirely.
+            prevalence_groups: ``{sample, group}``. When given, prevalence
+                counts **groups** (e.g. how many bioprojects carry the
+                taxon) rather than samples, so one large project cannot
+                make a taxon look common on its own.
+            clr_pseudocount: Added before the log, since a 99%-sparse
+                table is mostly zeros and log(0) is undefined.
+            presence_threshold: Relative abundance a taxon must exceed to
+                count as present; only used for ``"presence"``.
+            icc_groups: ``{sample, group}`` for the per-taxon intraclass
+                correlation. Needed by ``max_icc`` and ``icc_report``.
+            max_icc: Drop taxa whose ICC against that grouping exceeds
+                this, i.e. taxa that are mostly a property of which study
+                the sample came from. None (the default) computes nothing
+                and drops nothing. Read the report before setting it --
+                when the label is itself largely between-group, a
+                predictive taxon also scores a high ICC.
+            icc_report: Write the full ranked ICC table here as TSV.
+                Works without ``max_icc``, which is the intended first
+                use: look before filtering.
         Returns:
             SampleFeatureSet instance with features at the specified rank
         """
@@ -838,6 +898,29 @@ class TaxonomicProfiles:
         if samples is not None:
             long_lf = long_lf.filter(pl.col("sample").is_in(list(samples)))
 
+        mode = canonical_transform(transform)
+
+        all_samples: Optional[List[str]] = None
+        if min_prevalence:
+            long_lf, all_samples = self._filter_by_prevalence(
+                long_lf,
+                rank,
+                float(min_prevalence),
+                groups=prevalence_groups,
+            )
+
+        if icc_groups is not None and (
+            max_icc is not None or icc_report is not None
+        ):
+            long_lf, all_samples = self._apply_icc(
+                long_lf,
+                rank,
+                icc_groups,
+                max_icc,
+                icc_report,
+                all_samples,
+            )
+
         if stream_path is None:
             features = long_lf.collect().pivot(
                 values="relabund",
@@ -845,6 +928,23 @@ class TaxonomicProfiles:
                 on="taxonomy",
                 aggregate_function="first",
             )
+            features = self._pad_samples(features, all_samples)
+            # Same shape as the streamed path: a sample without a taxon
+            # has zero of it, not an unknown amount, and Float32 is what
+            # the models consume. Without this the two paths disagree.
+            taxa_cols = [c for c in features.columns if c != "sample"]
+            if taxa_cols:
+                features = features.with_columns(
+                    pl.col(taxa_cols).fill_null(0.0).cast(pl.Float32)
+                )
+                if mode == "clr":
+                    features = self._apply_clr(
+                        features, taxa_cols, float(clr_pseudocount)
+                    )
+                elif mode == "presence":
+                    features = self._apply_presence(
+                        features, taxa_cols, float(presence_threshold)
+                    )
             return SampleFeatureSet.from_df(
                 df=features, name=f"{rank.name.lower()}_features"
             )
@@ -854,7 +954,280 @@ class TaxonomicProfiles:
             rank=rank,
             stream_path=Path(stream_path),
             chunk_samples=max(1, int(chunk_samples)),
+            sample_ids=all_samples,
+            transform=mode,
+            clr_pseudocount=float(clr_pseudocount),
+            presence_threshold=float(presence_threshold),
         )
+
+    @staticmethod
+    def _apply_clr(
+        wide: pl.DataFrame, taxa: List[str], pseudocount: float
+    ) -> pl.DataFrame:
+        """Centred log-ratio across the taxa of one sample.
+
+        clr(x)_j = ln(x_j + p) - mean_k ln(x_k + p). Subtracting the mean
+        of the logs is the same as dividing by the geometric mean, with
+        no separate product to overflow. The pseudocount is unavoidable:
+        the table is mostly zeros and log(0) is undefined, so the choice
+        of p sets how far below the smallest real value a zero lands.
+
+        Row-wise, so a streamed chunk can be transformed on its own --
+        but only because each chunk already carries every taxon column.
+        It is a *subcomposition* of whatever taxa survived the prevalence
+        filter, which is the usual compromise.
+        """
+        if not taxa:
+            return wide
+        logged = wide.with_columns(
+            pl.col(taxa).cast(pl.Float64).add(pseudocount).log()
+        )
+        logged = logged.with_columns(
+            pl.mean_horizontal(taxa).alias("__clr_gm")
+        )
+        return logged.with_columns(
+            (pl.col(taxa) - pl.col("__clr_gm")).cast(pl.Float32)
+        ).drop("__clr_gm")
+
+    @staticmethod
+    def _apply_presence(
+        wide: pl.DataFrame, taxa: List[str], threshold: float = 0.0
+    ) -> pl.DataFrame:
+        """Presence/absence: 1 where the taxon is detected, 0 where not.
+
+        Throws away abundance and keeps membership. Sequencing depth and
+        library protocol move abundances a great deal more than they move
+        which taxa are detectable at all, so a binary table carries less
+        of the between-study artefact that a leave-one-bioproject-out
+        split asks the model to survive.
+
+        `threshold` is a floor a taxon's relative abundance must exceed
+        before it counts as present, for shedding barcode bleed and other
+        near-zero detections. The default 0.0 means any non-zero value is
+        presence, which is also how the prevalence filter counts, so the
+        two agree unless the threshold is raised.
+
+        Row-wise and independent of the other samples, so a streamed
+        chunk can be transformed on its own -- unlike CLR, this does not
+        even need the full column list.
+
+        Stays Float32 rather than becoming boolean or UInt8: every other
+        path here writes Float32, streamed chunks must share one schema,
+        and the models take floats regardless.
+        """
+        if not taxa:
+            return wide
+        return wide.with_columns((pl.col(taxa) > threshold).cast(pl.Float32))
+
+    @staticmethod
+    def _pad_samples(
+        wide: pl.DataFrame, all_samples: Optional[List[str]]
+    ) -> pl.DataFrame:
+        """Add back samples the prevalence filter emptied, as blank rows.
+
+        The caller fills the nulls with 0.0, so a diagonal concat is all
+        that is needed here.
+        """
+        if not all_samples:
+            return wide
+        present = set(wide.get_column("sample").to_list())
+        absent = [s for s in all_samples if s not in present]
+        if not absent:
+            return wide
+        return pl.concat(
+            [wide, pl.DataFrame({"sample": absent})], how="diagonal"
+        )
+
+    def _apply_icc(
+        self,
+        long_lf: pl.LazyFrame,
+        rank: TaxonomicRanks,
+        groups: pl.DataFrame,
+        max_icc: Optional[float],
+        report: Optional[Union[str, Path]],
+        all_samples: Optional[List[str]],
+    ) -> Tuple[pl.LazyFrame, Optional[List[str]]]:
+        """Rank taxa by ICC, write the table, optionally drop the top.
+
+        Runs *after* the prevalence filter, so the table describes the
+        taxa that will actually reach the model rather than the long tail
+        the pivot was never going to include.
+
+        Unsupervised, like the prevalence filter: it reads abundances and
+        the grouping, never a label, so it cannot leak the target. What
+        it can do is remove a taxon that predicts the label *through* the
+        study it came from -- which is the point, and also the risk.
+        """
+        # A dropped taxon can empty a sample, exactly as the prevalence
+        # filter can, so the pre-filter sample list has to exist before
+        # anything is removed or _pad_samples has nothing to restore.
+        if all_samples is None:
+            all_samples = sorted(
+                long_lf.select("sample")
+                .unique()
+                .collect()
+                .get_column("sample")
+                .to_list()
+            )
+
+        table = taxon_icc(long_lf, groups, samples=all_samples)
+        if report is not None:
+            path = Path(report)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            table.write_csv(path, separator="	")
+            logger.info("Wrote %d-row ICC table to %s", table.height, path)
+
+        if max_icc is None:
+            return long_lf, all_samples
+
+        if not table.height:
+            logger.warning(
+                "features.icc.max_icc is set but the ICC table is empty; "
+                "nothing dropped"
+            )
+            return long_lf, all_samples
+
+        # A null ICC means the design could not support the estimate, not
+        # that the taxon is clean, so keep it and say so rather than
+        # dropping on a missing value.
+        unknown = int(table.filter(pl.col("icc").is_null()).height)
+        if unknown:
+            logger.warning(
+                "%d of %d taxa have no ICC estimate (too few groups or "
+                "samples); they are kept",
+                unknown,
+                table.height,
+            )
+        drop = (
+            table.filter(pl.col("icc") > float(max_icc))
+            .get_column("taxonomy")
+            .to_list()
+        )
+        logger.info(
+            "ICC filter max_icc=%.3g: dropping %d of %d %s taxa",
+            float(max_icc),
+            len(drop),
+            table.height,
+            rank.name.lower(),
+        )
+        if not drop:
+            return long_lf, all_samples
+        if len(drop) == table.height:
+            logger.warning(
+                "features.icc.max_icc=%.3g drops every %s taxon; raise it",
+                float(max_icc),
+                rank.name.lower(),
+            )
+        return long_lf.filter(~pl.col("taxonomy").is_in(drop)), all_samples
+
+    def _filter_by_prevalence(
+        self,
+        long_lf: pl.LazyFrame,
+        rank: TaxonomicRanks,
+        min_prevalence: float,
+        groups: Optional[pl.DataFrame] = None,
+    ) -> Tuple[pl.LazyFrame, List[str]]:
+        """Keep taxa present in at least *min_prevalence* of samples.
+
+        Returns the filtered frame and the sample list as it was *before*
+        filtering, so no sample is lost just because all of its taxa were.
+
+        Unsupervised -- it reads abundances only, never a label, so it
+        cannot leak the target. Counted on the long frame, where a row
+        exists only for a taxon that is present, so this is a group_by
+        over sparse data rather than a pass over the wide matrix.
+        """
+        before = (
+            long_lf.select("sample").unique().collect().get_column("sample")
+        )
+        all_samples = sorted(before.to_list())
+        n_samples = len(all_samples)
+        n_taxa = int(
+            long_lf.select(pl.col("taxonomy").n_unique()).collect().item()
+        )
+        if not n_samples:
+            return long_lf, all_samples
+
+        # Counting samples lets one big project make a taxon look common.
+        # Counting groups asks the more useful question: in how many
+        # independent studies does this taxon turn up at all?
+        present = long_lf.filter(pl.col("relabund") > 0)
+        if groups is None:
+            unit, count_col = "sample", "sample"
+            n_units = n_samples
+        else:
+            gcol = next(c for c in groups.columns if c != "sample")
+            present = present.join(
+                groups.lazy().select(["sample", gcol]),
+                on="sample",
+                how="inner",
+            )
+            unit, count_col = gcol, gcol
+            n_units = int(
+                groups.filter(pl.col("sample").is_in(all_samples))
+                .get_column(gcol)
+                .n_unique()
+            )
+            if not n_units:
+                logger.warning(
+                    "Prevalence grouping '%s' matched no sample; "
+                    "falling back to counting samples",
+                    gcol,
+                )
+                present = long_lf.filter(pl.col("relabund") > 0)
+                unit, count_col, n_units = "sample", "sample", n_samples
+
+        need = max(1, int(min_prevalence * n_units))
+        kept = (
+            present.group_by("taxonomy")
+            .agg(pl.col(count_col).n_unique().alias("n"))
+            .filter(pl.col("n") >= need)
+            .select("taxonomy")
+            .collect()
+            .get_column("taxonomy")
+            .to_list()
+        )
+        logger.info(
+            "Prevalence filter %.3g%%: keeping %d of %d %s taxa "
+            "(present in >= %d of %d %ss)",
+            100 * min_prevalence,
+            len(kept),
+            n_taxa,
+            rank.name.lower(),
+            need,
+            n_units,
+            unit,
+        )
+        if not kept:
+            logger.warning(
+                "Prevalence filter removed every %s taxon; lower "
+                "features.min_prevalence",
+                rank.name.lower(),
+            )
+        filtered = long_lf.filter(pl.col("taxonomy").is_in(kept))
+
+        # A sample whose every taxon was rare now has no rows at all. It
+        # keeps its place in the matrix as a row of zeros -- the filter is
+        # about columns, and "carries no common taxon" is itself a fact
+        # about that sample, which still has a label worth predicting.
+        remaining = (
+            filtered.select("sample")
+            .unique()
+            .collect()
+            .get_column("sample")
+            .to_list()
+        )
+        emptied = n_samples - len(remaining)
+        if emptied:
+            logger.warning(
+                "Prevalence filter left %d of %d sample(s) with no %s "
+                "taxon above the threshold; they are kept as all-zero "
+                "rows",
+                emptied,
+                n_samples,
+                rank.name.lower(),
+            )
+        return filtered, all_samples
 
     def _stream_features(
         self,
@@ -862,6 +1235,10 @@ class TaxonomicProfiles:
         rank: TaxonomicRanks,
         stream_path: Path,
         chunk_samples: int,
+        sample_ids: Optional[List[str]] = None,
+        transform: str = "relabund",
+        clr_pseudocount: float = 1e-6,
+        presence_threshold: float = 0.0,
     ) -> SampleFeatureSet:
         """Pivot a rank to `stream_path` a chunk of samples at a time.
 
@@ -878,14 +1255,19 @@ class TaxonomicProfiles:
             .sort()
             .to_list()
         )
-        sample_ids = (
-            long_lf.select("sample")
-            .unique()
-            .collect()
-            .get_column("sample")
-            .sort()
-            .to_list()
-        )
+        # The prevalence filter passes the pre-filter list, so a sample
+        # whose every taxon was dropped still gets its row of zeros.
+        if sample_ids is None:
+            sample_ids = (
+                long_lf.select("sample")
+                .unique()
+                .collect()
+                .get_column("sample")
+                .sort()
+                .to_list()
+            )
+        else:
+            sample_ids = sorted(sample_ids)
         if not taxa or not sample_ids:
             logger.warning(
                 "No %s features found; nothing to stream", rank.name.lower()
@@ -906,34 +1288,62 @@ class TaxonomicProfiles:
         )
         stream_path.parent.mkdir(parents=True, exist_ok=True)
         columns = ["sample", *taxa]
-        first = True
-        with stream_path.open("wb") as handle:
-            for start in range(0, len(sample_ids), chunk_samples):
+        # Parquet cannot be appended to in place without pyarrow, so each
+        # chunk becomes one row-group file in a directory -- the standard
+        # layout, read back by scan_parquet("<dir>/*.parquet").
+        parquet = stream_path.suffix == ".parquet"
+        handle = None
+        if parquet:
+            shutil.rmtree(stream_path, ignore_errors=True)
+            stream_path.mkdir(parents=True, exist_ok=True)
+        else:
+            handle = stream_path.open("wb")
+        try:
+            for part, start in enumerate(
+                range(0, len(sample_ids), chunk_samples)
+            ):
                 batch = sample_ids[start : start + chunk_samples]
+                sub = long_lf.filter(pl.col("sample").is_in(batch)).collect()
                 wide = (
-                    long_lf.filter(pl.col("sample").is_in(batch))
-                    .collect()
-                    .pivot(
+                    sub.pivot(
                         values="relabund",
                         index="sample",
                         on="taxonomy",
                         aggregate_function="first",
                     )
+                    if sub.height
+                    else pl.DataFrame({"sample": batch})
                 )
+                wide = self._pad_samples(wide, batch)
                 # A chunk only carries the taxa its samples have; pad the
-                # rest so every block written shares one schema.
+                # rest so every block written shares one schema. 0.0 and
+                # not null: absent means zero abundance, and a null would
+                # have to be filled again on every later read.
                 missing = [c for c in taxa if c not in wide.columns]
                 if missing:
                     wide = wide.with_columns(
                         [
-                            pl.lit(None, dtype=pl.Float64).alias(c)
+                            pl.lit(0.0, dtype=pl.Float32).alias(c)
                             for c in missing
                         ]
                     )
-                wide = wide.select(columns)
-                wide.write_csv(handle, include_header=first)
-                first = False
+                wide = wide.select(columns).with_columns(
+                    pl.col(taxa).fill_null(0.0).cast(pl.Float32)
+                )
+                if transform == "clr":
+                    wide = self._apply_clr(wide, taxa, clr_pseudocount)
+                elif transform == "presence":
+                    wide = self._apply_presence(wide, taxa, presence_threshold)
+                if parquet:
+                    wide.write_parquet(
+                        stream_path / f"part_{part:05d}.parquet"
+                    )
+                else:
+                    wide.write_csv(handle, include_header=part == 0)
                 del wide
+        finally:
+            if handle is not None:
+                handle.close()
 
         return SampleFeatureSet.scan(
             stream_path, name=f"{rank.name.lower()}_features"

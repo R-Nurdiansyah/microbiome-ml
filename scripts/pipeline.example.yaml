@@ -77,10 +77,126 @@ features:
   # dataset a chunk of samples at a time, so peak memory is roughly
   # chunk_samples x number of taxa rather than the whole matrix.
   chunk_samples: 5000
+  # On-disk format for the streamed feature tables.
+  #   csv     -> the default; readable, but a text zero has no dtype, so
+  #              polars reads the table back as Float64 -- 8 bytes for
+  #              every zero in a 99%-sparse genus matrix.
+  #   parquet -> columnar and typed: Float32 survives the round trip, the
+  #              file is a fraction of the size, and every later job scans
+  #              it instead of re-parsing text. Written as a directory of
+  #              row-group parts, <prefix>_<rank>.parquet/.
+  # Changing this needs the dataset rebuilt (-R prepare) or the existing
+  # tables converted -- see "Converting an existing dataset" in the README.
+  format: csv
+  # Drop taxa present (non-zero) in fewer than this fraction of samples.
+  # null (or absent) = keep every taxon, which is the old behaviour.
+  #   0.01 -> present in >=1% of samples. On a 59,443-genus soil table
+  #           that keeps ~8,500 columns and 97.6% of the total abundance.
+  #   0.05 -> ~2,500 columns, 88.7% of abundance.
+  # Unsupervised: it reads abundances only, never a label, so it cannot
+  # leak the target. Counted once over the samples being built, not per
+  # CV fold. Say so in your methods.
+  min_prevalence: null
+  # What prevalence counts. null (default) = samples. A grouping column
+  # name (e.g. bioproject) counts DISTINCT GROUPS instead: "in how many
+  # independent studies does this taxon appear at all", so one large
+  # project cannot make a taxon look common on its own. Needs the column
+  # under groupings. Names the set <prefix>_<rank>_bio.
+  prevalence_by: null
+  # How abundances are expressed.
+  #   relabund -> the default; values stay relative abundances, which are
+  #               a constant-sum composition (every sample adds to 1).
+  #   clr      -> centred log-ratio per sample across the taxa kept at
+  #               this rank: ln(x + p) minus the mean of those logs.
+  #               Puts features on an additive scale, which tree models
+  #               and correlations handle more sensibly than proportions.
+  #               Names the set <prefix>_<rank>_clr.
+  #   presence -> 1 if the taxon is there, 0 if not; abundance is
+  #               discarded. Depth and library protocol shift abundances
+  #               far more than they shift which taxa are detectable, so
+  #               this sheds much of the between-study artefact that a
+  #               leave-one-bioproject-out split has to survive.
+  #               Names the set <prefix>_<rank>_pa.
+  # One value per run, and they cannot share a prepared dataset:
+  # Dataset.load reads its feature sets from manifest.json, so a second
+  # prepare into the same base_dir rewrites the manifest and orphans the
+  # first transform's table on disk. Comparing transforms means one run
+  # each into its own base_dir --
+  #   scripts/sweep_transforms.py drives that loop and writes one
+  #   summary across the runs.
+  transform: relabund
+  # Added before the log, since the table is mostly zeros and log(0) is
+  # undefined. Sets how far below the smallest real value a zero lands.
+  # Only used when transform: clr.
+  clr_pseudocount: 1.0e-6
+  # Relative abundance a taxon must exceed before it counts as present.
+  # 0.0 = any non-zero value, which matches how min_prevalence counts.
+  # Raise it (e.g. 1.0e-4) to ignore barcode bleed and other near-zero
+  # detections. Only used when transform: presence.
+  presence_threshold: 0.0
   # Build features only for samples that have at least one non-null
   # label. CV, the trainer and SHAP never touch an unlabelled sample, so
   # this is free unless you want the saved dataset to cover everything.
   labelled_only: false
+
+  # Per-taxon intraclass correlation: what fraction of a taxon's variance
+  # across samples is explained by knowing which study it came from.
+  #   ICC ~ 1 -> flat inside every study, different between them. Knowing
+  #             the bioproject tells you the abundance. That is a protocol
+  #             artefact (primer bias, extraction kit, depth, a lab's
+  #             contaminant), and a tree splitting on it is learning which
+  #             study it is looking at -- worthless under bioproject_logo.
+  #   ICC ~ 0 -> moves as much inside a study as across studies, so
+  #             something other than batch is driving it.
+  # Unsupervised: reads abundances and the grouping, never a label.
+  # Always measured on relative abundance, whatever `transform` is set to:
+  # it runs on the long table, before the pivot and before clr/presence,
+  # so the number stays interpretable and comparable across transforms.
+  # Runs after the prevalence filter, so it describes the taxa that will
+  # actually reach the model rather than the whole long tail.
+  icc:
+    # false = compute nothing. Costs one group_by over the long table.
+    enabled: false
+    # Grouping column to measure against; must exist under groupings.
+    group: bioproject
+    # Write <features>_icc.tsv next to the streamed feature tables,
+    # ranked by ICC so the study markers are at the top. Look at this
+    # first -- it is the useful half of the feature.
+    report: true
+    # Drop taxa above this ICC. null = rank only, drop nothing.
+    #
+    # READ THE TABLE BEFORE SETTING THIS. Every label here carries 57-80%
+    # of its variance between bioprojects, so a taxon that genuinely
+    # predicts the label must also vary between studies and will also
+    # score a high ICC. Variance structure alone cannot tell batch from
+    # signal under that confound. Excluding named contaminants you can
+    # see in the table is a safer move than a blind threshold.
+    max_icc: null
+
+  # Shadow features: a measured noise floor for the importance table.
+  # A shadow is a real column shuffled across samples -- same values,
+  # same sparsity, no relationship to any label -- so whatever importance
+  # it earns is what the model hands out for nothing. Borrowed from
+  # Boruta, without Boruta's ~100 forest fits.
+  #
+  # This is the comparison the importance report cannot otherwise make:
+  # "the forest used 1,155 of 4,260 columns" and "1,155 columns the tree
+  # had to split on something" look identical without a null.
+  shadow:
+    # Builds <set>_shad alongside each taxonomic set, holding every real
+    # column PLUS the shadows (the comparison only means anything inside
+    # one fit). The clean set is untouched. Name the _shad set in
+    # cv.feature_set to actually train on it, e.g.
+    #   cv: {feature_set: [tax_genus, tax_genus_shad]}
+    enabled: false
+    # How many shadow columns. More = a better-calibrated null; with far
+    # fewer shadows than real columns, the best shadow is the max of
+    # fewer draws and the report's `real>max` over-counts. ~2% of the
+    # column count is cheap and usually enough.
+    n: 200
+    # Fixes which columns are copied and how they shuffle, so a rerun
+    # reproduces the same null.
+    seed: 1234
 
 preprocessing:
   # Master switch for the QC steps below. false = use the data as given.
@@ -136,6 +252,21 @@ split:
     label: null                    # null = folds for every label
     n_folds: 5
     n_bins: 5                      # label stratification, as above
+    # How to cut the groups into folds. One, or both as a list.
+    #   kfold -> pack the groups into n_folds stratified folds (the
+    #            default; one scheme per grouping, named <grouping>)
+    #   logo  -> leave-one-group-out, sklearn's LeaveOneGroupOut: every
+    #            group becomes its own validation fold, so the number of
+    #            folds is the number of groups. Named <grouping>_logo.
+    #            Needs a grouping, so `random` never gets a LOGO variant.
+    # Both doubles the number of CV jobs, and LOGO fits one model per
+    # group, so it suits a grouping with few, well-populated groups.
+    methods: [kfold]
+    # Refuse a LOGO scheme whose grouping has more usable groups than
+    # this -- it would be that many CV iterations per model. Groups with
+    # a single sample cannot be a validation fold (R2 needs 2+ points);
+    # they stay in training for every iteration and do not count here.
+    logo_max_groups: 50
     # Which fold schemes to build (each scheme = a different way to cut the
     # train samples into folds):
     #   all      -> `random` + one scheme per grouping column
@@ -187,8 +318,100 @@ cv:
 # combination per label/scheme, but nothing is refit or scored on the test
 # set. The holdout split is still created and saved under splits/, so a later
 # run with the same split.* settings evaluates on the identical test samples.
+# Score the model that is fitted on the WHOLE training pool, rather than
+# on k-1 folds like every CV number. That model already exists -- the CV
+# stage fits it after cross_validate and currently only reads feature
+# importances off it -- so this scores it rather than training anything.
+#
+# Writes <base_dir>/final_fit/:
+#   full_fit_metrics.csv      one row per label x CV scheme
+#   full_fit_importances.csv  top_n features of that full-pool fit
+#
+# Columns worth knowing:
+#   in_sample_r2   the fit scored on the rows it trained on. A CEILING,
+#                  not a performance estimate -- a random forest lands
+#                  near 1.0 on almost anything.
+#   oob_r2         out-of-bag R2: each row scored by the trees that did
+#                  not draw it. Genuinely held out, and free because it
+#                  rides along with the fit. Random-forest only; an
+#                  XGBoost row leaves it empty.
+#   overfit_gap    in_sample_r2 minus the pooled CV score. How much of
+#                  the in-sample fit is memorisation.
+#
+# READ oob_r2 LIKE A RANDOM SPLIT. Bootstrap draws rows, not groups, so
+# a row's own study is nearly always among the trees scoring it. Where
+# study identity predicts the label -- which is this data -- OOB will
+# look like the `random` scheme and far better than bioproject_logo. It
+# says the fit converged, not that it will transfer to a new study.
+#
+# Independent of holdout_evaluation: this describes the training fit, so
+# it still runs with the holdout stage switched off.
+final_fit:
+  # false = compute nothing, which is the default.
+  enabled: false
+  # Ask for the out-of-bag score. Costs an OOB pass on each fit rather
+  # than a refit; set false to skip it and keep in-sample only.
+  oob: true
+  # Features listed in full_fit_importances.csv per label x scheme.
+  top_n: 20
+
 holdout_evaluation:
   enabled: true
+
+# Snakemake only. One extra rule at the end of a sweep, reading the CV
+# exports that already exist -- no model is refitted or unpickled, so it
+# costs seconds. Writes <base>/feature_report/:
+#   rank_comparison.tsv           pooled R2 per rank, coarse -> fine, so
+#                                 you can see whether genus beats order
+#   importance_concentration.tsv  how many features carry each share of
+#                                 the total importance, and how many the
+#                                 model never split on at all
+#   importance_kept_taxa.tsv      those features, named, with their
+#                                 cumulative share -- the LARGEST
+#                                 coverage below; the smaller sets are
+#                                 nested inside it
+#   feature_report.txt            both tables, readable
+# Run it alone against any finished output directory:
+#   python scripts/rank_feature_report.py --root <base>
+# Read by scripts/prune_iterate_cv.py only -- not part of the Snakemake
+# DAG. Each round runs CV, drops the features whose importance came back
+# exactly zero (the model never split on them), and runs the same CV
+# again on what is left. It stops early when a round drops nothing.
+# Unlike feature_report this costs real compute, so it is off by default;
+# --iterations on the command line overrides `enabled` either way.
+#   python scripts/prune_iterate_cv.py --config pipeline.yaml \
+#       --dataset <base>/prepared --splits <base>/<run>/splits \
+#       --label ph --scheme bioproject_logo --iterations 3 --out out/prune
+# The scores it reports come from the same folds the pruning was derived
+# from, so they are optimistic; use them to see how much can be dropped
+# before the score moves, and the holdout for the honest number.
+feature_pruning:
+  enabled: false
+  # Prune/re-run rounds after the baseline. 0 = baseline CV only.
+  iterations: 1
+  # What a round drops.
+  #   zero     -> (default) keep every feature with importance above
+  #               zero, i.e. drop only what the model never split on.
+  #               Settles after a round or two.
+  #   coverage -> keep the smallest set reaching `coverage` of the total
+  #               importance, the count the feature report calls
+  #               n_for_95pct. Much more aggressive, and it does drop
+  #               features the model used. It takes a fraction of
+  #               whatever is left every round, so it keeps shrinking
+  #               until min_features stops it -- set that on purpose.
+  prune: zero
+  # Only read when prune: coverage.
+  coverage: 0.95
+  # Never let a round leave fewer features than this.
+  min_features: 10
+
+feature_report:
+  enabled: true
+  # Shares of total importance to report, one column each. The largest
+  # also decides n_dropped and which taxa land in the kept-taxa file.
+  coverage: [0.5, 0.9, 0.95]
+  # Features printed per combination in the text report; the TSV is full.
+  top: 25
 
 outputs:
   # Everything below is written under here (also overridable with

@@ -84,6 +84,17 @@ _CATEGORICAL_HUES = (
 _OTHER_HUE = "#bdbdbd"  # lighter than tab10 grey, so the two never merge
 
 
+def _fmt_r2(value: float) -> str:
+    """An R2 a human can read at a glance.
+
+    In range it is a 3-decimal score; a blown-up fold is thousands-
+    separated and loses the decimals nobody reads at that magnitude.
+    """
+    if not np.isfinite(value):
+        return "n/a"
+    return f"{value:,.3f}" if abs(value) < 1000 else f"{value:,.0f}"
+
+
 class Visualiser:
     """Wrap CV exports and holdout diagnostics around a single output root."""
 
@@ -287,6 +298,8 @@ class Visualiser:
             # If multiple records per key, flatten their folds together in order
             folds: List[float] = []
             avg_r_vals: List[float] = []
+            pooled_vals: List[float] = []
+            sst_vals: List[float] = []
             avg_mse_vals: List[float] = []
             for r in recs:
                 vals = (
@@ -300,6 +313,19 @@ class Visualiser:
                             folds.append(float(v))
                         except Exception:
                             continue
+                ssts = r.get("validation_sst_per_fold") or []
+                if isinstance(ssts, (list, tuple)):
+                    for v in ssts:
+                        try:
+                            sst_vals.append(float(v))
+                        except Exception:
+                            sst_vals.append(float("nan"))
+                pr2 = r.get("pooled_validation_r2")
+                if pr2 is not None:
+                    try:
+                        pooled_vals.append(float(pr2))
+                    except Exception:
+                        pass
                 ar2 = r.get("avg_validation_r2")
                 if ar2 is not None:
                     try:
@@ -322,22 +348,30 @@ class Visualiser:
             if not folds:
                 continue
 
-            # compute avg line value (prefer provided avg if single rec, else mean of avg_r_vals or mean of folds)
-            if len(recs) == 1:
-                avg_line = recs[0].get("avg_validation_r2")
-                try:
-                    avg_line = (
-                        float(avg_line)
-                        if avg_line is not None
-                        else float(sum(folds) / len(folds))
-                    )
-                except Exception:
-                    avg_line = float(sum(folds) / len(folds))
+            # A fold whose held-out group has a constant label has
+            # SST = 0: R2 is undefined and scikit-learn reports 0.0, which
+            # on a bar chart reads as a real, mediocre score. Mark those
+            # and leave them out of the reference line, as pooled R2 does.
+            # Older records carry no SST, so fall back to the rule
+            # CV_Result uses: an exact 0.0 is degenerate.
+            if len(sst_vals) == len(folds):
+                usable = [i for i, t in enumerate(sst_vals) if t > 0]
             else:
-                if avg_r_vals:
-                    avg_line = float(sum(avg_r_vals) / len(avg_r_vals))
-                else:
-                    avg_line = float(sum(folds) / len(folds))
+                usable = [i for i, v in enumerate(folds) if v != 0.0]
+            skipped = set(range(len(folds))) - set(usable)
+
+            # Reference line: pooled R2 -- each fold weighted by the
+            # variance it had to explain -- which is what the sweep ranks
+            # on. The mean is the fallback for a pre-pooled run.
+            line_label = "pooled r²"
+            if pooled_vals:
+                avg_line = float(sum(pooled_vals) / len(pooled_vals))
+            elif avg_r_vals:
+                line_label = "average r²"
+                avg_line = float(sum(avg_r_vals) / len(avg_r_vals))
+            else:
+                line_label = "average r²"
+                avg_line = float(sum(folds) / len(folds))
 
             # compute avg_validation_mse to display under the plot (mean if multiple)
             if len(recs) == 1:
@@ -360,15 +394,72 @@ class Visualiser:
             width = max(4, n * figsize_per_fold)
             fig, ax = plt.subplots(figsize=(width, 4))
             x = list(range(1, n + 1))
-            ax.bar(x, folds, color=bar_color, edgecolor="black")
-            ax.plot(
+
+            # R2 has no lower bound: one leave-one-group-out fold can score
+            # -838,150 and flatten every other bar onto the baseline. Fix the
+            # axis at [-1, 1] -- the range R2 is readable in -- draw anything
+            # below -1 to the floor with a break mark, and print its real
+            # value. The axis is the same height on every plot, so runs can
+            # be compared side by side; with no negative fold the lower half
+            # is dropped and the plot keeps its size.
+            floor = -1.0
+            y_bottom = floor if min(folds) < 0 else 0.0
+            span = 1.0 - y_bottom
+            drawn = [min(max(v, floor), 1.0) for v in folds]
+
+            ax.bar(
                 x,
-                [avg_line] * n,
-                color="k",
-                linestyle="--",
-                marker="o",
-                label=f"average r2 {avg_line:.3f}",
+                drawn,
+                color=[
+                    _OTHER_HUE if i in skipped else bar_color
+                    for i in range(len(folds))
+                ],
+                edgecolor="none",
+                zorder=2,
             )
+            ax.set_ylim(y_bottom, 1.0)
+            ax.set_yticks(
+                [-1.0, -0.5, 0.0, 0.5, 1.0]
+                if y_bottom < 0
+                else [0.0, 0.25, 0.5, 0.75, 1.0]
+            )
+            if y_bottom < 0:
+                ax.axhline(0.0, color="#999999", lw=0.8, zorder=1)
+
+            # Break mark on a clipped bar: two surface-coloured slashes just
+            # above the floor, the usual "this bar runs off the scale" cue.
+            for xi, v in zip(x, folds):
+                if v >= floor:
+                    continue
+                for off in (0.05, 0.09):
+                    ax.plot(
+                        [xi - 0.42, xi + 0.42],
+                        [
+                            y_bottom + span * (off - 0.012),
+                            y_bottom + span * (off + 0.012),
+                        ],
+                        color="white",
+                        lw=2,
+                        solid_capstyle="butt",
+                        zorder=3,
+                    )
+
+            avg_txt = f"{line_label} {_fmt_r2(avg_line)}"
+            if skipped:
+                avg_txt += f" ({len(usable)}/{len(folds)} folds)"
+            if y_bottom <= avg_line <= 1.0:
+                ax.axhline(
+                    avg_line,
+                    color="#222222",
+                    linestyle="--",
+                    lw=1.5,
+                    zorder=4,
+                    label=avg_txt,
+                )
+            else:
+                # Off the axis -- a line at the floor would read as a value.
+                ax.plot([], [], " ", label=f"{avg_txt} (off scale)")
+
             ax.set_xlabel("Fold")
             ax.set_ylabel("Validation R²")
             title = f"{feature_set} — {label} — {scheme} — {model}"
@@ -376,19 +467,46 @@ class Visualiser:
             ax.set_xticks(x)
 
             if show_values:
-                # Always inside the bar at its far end: just below the top
-                # for positive bars, just above the bottom for negative ones.
-                for xi, v in zip(x, folds):
+                for i, (xi, v, dv) in enumerate(zip(x, folds, drawn)):
+                    if i in skipped:
+                        # not "zero variance explained" -- no variance to
+                        # explain, so R2 does not exist for this fold
+                        ax.annotate(
+                            "n/a",
+                            xy=(xi, dv),
+                            xytext=(0, 3 if dv >= 0 else -3),
+                            textcoords="offset points",
+                            ha="center",
+                            va="bottom" if dv >= 0 else "top",
+                            fontsize=8,
+                            color="#555555",
+                            fontstyle="italic",
+                            zorder=5,
+                        )
+                        continue
+                    clipped = v < floor
+                    # White inside the bar only when the bar is tall enough
+                    # to hold the text; otherwise dark ink outside its end,
+                    # else short bars print white on a white background.
+                    inside = clipped or abs(dv) >= 0.18 * span
+                    up = dv >= 0
+                    # Text runs back into the bar when it sits inside the
+                    # far end of an upward bar, or outside the end of a
+                    # downward one -- the same condition either way.
+                    back = inside == up
                     ax.annotate(
-                        f"{v:.3f}",
-                        xy=(xi, v),
-                        xytext=(0, -3 if v >= 0 else 3),
+                        _fmt_r2(v),
+                        # clipped: clear of the break mark, reading upwards
+                        xy=(xi, y_bottom + span * 0.13 if clipped else dv),
+                        xytext=(0, -3 if back else 3),
                         textcoords="offset points",
                         ha="center",
-                        va="top" if v >= 0 else "bottom",
+                        va="top" if back else "bottom",
                         fontsize=8,
-                        color="white",
+                        color="white" if inside else "#222222",
                         fontweight="bold",
+                        rotation=90 if clipped else 0,
+                        zorder=5,
                     )
 
             ax.legend(loc="best")

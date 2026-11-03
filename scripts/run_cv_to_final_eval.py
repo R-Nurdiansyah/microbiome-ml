@@ -33,6 +33,7 @@ except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from microbiome_ml.train.cv import CrossValidator  # noqa: E402
+from microbiome_ml.train.full_fit import write_full_fit_report  # noqa: E402
 from microbiome_ml.train.results import (  # noqa: E402
     CV_Result,
     HoldoutEvaluation,
@@ -40,7 +41,10 @@ from microbiome_ml.train.results import (  # noqa: E402
 from microbiome_ml.train.trainer import ModelTrainer  # noqa: E402
 from microbiome_ml.utils.logging import setup_logging  # noqa: E402
 from microbiome_ml.visualise.visualisations import Visualiser  # noqa: E402
-from microbiome_ml.wrangle.dataset import Dataset  # noqa: E402
+from microbiome_ml.wrangle.dataset import (  # noqa: E402
+    Dataset,
+    rank_from_feature_set,
+)
 
 LOGGER = logging.getLogger("pipeline")
 
@@ -163,13 +167,21 @@ def plot_holdout_distributions(
     vis_cfg: Dict[str, Any],
     out_dir: Path,
     holdout_grouping: Optional[str] = None,
+    stack_by: Optional[str] = None,
 ) -> None:
     """Label distribution train vs test, one figure per label.
 
-    Driven by `visualise.holdout_distribution` in the config. `grouping:
-    auto` stacks by the column that defined the holdout when there is one
-    (so you can see which groups landed in test), falling back to no
-    stacking for a random or taxon holdout.
+    Driven by `visualise.holdout_distribution` in the config.
+
+    Args:
+        holdout_grouping: What to call this run in the returned stats, and
+            so in holdout_distribution_summary.txt. May be a run stamp
+            such as ``bioproject__temperature``.
+        stack_by: The metadata *column* the bars stack by under
+            ``grouping: auto``. Separate from `holdout_grouping` because a
+            run stamp is not a column name. None, or a name the holdout
+            table does not have, falls back to the taxon-presence column
+            when there is one, else no stacking.
     """
     if not bool(vis_cfg.get("enabled", False)):
         return
@@ -197,16 +209,16 @@ def plot_holdout_distributions(
     rows: List[Dict[str, Any]] = []
     for path in holdouts:
         label = path.parent.name
-        grouping = holdout_grouping if grouping_cfg == "auto" else grouping_cfg
-        # `auto` only works for a metadata grouping that is a real column
-        if grouping is not None:
-            header = pl.read_csv(path, n_rows=0).columns
-            if grouping not in header:
-                grouping = (
-                    "holdout_taxon_presence"
-                    if "holdout_taxon_presence" in header
-                    else None
-                )
+        grouping = stack_by if grouping_cfg == "auto" else grouping_cfg
+        # Only a real column can be stacked by; a taxon holdout stacks by
+        # carrier/non-carrier instead, and a random one not at all.
+        header = pl.read_csv(path, n_rows=0).columns
+        if grouping is None or grouping not in header:
+            grouping = (
+                "holdout_taxon_presence"
+                if "holdout_taxon_presence" in header
+                else None
+            )
         try:
             stats = vis.plot_holdout_distribution(
                 path,
@@ -229,6 +241,10 @@ def plot_holdout_distributions(
     if rows:
         # Machine-readable twin of the figures; the sweep collates these
         # into one ranked text report (looking at N figures does not scale).
+        # The directory is ensured here rather than relied on: Visualiser
+        # creates it as a side effect of its own construction, which left
+        # this write depending on an object it does not own.
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
         pl.DataFrame(rows).write_csv(
             Path(out_dir) / "holdout_distribution_stats.tsv", separator="\t"
         )
@@ -323,8 +339,21 @@ _SECTIONS = (
     "features",
     "visualise",
     "shap",
+    "final_fit",
     "holdout_evaluation",
 )
+
+
+def _as_dict(value: Any, name: str) -> Dict[str, Any]:
+    """A nested config block as a mapping; absent, null or false -> {}."""
+    if value is None or value is False:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Config block '{name}' must be a mapping, got "
+            f"{type(value).__name__}"
+        )
+    return value
 
 
 def _sections(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -435,6 +464,23 @@ def build_dataset(
             profiles_rank=prep_cfg.get("profiles_rank", "order"),
         )
 
+    # Per-taxon ICC and the shadow mapping are diagnostics about the
+    # feature table, so they sit beside it rather than in the run outputs.
+    icc_cfg = _as_dict(feature_cfg.get("icc"), "features.icc")
+    shadow_cfg = _as_dict(feature_cfg.get("shadow"), "features.shadow")
+    icc_on = bool(icc_cfg.get("enabled", False))
+    report_dir = (
+        Path(stream_dir).parent / "diagnostics"
+        if stream_dir is not None
+        else None
+    )
+    if report_dir is None and (icc_on or shadow_cfg.get("enabled", False)):
+        LOGGER.warning(
+            "features.icc / features.shadow write their tables next to "
+            "the streamed features, and this run has no stream_dir; the "
+            "filter still applies but no table is written"
+        )
+
     if feature_cfg.get("add_taxonomic_features", True):
         ranks = feature_cfg.get("ranks")
         build_all = bool(feature_cfg.get("all", True))
@@ -446,10 +492,14 @@ def build_dataset(
         wanted = sec["cv"].get("feature_set")
         if wanted:
             wanted = wanted if isinstance(wanted, list) else [wanted]
+            # tax_genus_clr_bio names the genus rank; the suffixes
+            # record how it was built, not what to extract.
             needed = [
-                str(name).split(f"{prefix}_", 1)[-1]
-                for name in wanted
-                if str(name).startswith(f"{prefix}_")
+                r
+                for r in (
+                    rank_from_feature_set(str(name), prefix) for name in wanted
+                )
+                if r
             ]
             if needed:
                 skipped = (
@@ -477,7 +527,40 @@ def build_dataset(
             stream_dir=stream_dir,
             chunk_samples=int(feature_cfg.get("chunk_samples", 5000)),
             labelled_only=bool(feature_cfg.get("labelled_only", False)),
+            file_format=str(feature_cfg.get("format", "csv")),
+            min_prevalence=(
+                None
+                if feature_cfg.get("min_prevalence") in (None, "", False)
+                else float(feature_cfg["min_prevalence"])
+            ),
+            transform=str(feature_cfg.get("transform", "relabund")),
+            clr_pseudocount=float(feature_cfg.get("clr_pseudocount", 1e-6)),
+            presence_threshold=float(
+                feature_cfg.get("presence_threshold", 0.0)
+            ),
+            prevalence_by=feature_cfg.get("prevalence_by") or None,
+            icc_by=(icc_cfg.get("group") or None) if icc_on else None,
+            max_icc=(
+                None
+                if not icc_on or icc_cfg.get("max_icc") in (None, "", False)
+                else float(icc_cfg["max_icc"])
+            ),
+            icc_report_dir=(
+                report_dir
+                if icc_on and icc_cfg.get("report", True) and report_dir
+                else None
+            ),
         )
+
+        # Shadow sets are derived from the taxonomic ones, so they are
+        # built after them and never replace them -- `<set>_shad` carries
+        # every real column plus the shuffled copies.
+        if shadow_cfg.get("enabled", False):
+            dataset = dataset.add_shadow_features(
+                n_shadow=int(shadow_cfg.get("n", 200)),
+                seed=int(shadow_cfg.get("seed", 0)),
+                mapping_dir=report_dir,
+            )
 
     return dataset
 
@@ -566,6 +649,8 @@ def run_from_dataset(
         use_holdout=bool(split_cv_cfg.get("use_holdout", True)),
         force=bool(split_cv_cfg.get("force", True)),
         strict=bool(split_cv_cfg.get("strict", True)),
+        methods=split_cv_cfg.get("methods", "kfold"),
+        logo_max_groups=int(split_cv_cfg.get("logo_max_groups", 50)),
     )
     dataset.save_cv_folds(splits_out)
     LOGGER.info("Saved CV fold assignments to %s", splits_out)
@@ -584,6 +669,7 @@ def run_from_dataset(
         splits_out,
         vis_cfg,
         base_dir / "split_visualisations",
+        stack_by=holdout_cfg.get("grouping"),
         holdout_grouping=(
             f"taxon_{taxon_rank}"
             if taxon_rank
@@ -607,13 +693,20 @@ def run_from_dataset(
     if not isinstance(models, list):
         raise ValueError("cv.models must be a list (e.g., ['rf', 'xgboost'])")
 
+    # Diagnostics for the model fitted on the whole CV pool. Independent
+    # of holdout_evaluation: it describes the training fit, not the test
+    # set, so it still runs when the holdout stage is switched off.
+    final_fit_cfg = _as_dict(sec.get("final_fit"), "final_fit")
+    final_fit_on = bool(final_fit_cfg.get("enabled", False))
+
     cv = CrossValidator(
         dataset=dataset,
         models=models,
-        cv_folds=int(split_cv_cfg.get("n_folds", 5)),
         label=cv_cfg.get("label"),
         scheme=cv_cfg.get("scheme"),
         feature_set=cv_cfg.get("feature_set"),
+        full_fit=final_fit_on,
+        full_fit_oob=bool(final_fit_cfg.get("oob", True)),
     )
 
     mode = str(cv_cfg.get("mode", "run")).strip().lower()
@@ -665,6 +758,13 @@ def run_from_dataset(
         raise RuntimeError("No best CV result was produced")
 
     _log_best_combinations(cv)
+
+    if final_fit_on:
+        write_full_fit_report(
+            cv.best_result_by_label_scheme or {},
+            base_dir / "final_fit",
+            top_n=int(final_fit_cfg.get("top_n", 20)),
+        )
 
     vis_enabled = bool(vis_cfg.get("enabled", False))
     vis_formats = list(vis_cfg.get("formats", ["png"]))
