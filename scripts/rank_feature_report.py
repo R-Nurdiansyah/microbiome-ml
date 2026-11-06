@@ -70,10 +70,43 @@ def _grouping_from(path: Path) -> str:
     return "-"
 
 
+def _cv_exports(root: Path, filename: str) -> List[Path]:
+    """Only the CV exports, which is what this report is about.
+
+    The same basename is written in three places per (label,
+    scheme): `cv_results/` holds every CV combination,
+    `best_models/<label>/<scheme>/` repeats the winning row, and --
+    once the holdout stage runs -- `holdout/` holds final-test rows.
+    A plain `**/` glob takes all three, which double-counts the
+    winner and mixes the holdout in. The holdout table's
+    `pooled_validation_r2` is empty, an all-empty column parses as
+    text, and a text column makes `max()` lexicographic -- so the
+    report would name the wrong best rank even where it did not
+    crash on the arithmetic.
+    """
+    paths = sorted(root.glob(f"**/{filename}"))
+    canonical = [p for p in paths if p.parent.name == "cv_results"]
+    if canonical:
+        return canonical
+    # An older or hand-assembled tree may not have cv_results/ at
+    # all; take what there is, minus the holdout copies, rather
+    # than reporting nothing.
+    other = [p for p in paths if p.parent.name != "holdout"]
+    if other and len(other) != len(paths):
+        LOGGER.warning(
+            "No cv_results/%s under %s; using %d other copy(ies) "
+            "and ignoring the holdout tables.",
+            filename,
+            root,
+            len(other),
+        )
+    return other
+
+
 def _load(root: Path, filename: str) -> pl.DataFrame:
-    """Every `filename` under `root`, stamped with its holdout grouping."""
+    """Every CV `filename` under `root`, stamped with its holdout grouping."""
     frames = []
-    for path in sorted(root.glob(f"**/{filename}")):
+    for path in _cv_exports(root, filename):
         df = pl.read_csv(path, infer_schema_length=10000)
         if df.height:
             frames.append(
@@ -169,6 +202,12 @@ def rank_comparison(summaries: pl.DataFrame, prefix: str) -> pl.DataFrame:
     ]
     best = (
         annotate_ranks(summaries, prefix)
+        # Cast before the max, not after: one CSV with an empty
+        # score column is enough to make the whole concatenated
+        # column text, and max() on text is alphabetical -- which
+        # ranks "-6.3" above "0.2". strict=False sends anything
+        # genuinely unparseable to null instead of raising.
+        .with_columns(pl.col(score).cast(pl.Float64, strict=False))
         .group_by([*KEYS, "tax_rank", "variant", "rank_depth"])
         .agg(
             [pl.col(score).max().alias("score")]

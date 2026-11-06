@@ -39,6 +39,7 @@ from sweep_tokens import (  # noqa: E402,F401
 )
 
 from microbiome_ml.train.cv import CrossValidator  # noqa: E402
+from microbiome_ml.train.full_fit import write_full_fit_report  # noqa: E402
 from microbiome_ml.train.results import CV_Result  # noqa: E402
 from microbiome_ml.train.trainer import ModelTrainer  # noqa: E402
 from microbiome_ml.visualise.visualisations import Visualiser  # noqa: E402
@@ -237,6 +238,11 @@ def step_cv(args: argparse.Namespace) -> None:
     cv_cfg, out_cfg = sec["cv"], sec["outputs"]
     vis_cfg, shap_cfg = sec["visualise"], sec["shap"]
     holdout_enabled = bool(sec["holdout_evaluation"].get("enabled", True))
+    # Whole-training-pool diagnostics. The CV stage already fits the
+    # winner on every CV row to read importances off it; this scores
+    # that same fit instead of letting it go unmeasured.
+    final_fit_cfg = sec["final_fit"]
+    final_fit_on = bool(final_fit_cfg.get("enabled", False))
     holdout_grouping = getattr(args, "run_name", None) or spec_dir_name(
         args.grouping
     )
@@ -264,6 +270,8 @@ def step_cv(args: argparse.Namespace) -> None:
         label=label,
         scheme=scheme,
         feature_set=cv_cfg.get("feature_set"),
+        full_fit=final_fit_on,
+        full_fit_oob=bool(final_fit_cfg.get("oob", True)),
     )
     mode = str(cv_cfg.get("mode", "run")).strip().lower()
     param_path = str(cv_cfg.get("param_path", "parameters.yaml"))
@@ -299,6 +307,13 @@ def step_cv(args: argparse.Namespace) -> None:
         best_result_key_by_label_scheme=cv.best_result_key_by_label_scheme,
     )
     pipeline._log_best_combinations(cv)
+
+    if final_fit_on:
+        write_full_fit_report(
+            cv.best_result_by_label_scheme or {},
+            run_dir / "final_fit",
+            top_n=int(final_fit_cfg.get("top_n", 20)),
+        )
 
     vis_enabled = bool(vis_cfg.get("enabled", False))
     vis_formats = list(vis_cfg.get("formats", ["png"]))

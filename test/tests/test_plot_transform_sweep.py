@@ -265,6 +265,125 @@ def test_n_label_is_read_from_the_headline(tmp_path):
     assert ptw.label_sizes(headline) == {"ph": 330, "temperature": 1936}
 
 
+def test_a_named_scheme_gets_its_own_figure_instead_of_the_best(tmp_path):
+    out = tmp_path / "figs"
+    models = ptw.load_models(_table(tmp_path, _sweep_rows("ph")))
+    written = ptw.plot_sweep(models, out, ["png"], scheme="ecoregion_logo")
+    assert [p.name for p in written] == ["transform_sweep_ph__ecoregion_logo"]
+    assert (out / "transform_sweep_ph__ecoregion_logo.png").exists()
+
+    fig = ptw.draw_label(
+        "ph", ptw.best_per_cell(models), None, scheme="ecoregion_logo"
+    )
+    assert "ecoregion_logo" in fig.axes[1].get_title(loc="left")
+    # month_logo scores best here, and panel (a) still has to show it.
+    assert "month" in fig.axes[0].get_xticklabels()[0].get_text()
+    ptw.plt.close(fig)
+
+
+def test_a_label_that_never_ran_the_scheme_is_skipped(tmp_path):
+    rows = _sweep_rows("ph") + [
+        r
+        for r in _sweep_rows("temperature")
+        if r["scheme"] != "bioproject_logo"
+    ]
+    out = tmp_path / "figs"
+    written = ptw.plot_sweep(
+        ptw.load_models(_table(tmp_path, rows)),
+        out,
+        ["png"],
+        scheme="bioproject_logo",
+    )
+    assert [p.name for p in written] == ["transform_sweep_ph__bioproject_logo"]
+
+
+def test_holdout_figure_keeps_to_the_named_scheme(tmp_path):
+    holdout = pl.DataFrame(
+        {
+            "combo": ["a", "a"],
+            "transform": ["relabund", "relabund"],
+            "label": ["ph", "ph"],
+            "scheme": ["random", "month"],
+            "r2": [0.9, 0.2],
+        }
+    )
+    models = ptw.load_models(_table(tmp_path, _sweep_rows("ph")))
+    out = tmp_path / "figs"
+    written = ptw.plot_holdout(holdout, models, out, ["png"], scheme="month")
+    assert [p.name for p in written] == ["transform_sweep_holdout_ph__month"]
+
+    fig = ptw.draw_holdout("ph", holdout, models, scheme="month")
+    assert fig.axes[0].patches[0].get_height() == 0.2
+    ptw.plt.close(fig)
+    assert ptw.draw_holdout("ph", holdout, models, scheme="absent") is None
+
+
 def test_a_missing_headline_is_not_fatal(tmp_path):
     assert ptw.label_sizes(tmp_path / "nope.tsv") == {}
     assert ptw.label_sizes(None) == {}
+
+
+# ---------------------------------------------------------------------------
+# Figures across every combination
+# ---------------------------------------------------------------------------
+def test_the_icc_figure_is_written_and_skips_when_empty(tmp_path):
+    tables = [("clr", [0.1, 0.95, 0.2]), ("presence", [0.5])]
+    target = ptw.plot_icc_distribution(
+        tables, [0.9], "bioproject", tmp_path, ["png"]
+    )
+    assert (tmp_path / f"{target.name}.png").exists()
+    assert ptw.plot_icc_distribution([], [], "x", tmp_path, ["png"]) is None
+
+
+def test_the_shadow_figure_is_written_and_skips_when_empty(tmp_path):
+    floor = pl.DataFrame(
+        {
+            "combo": ["a", "b"],
+            "label": ["ph", "ph"],
+            "n_real": [100, 80],
+            "n_real_above_q95": [10, 0],
+            "pct_above_noise": [10.0, 0.0],
+        }
+    )
+    target = ptw.plot_shadow_floor(floor, tmp_path, ["png"])
+    assert (tmp_path / f"{target.name}.png").exists()
+    assert ptw.plot_shadow_floor(floor.head(0), tmp_path, ["png"]) is None
+
+
+def _scoreboard_rows():
+    rows = []
+    for combo, cv, unpruned, pruned in (
+        ("a", 0.5, 0.4, 0.45),
+        ("b", 0.3, float("nan"), None),
+        ("c", 0.2, -3.5, 0.0),
+    ):
+        for version, holdout, n in (
+            ("unpruned", unpruned, 100),
+            ("pruned", pruned, 10),
+        ):
+            rows.append(
+                {
+                    "combo": combo,
+                    "label": "ph",
+                    "scheme": "month",
+                    "version": version,
+                    "cv_pooled_r2": cv,
+                    "holdout_r2": holdout,
+                    "n_features": n,
+                }
+            )
+    return rows
+
+
+def test_the_scoreboard_copes_with_blown_up_and_missing_scores(tmp_path):
+    frame = pl.DataFrame(_scoreboard_rows(), infer_schema_length=None)
+    target = ptw.plot_scoreboard(frame, tmp_path, ["png"])
+    assert (tmp_path / f"{target.name}.png").exists()
+    assert ptw.plot_scoreboard(frame.head(0), tmp_path, ["png"]) is None
+
+
+def test_the_runtime_figure_is_written_even_when_nothing_took_time(tmp_path):
+    table = pl.DataFrame({"combo": ["a"], "cv": [0.0], "prune": [0.0]})
+    target = ptw.plot_runtime(table, ["cv", "prune"], tmp_path, ["png"])
+    assert (tmp_path / f"{target.name}.png").exists()
+    assert ptw.plot_runtime(table.head(0), ["cv"], tmp_path, ["png"]) is None

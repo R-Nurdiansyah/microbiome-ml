@@ -46,6 +46,25 @@ def write_param_yaml(path: Path):
     path.write_text(json.dumps(payload))
 
 
+@pytest.mark.parametrize(
+    "n_jobs,max_combos,expected",
+    [
+        # One combination: its folds get exactly the budget it was given.
+        # This was -1, so a job told 6 cores could take every core it saw.
+        (6, 1, (1, 6)),
+        (1, 1, (1, 1)),
+        # Nothing asked for: joblib counts the cores this job can use.
+        (None, 1, (1, -1)),
+        # Several combinations fan out instead, never both levels at once.
+        (6, 2, (2, 1)),
+        (2, 9, (2, 1)),
+        (None, 2, (2, 1)),
+    ],
+)
+def test_cv_stays_within_its_core_budget(n_jobs, max_combos, expected):
+    assert cv_module._cv_parallelism(n_jobs, max_combos, 128) == expected
+
+
 def test_run_and_run_grid(tmp_path):
     # simple dataset: y = f0 + noise
     samples = [f"s{i}" for i in range(6)]

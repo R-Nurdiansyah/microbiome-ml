@@ -158,6 +158,24 @@ def _resolve_model_alias(name: str) -> str:
 
 
 # Define a CrossValidator class to handle cross-validation process
+def _cv_parallelism(
+    n_jobs: Optional[int], max_combos: int, cpu_total: int
+) -> Tuple[int, int]:
+    """Workers across combinations, and across one combination's folds.
+
+    Only one level fans out, to avoid nested over-subscription. A single
+    combination gives its folds the whole budget: an explicit `n_jobs` is a
+    limit, because other jobs may be sharing the node. With none set, -1
+    lets joblib count the cores this job can actually use, which on a
+    shared node can be far fewer than `cpu_total`.
+    """
+    requested = cpu_total if n_jobs is None else int(n_jobs)
+    parallel_jobs = max(1, min(requested, max_combos))
+    if parallel_jobs > 1:
+        return parallel_jobs, 1
+    return 1, -1 if n_jobs is None else max(1, requested)
+
+
 class CrossValidator:
     """Base class to perform cross-validation on microbiome datasets using
     specified models and CV schemes.
@@ -354,7 +372,7 @@ class CrossValidator:
             label: Union[str, List[str]] = None (specific label(s) to use; defaults to self.label or all label attributes in dataset)
             scheme: Union[str, List[str]] = None (specific CV scheme(s) to use; defaults to all schemes in dataset)
             param_path: str = "hyperparameters.yaml" (path to YAML file with hyperparameter grids)
-            n_jobs: Optional[int] = None (number of cross-validation combinations to evaluate in parallel; defaults to detected CPU cores)
+            n_jobs: Optional[int] = None (workers for this run. Combinations run in parallel when there are several, otherwise the folds of the one combination do; defaults to detected CPU cores)
         Outputs:
             Dict[str, CV_Result]: A dictionary mapping each unique combination of feature set, label, scheme, model, and hyperparameters to its CV_Result.
         """
@@ -488,11 +506,9 @@ class CrossValidator:
             * _n(label_to_use, 1)
             * _n(scheme_to_use, 1)
         )
-        requested = cpu_total if n_jobs is None else int(n_jobs)
-        parallel_jobs = max(1, min(requested, max_combos))
-
-        # Avoid nested over-subscription: only fan-out inside cross_validate when sequential
-        inner_cv_jobs = -1 if parallel_jobs == 1 else 1
+        parallel_jobs, inner_cv_jobs = _cv_parallelism(
+            n_jobs, max_combos, cpu_total
+        )
 
         logger.info(
             "Dispatching CV combinations across %d worker(s) "
