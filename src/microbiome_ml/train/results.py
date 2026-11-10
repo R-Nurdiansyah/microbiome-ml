@@ -74,7 +74,7 @@ def pooled_r2_per_candidate(cv_results: Dict[str, Any]) -> np.ndarray:
     evaluable = sst > 0
     total_sst = np.where(evaluable, sst, 0.0).sum(axis=1)
     total_sse = np.where(evaluable, sse, 0.0).sum(axis=1)
-    pooled = np.full(total_sst.shape, np.nan)
+    pooled: np.ndarray = np.full(total_sst.shape, np.nan)
     ok = total_sst > 0
     pooled[ok] = 1.0 - total_sse[ok] / total_sst[ok]
     pooled[np.isnan(sse).any(axis=1)] = np.nan
