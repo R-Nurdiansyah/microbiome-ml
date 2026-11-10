@@ -104,6 +104,51 @@ def test_absences_count_as_zeros_not_as_missing():
     assert got["mean"] == pytest.approx((0.40 + 0.50 + 0.45) / 6)
 
 
+def test_several_rows_for_one_taxon_in_a_sample_are_one_value():
+    """A taxon split over lineages gives the ICC of its per-sample totals.
+
+    Squaring the rows one by one makes the within-group sum of squares go
+    negative. It then clamps to zero, and the taxon reads as ICC 1.0 with
+    a prevalence above 1, whatever the data says.
+    """
+    totals = [
+        ("s0", 0.10),
+        ("s1", 0.50),
+        ("s2", 0.30),
+        ("s3", 0.12),
+        ("s4", 0.48),
+        ("s5", 0.30),
+    ]
+    split = [
+        (sample, "o__x", value * share)
+        for sample, value in totals
+        for share in (0.5, 0.3, 0.2)
+    ]
+    summed = [(sample, "o__x", value) for sample, value in totals]
+
+    got = _icc_of(taxon_icc(_long(split), GROUPS_2x3), "o__x")
+    want = _icc_of(taxon_icc(_long(summed), GROUPS_2x3), "o__x")
+
+    assert got["icc"] == pytest.approx(0.0, abs=0.01)
+    assert got["prevalence"] == pytest.approx(1.0)
+    assert got["n_present"] == 6
+    for column in ("mean", "var_between", "var_within", "icc", "icc_raw"):
+        assert got[column] == pytest.approx(want[column]), column
+
+
+def test_a_taxon_split_in_some_samples_only_counts_each_sample_once():
+    rows = [
+        ("s0", "o__x", 0.2),
+        ("s0", "o__x", 0.3),
+        ("s3", "o__x", 0.5),
+    ]
+    got = _icc_of(taxon_icc(_long(rows), GROUPS_2x3), "o__x")
+    assert got["n_present"] == 2
+    assert got["prevalence"] == pytest.approx(2 / 6)
+    assert got["mean"] == pytest.approx(1.0 / 6)
+    assert got["n_groups_present"] == 2
+
+
 def test_prevalence_and_mean_span_every_sample_in_the_design():
     """Denominators are all samples, not the ones carrying a row."""
     rows = [("s0", "g__rare", 0.60)]

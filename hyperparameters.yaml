@@ -1,87 +1,38 @@
-# models + hyperparameters
+# Grids for cv.mode: run_grid. Every list is searched, so the candidate count
+# is the product of the list lengths. Each candidate costs one fit per fold.
 # use ~ for None
+#
+# A model named in cv.models must have a key here, or run_grid stops. An empty
+# key (`rf:`) means sklearn's defaults, on purpose.
+#
+# Widened where the 18S run picked an end of the range. 30 RF and 36 XGB
+# candidates.
+
 rf:
-  n_estimators:
-    - 100
-    # - 200
-    # - 500
-  max_depth:
-    # - 10
-    - ~
-  criterion:
-    - squared_error
-    # - absolute_error
-    # - friedman_mse
-    # - poisson
-  max_features:
-    # - sqrt
-    # - log2
-    - ~
-  ccp_alpha:
-  # this controls the level of pruning performed to reduce overfitting.
-    # - 0
-    # - 0.01
-    # - 0.1
-    - 1
-    # - ~
-  min_samples_leaf:
-  # # if a feature is < this value, it will not be considered to become a terminal node.
-  # # this can prevent overfitting e.g. where all samples get their own leaf
-    - 1
-    # - 5
-    # - 10
-# gb:
-#   n_estimators:
-#     # - 100
-#     # - 200
-#     - 500
-#   max_depth:
-#     - 10
-#     - ~
-#   learning_rate:
-#     - 0.01
-#     # - 0.001
-#     # - 0.0001
-#   min_samples_split:
-#     - 2
-#     - 5
-#     - 10
-#   min_samples_leaf:
-#     - 1
-#     - 5
-#     - 10
-#   subsample:
-#     - 0.8
-#     # - 0.9
-#     # - 1.0
-# en:
-#   alpha:
-#     - 0.1
-#     - 0.5
-#     - 1.0
-#   l1_ratio:
-#     - 0.1
-#     - 0.5
-#     - 1.0
+  n_estimators: [500]
+  # Fit time grows with this; 0.7 and 1.0 are the expensive end.
+  max_features: [0.1, 0.33, 0.5, 0.7, 1.0]
+  min_samples_leaf: [1, 2, 5]
+  # Share of rows each tree draws (~ = all). 0.5 halves fit time and memory.
+  max_samples: [0.5, ~]
+
 xgb:
-  n_estimators:
-    - 100
-# #    - 200
-#   max_depth:
-#     - 3
-# #    - 6
-#   learning_rate:
-#     - 0.01
-# #    - 0.1
-#   subsample:
-#     - 0.8
-# #    - 1.0
-#   colsample_bytree:
-#     - 0.8
-# #    - 1.0
-#   reg_alpha:  # L1 regularization
-#     - 0
-# #    - 0.1
-#   reg_lambda:  # L2 regularization
-#     - 1
-# #    - 2
+  n_estimators: [1000]
+  learning_rate: [0.03, 0.05, 0.1]
+  max_depth: [4, 6, 8]
+  colsample_bytree: [0.3, 0.5]
+  min_child_weight: [1, 5]
+  subsample: [0.8]
+
+# LinearSVR after a MaxAbsScaler (cv.ScaledLinearSVR), so keys take the
+# `svr__` prefix. Only used when cv.models lists svm. 20 candidates.
+svm:
+  # liblinear sums the loss over samples rather than averaging it, so the
+  # same C regularises less as the data grows: wide on purpose.
+  svr__C: [0.001, 0.01, 0.1, 1, 10]
+  # In label units (degrees C here): errors smaller than this cost nothing.
+  svr__epsilon: [0.0, 0.5]
+  # epsilon_insensitive is the classic SVR loss (absolute error past epsilon).
+  # squared_epsilon_insensitive squares it, and with far more samples than
+  # taxa lets dual="auto" pick the primal solver, the fast one.
+  svr__loss: [epsilon_insensitive, squared_epsilon_insensitive]

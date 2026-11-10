@@ -1,0 +1,168 @@
+# A transform sweep from top to bottom, from this one file:
+#
+#   pixi run python scripts/sweep_transforms.py --config sweep.yaml
+#
+# Rerunning skips finished work. A flag on the command line wins over this file.
+#
+# The `sweep:` section is the only part specific to the sweep. Everything else
+# is the normal pipeline config (see pipeline.example.yaml), and it is copied
+# into every combination, except for what the grid sets:
+# features.transform, min_prevalence, icc and shadow, and cv.feature_set.
+
+sweep:
+  # ---------------------------- where and how -------------------------------
+  out: out/transform_sweep
+  # local:     this machine, no Snakemake and no queue. Use it inside an
+  #            interactive job.
+  # snakemake: workflow/Snakefile, which can submit to a queue. Pruning and the
+  #            final fit still run where this script runs, so with a queue on
+  #            a login node, leave `prune` off.
+  runner: local
+  # Cores per combination. null = PBS_NCPUS shared across max_workers, else 8.
+  cores: null
+  # Combinations at once. The budgets multiply: 3 workers x 8 cores is 24 cores.
+  max_workers: 1
+  stop_on_error: false
+  log_level: INFO
+  # Snakemake runner only.
+  pixi: true
+  snakemake_args: []
+
+  # ---------------------------- stage 1: subset -----------------------------
+  # Up to n_per_label samples with a value for EACH entry in data.labels, so
+  # the total is at most labels x n_per_label. Use it to compare transforms, not
+  # to predict the full run's feature counts or scores.
+  # Delete this block, or set n_per_label to null, to use the full data.
+  subset:
+    n_per_label: 200
+    seed: 42
+    dir: null  # null = <out>/subset_n<N>_seed<S>
+
+  # ---------------------------- stages 2-3: the grid ------------------------
+  # Runs = transforms x max(1, min_prevalence) x (1 + icc_max).
+  transforms: [relabund, clr, presence]
+  min_prevalence: [0.1]  # [] = whatever features.min_prevalence says
+  icc_max: [0.9]         # [] = report ICC only
+  icc_group: bioproject
+  shadow: true           # trains <set>_shad beside each clean set
+  models: null           # null = cv.models; [rf] is a cheap first pass
+
+  # label -> holdout grouping. A label may name a list of groupings.
+  pairs:
+    temperature: bioproject
+    geo_temperature: bioproject
+  # ...or every grouping x every label, instead of pairs:
+  # holdout_groupings: [random, bioproject]
+
+  # ---------------------------- stage 4: each combination -------------------
+  holdout: false    # also run the holdout at the end of each CV job
+  final_fit: true   # also score the fit on the whole training pool
+
+  # ---------------------------- stage 5: figures ----------------------------
+  # One figure set per CV scheme. null = every scheme that ran.
+  figure_schemes: [random, month, ecoregion, bioproject]
+
+  # ---------------------------- stages 7-8: pruning and final fit -----------
+  # Per combination x label, on the best clean set on `scheme`.
+  # Each is then fitted twice, on all features and on those pruning kept, and
+  # scored on the holdout. These stages only run when enabled is true.
+  prune:
+    enabled: true
+    # One CV scheme for every row, so they compare like with like. A label that
+    # did not run it is skipped with a warning. null = each row takes its own
+    # best grouped scheme, never `random`.
+    scheme: bioproject
+    mode: zero         # zero: drop unused features. coverage: far more aggressive
+    coverage: 0.95     # coverage mode only
+    iterations: 3
+    min_features: 10   # coverage mode needs this set on purpose
+
+# -----------------------------------------------------------------------------
+# The normal pipeline config
+# -----------------------------------------------------------------------------
+data:
+  metadata: /path/to/metadata.csv
+  attributes: /path/to/attributes.csv
+  study_titles: null
+  profiles: /path/to/community_coverage.csv
+  root: null
+  labels:
+    temperature: /path/to/label_temperature.csv
+    geo_temperature: /path/to/label_geo_temp.csv
+
+groupings:
+  defaults: false
+  columns: [month, ecoregion, bioproject]
+  file: null
+
+features:
+  add_taxonomic_features: true
+  all: false
+  ranks: [genus]
+  prefix: tax
+  chunk_samples: 5000
+  format: parquet
+  labelled_only: true
+  prevalence_by: bioproject
+  presence_threshold: 0.0
+  shadow: {n: 200, seed: 1234}
+
+preprocessing:
+  enabled: false
+
+split:
+  holdout:
+    label: null
+    test_size: 0.2
+    n_bins: 5
+    grouping: null
+    random_state: 42
+    force: true
+  cv:
+    label: null
+    n_folds: 5
+    n_bins: 5
+    methods: [kfold]  # or [logo], or both
+    grouping: all
+    random_state: 42
+    logo_max_groups: 50
+    use_holdout: true
+    force: true
+    strict: true      # false allows a scheme with fewer folds than n_folds
+
+cv:
+  enabled: true
+  models: [rf, xgboost]
+  mode: run
+  param_path: parameters.yaml
+  label: null
+  scheme: null        # null = every scheme; [month] to go faster
+  feature_set: [tax_genus]  # only the rank counts; the full name is derived
+
+feature_report:
+  coverage: [0.5, 0.9, 0.95]
+  top: 25
+
+holdout_evaluation:
+  enabled: false
+
+final_fit:
+  oob: true
+  top_n: 10
+
+outputs:
+  cv_save_models: false
+  cv_fold_table: false
+
+visualise:
+  enabled: true
+  formats: [png]
+  top_n: 10
+  holdout_distribution:
+    enabled: true
+    grouping: auto
+    bins: 10
+    stat: [count, probability]
+
+shap:
+  enabled: false

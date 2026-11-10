@@ -48,7 +48,7 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib
 
@@ -398,21 +398,28 @@ def panel_folds(
 # One label's figure
 # ---------------------------------------------------------------------------
 def draw_label(
-    label: str, block: pl.DataFrame, n_label: Optional[int]
+    label: str,
+    block: pl.DataFrame,
+    n_label: Optional[int],
+    scheme: Optional[str] = None,
 ) -> Optional[plt.Figure]:
-    """The three-panel figure for one label, or None if nothing to draw."""
+    """The three-panel figure for one label, or None if nothing to draw.
+
+    Panels (b) and (c) zoom to `scheme`, or to the best-scoring scheme
+    when it is None. Panel (a) always shows every scheme.
+    """
     schemes = scheme_order(block)
     transforms = transform_order(block)
     if not schemes or not transforms:
         LOGGER.warning("%s: no scheme/transform to plot", label)
         return None
     hues = hue_map(transform_order(block))
-    best = schemes[0]
+    shown = scheme or schemes[0]
 
     fig, axes = plt.subplots(1, 3, figsize=(16.0, 4.8))
     panel_schemes(axes[0], block, schemes, transforms, hues)
-    panel_transforms(axes[1], block, best, transforms, hues)
-    if not panel_folds(axes[2], block, best, transforms, hues):
+    panel_transforms(axes[1], block, shown, transforms, hues)
+    if not panel_folds(axes[2], block, shown, transforms, hues):
         axes[2].set_visible(False)
         LOGGER.info("%s: no cross_val_scores; panel (c) omitted", label)
 
@@ -452,8 +459,9 @@ def draw_label(
     )
 
     n = f", n={n_label:,}" if n_label else ""
+    focus = f"scheme: {scheme}" if scheme else f"best scheme: {shown}"
     fig.suptitle(
-        f"Transform sweep — {label}{n}  (best scheme: {best})",
+        f"Transform sweep — {label}{n}  ({focus})",
         y=0.995,
         fontsize=11,
     )
@@ -505,8 +513,14 @@ def plot_sweep(
     formats: List[str],
     headline: Optional[Path] = None,
     labels: Optional[List[str]] = None,
+    scheme: Optional[str] = None,
 ) -> List[Path]:
-    """One figure per label. Returns the stems written."""
+    """One figure per label. Returns the stems written.
+
+    With `scheme`, panels (b) and (c) show that scheme instead of the
+    best-scoring one, the file name ends in `__<scheme>`, and a label that
+    never ran the scheme is skipped.
+    """
     best = best_per_cell(models)
     sizes = label_sizes(headline)
     vis = Visualiser(out=out_dir, formats=formats)
@@ -520,15 +534,520 @@ def plot_sweep(
         if not block.height:
             LOGGER.warning("no rows for label '%s'; skipped", label)
             continue
-        fig = draw_label(label, block, sizes.get(label))
+        if scheme and block.filter(pl.col("scheme") == scheme).is_empty():
+            LOGGER.warning(
+                "label '%s' has no scheme '%s'; skipped", label, scheme
+            )
+            continue
+        fig = draw_label(label, block, sizes.get(label), scheme=scheme)
         if fig is None:
             continue
-        target = vis.output_dir / f"transform_sweep_{label}"
+        suffix = f"__{scheme}" if scheme else ""
+        target = vis.output_dir / f"transform_sweep_{label}{suffix}"
         vis._save_fig(fig, target)
         plt.close(fig)
         LOGGER.info("wrote %s", target)
         written.append(target)
     return written
+
+
+def load_holdout(path: Path) -> Optional[pl.DataFrame]:
+    """`summary/holdout.tsv`, or None when the final test never ran.
+
+    Absent is the normal state for a CV-only sweep, so this is not an
+    error: the caller simply draws no final-test figure.
+    """
+    if not path.exists():
+        return None
+    try:
+        frame = pl.read_csv(path, separator="\t", infer_schema_length=10000)
+    except Exception as exc:
+        LOGGER.warning("could not read %s: %s", path, exc)
+        return None
+    needed = {"combo", "label", "r2"}
+    if not frame.height or not needed <= set(frame.columns):
+        LOGGER.warning(
+            "%s lacks %s; no final-test figure",
+            path,
+            sorted(needed - set(frame.columns)),
+        )
+        return None
+    frame = frame.with_columns(
+        pl.col("r2").cast(pl.Float64, strict=False)
+    ).filter(pl.col("r2").is_not_null())
+    return frame if frame.height else None
+
+
+def _cv_by_combo(block: pl.DataFrame, scheme: str) -> Dict[str, float]:
+    """Best CV score per combination, for the gap panel."""
+    sub = block.filter(pl.col("scheme") == scheme)
+    out: Dict[str, float] = {}
+    for row in sub.iter_rows(named=True):
+        value = row.get(SCORE)
+        if value is None:
+            continue
+        combo = str(row.get("combo"))
+        out[combo] = max(out.get(combo, float("-inf")), float(value))
+    return out
+
+
+def panel_holdout(
+    ax: plt.Axes,
+    block: pl.DataFrame,
+    combos: List[str],
+    hues: Dict[str, str],
+) -> None:
+    """Final-test R2 per combination, best first."""
+    scores = [float(r["r2"]) for r in block.iter_rows(named=True)]
+    colors = [
+        hues.get(str(r.get("transform")), "#888888")
+        for r in block.iter_rows(named=True)
+    ]
+    positions = list(range(len(combos)))
+    bars = ax.bar(positions, scores, color=colors, width=0.68)
+    ax.axhline(0.0, color="#333333", lw=1.0, zorder=0)
+    for rect, value in zip(bars, scores):
+        ax.annotate(
+            f"{value:.3f}",
+            xy=(rect.get_x() + rect.get_width() / 2, value),
+            xytext=(0, 3 if value >= 0 else -11),
+            textcoords="offset points",
+            ha="center",
+            fontsize=8,
+        )
+    ax.set_xticks(positions)
+    ax.set_xticklabels(combos, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("holdout R$^2$")
+    ax.set_title("(a) final test, ranked", loc="left", fontsize=10)
+    _pad_limits(ax)
+
+
+def panel_gap(
+    ax: plt.Axes,
+    combos: List[str],
+    cv_scores: Dict[str, float],
+    ho_scores: Dict[str, float],
+) -> bool:
+    """CV beside holdout per combination: did the CV winner hold up?"""
+    pairs = [
+        (c, cv_scores[c], ho_scores[c])
+        for c in combos
+        if c in cv_scores and c in ho_scores
+    ]
+    if not pairs:
+        return False
+    positions = list(range(len(pairs)))
+    width = 0.38
+    ax.bar(
+        [p - width / 2 for p in positions],
+        [cv for _, cv, _ in pairs],
+        width=width,
+        color="#9ecae1",
+        label="CV (validation folds)",
+    )
+    ax.bar(
+        [p + width / 2 for p in positions],
+        [ho for _, _, ho in pairs],
+        width=width,
+        color="#2171b5",
+        label="holdout (final test)",
+    )
+    ax.axhline(0.0, color="#333333", lw=1.0, zorder=0)
+    ax.set_xticks(positions)
+    ax.set_xticklabels(
+        [c for c, _, _ in pairs], rotation=30, ha="right", fontsize=8
+    )
+    ax.set_ylabel("R$^2$")
+    ax.set_title(
+        "(b) CV vs final test, same combination", loc="left", fontsize=10
+    )
+    ax.legend(fontsize=8, frameon=False)
+    _pad_limits(ax)
+    return True
+
+
+def draw_holdout(
+    label: str,
+    holdout: pl.DataFrame,
+    models: pl.DataFrame,
+    scheme: Optional[str] = None,
+) -> Optional[plt.Figure]:
+    """The final-test figure for one label, or None if nothing to draw."""
+    block = holdout.filter(pl.col("label") == label)
+    if not block.height:
+        return None
+    # One row per combination: a sweep can evaluate several schemes, and
+    # stacking them in one bar chart would compare different test sets.
+    if "scheme" in block.columns:
+        schemes = (
+            [scheme]
+            if scheme
+            else [str(v) for v in block.get_column("scheme").unique().sort()]
+        )
+        best_scheme = max(
+            schemes,
+            key=lambda s: block.filter(pl.col("scheme") == s)
+            .get_column("r2")
+            .max(),
+        )
+        block = block.filter(pl.col("scheme") == best_scheme)
+        if not block.height:
+            return None
+    else:
+        best_scheme = "?"
+    block = block.sort("r2", descending=True, nulls_last=True)
+    combos = [str(v) for v in block.get_column("combo")]
+    hues = hue_map(transform_order(block))
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8))
+    panel_holdout(axes[0], block, combos, hues)
+    ho_scores = {
+        str(r["combo"]): float(r["r2"]) for r in block.iter_rows(named=True)
+    }
+    cv_scores = _cv_by_combo(
+        models.filter(pl.col("label") == label), best_scheme
+    )
+    if not panel_gap(axes[1], combos, cv_scores, ho_scores):
+        axes[1].set_visible(False)
+        LOGGER.info(
+            "%s: no CV score matching scheme '%s'; panel (b) omitted",
+            label,
+            best_scheme,
+        )
+    fig.suptitle(
+        f"{label} -- final test  (scheme: {best_scheme})",
+        fontsize=12,
+        x=0.01,
+        ha="left",
+    )
+    fig.text(
+        0.01,
+        0.015,
+        "Samples no fold ever saw. Where (b) shows holdout well below "
+        "CV, the CV score was optimistic -- rank on the dark bars.",
+        fontsize=8,
+        color="#444444",
+        wrap=True,
+    )
+    fig.tight_layout(rect=(0, 0.06, 1, 0.94))
+    return fig
+
+
+def plot_holdout(
+    holdout: pl.DataFrame,
+    models: pl.DataFrame,
+    out_dir: Path,
+    formats: List[str],
+    labels: Optional[List[str]] = None,
+    scheme: Optional[str] = None,
+) -> List[Path]:
+    """One final-test figure per label. Returns the stems written.
+
+    With `scheme`, each figure shows that scheme instead of the one with
+    the highest holdout score, and the file name ends in `__<scheme>`.
+    """
+    vis = Visualiser(out=out_dir, formats=formats)
+    written: List[Path] = []
+    wanted = labels or [
+        str(v) for v in holdout.get_column("label").unique().sort().to_list()
+    ]
+    for label in wanted:
+        fig = draw_holdout(label, holdout, models, scheme=scheme)
+        if fig is None:
+            LOGGER.warning("no holdout rows for label '%s'; skipped", label)
+            continue
+        suffix = f"__{scheme}" if scheme else ""
+        target = vis.output_dir / f"transform_sweep_holdout_{label}{suffix}"
+        vis._save_fig(fig, target)
+        plt.close(fig)
+        LOGGER.info("wrote %s", target)
+        written.append(target)
+    return written
+
+
+# ---------------------------------------------------------------------------
+# Figures across every combination, for the end-to-end sweep
+# ---------------------------------------------------------------------------
+def _panel_grid(
+    n_panels: int, ncols: int, width: float, height: float
+) -> Tuple[plt.Figure, List[plt.Axes]]:
+    """A grid of small multiples, with the unused axes hidden."""
+    ncols = min(ncols, max(1, n_panels))
+    nrows = math.ceil(n_panels / ncols)
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(width * ncols, height * nrows), squeeze=False
+    )
+    flat = [ax for row in axes for ax in row]
+    for ax in flat[n_panels:]:
+        ax.set_visible(False)
+    return fig, flat
+
+
+def _save(
+    fig: plt.Figure, out_dir: Path, formats: List[str], stem: str
+) -> Path:
+    vis = Visualiser(out=out_dir, formats=formats)
+    target = vis.output_dir / stem
+    vis._save_fig(fig, target)
+    plt.close(fig)
+    LOGGER.info("wrote %s", target)
+    return target
+
+
+def plot_icc_distribution(
+    tables: List[Tuple[str, List[float]]],
+    cutoffs: List[float],
+    group: str,
+    out_dir: Path,
+    formats: List[str],
+) -> Optional[Path]:
+    """One ICC histogram per combination, with the cutoffs marked."""
+    if not tables:
+        return None
+    fig, axes = _panel_grid(len(tables), 3, 4.6, 3.2)
+    for ax, (name, values) in zip(axes, tables):
+        ax.hist(
+            values,
+            bins=30,
+            range=(0, 1),
+            color=_CATEGORICAL_HUES[0],
+            edgecolor="white",
+        )
+        for cut in cutoffs:
+            above = sum(value > cut for value in values)
+            ax.axvline(cut, color="#444444", linestyle="--", linewidth=1.0)
+            ax.annotate(
+                f"{above:,} of {len(values):,} above {cut:g}",
+                (cut, 1.0),
+                xycoords=("data", "axes fraction"),
+                xytext=(-4, -12),
+                textcoords="offset points",
+                ha="right",
+                fontsize=8,
+            )
+        ax.set_title(name, fontsize=9, loc="left")
+        ax.set_xlabel("ICC", fontsize=8)
+        ax.set_ylabel("taxa", fontsize=8)
+        ax.tick_params(labelsize=8)
+        ax.grid(True, axis="y", alpha=0.18)
+    fig.suptitle(
+        f"Between-study share of variation, per taxon (by {group})",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    return _save(fig, out_dir, formats, "icc_distribution")
+
+
+def plot_shadow_floor(
+    floor: pl.DataFrame, out_dir: Path, formats: List[str]
+) -> Optional[Path]:
+    """Share of real taxa above the shuffled-noise floor, per combination."""
+    if not floor.height:
+        return None
+    labels = floor.get_column("label").unique().sort().to_list()
+    height = 0.5 * floor.get_column("combo").n_unique() + 1.6
+    fig, axes = _panel_grid(len(labels), 2, 6.4, height)
+    for ax, label in zip(axes, labels):
+        block = floor.filter(pl.col("label") == label).sort("pct_above_noise")
+        names = block.get_column("combo").to_list()
+        values = block.get_column("pct_above_noise").to_list()
+        ax.barh(names, values, color=_CATEGORICAL_HUES[0], height=0.62)
+        for y, row in enumerate(block.iter_rows(named=True)):
+            ax.annotate(
+                f"{row['n_real_above_q95']:,} of {row['n_real']:,}",
+                (row["pct_above_noise"], y),
+                xytext=(4, 0),
+                textcoords="offset points",
+                va="center",
+                fontsize=8,
+            )
+        ax.set_xlim(0, max(max(values), 1) * 1.3)
+        ax.set_title(label, fontsize=10, loc="left")
+        ax.set_xlabel("% of real taxa above the shadow q95", fontsize=8)
+        ax.tick_params(labelsize=8)
+        ax.grid(True, axis="x", alpha=0.18)
+    fig.suptitle("How many taxa beat shuffled noise", fontsize=11)
+    fig.tight_layout()
+    return _save(fig, out_dir, formats, "shadow_floor")
+
+
+def _finite(value: Any) -> bool:
+    return value is not None and math.isfinite(value)
+
+
+def plot_scoreboard(
+    frame: pl.DataFrame,
+    out_dir: Path,
+    formats: List[str],
+    floor: float = -1.0,
+) -> Optional[Path]:
+    """One panel per label, one row per combination, three markers each."""
+    if not frame.height:
+        return None
+    labels = frame.get_column("label").unique().sort().to_list()
+    n_combos = frame.get_column("combo").n_unique()
+    fig, axes = _panel_grid(len(labels), 2, 7.2, 0.46 * n_combos + 1.5)
+    series = [
+        ("CV, unpruned", "o", "none", _CATEGORICAL_HUES[0]),
+        ("holdout, unpruned", "s", _CATEGORICAL_HUES[1], _CATEGORICAL_HUES[1]),
+        ("holdout, pruned", "D", _CATEGORICAL_HUES[2], _CATEGORICAL_HUES[2]),
+    ]
+    clipped = False
+    for ax, label in zip(axes, labels):
+        block = frame.filter(pl.col("label") == label)
+        by_combo: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for row in block.iter_rows(named=True):
+            by_combo.setdefault(row["combo"], {})[row["version"]] = row
+
+        def pruned_score(name: str) -> float:
+            value = by_combo[name].get("pruned", {}).get("holdout_r2")
+            return value if _finite(value) else float("-inf")
+
+        # Best pruned holdout at the top.
+        order = sorted(by_combo, key=pruned_score)
+        plotted: List[float] = []
+        for y, name in enumerate(order):
+            before = by_combo[name].get("unpruned", {})
+            after = by_combo[name].get("pruned", {})
+            values = [
+                before.get("cv_pooled_r2"),
+                before.get("holdout_r2"),
+                after.get("holdout_r2"),
+            ]
+            finite = [v for v in values if _finite(v)]
+            plotted += finite
+            if finite:
+                ax.plot(
+                    [max(min(finite), floor), max(finite)],
+                    [y, y],
+                    color="#bbbbbb",
+                    linewidth=1.0,
+                    zorder=1,
+                )
+            for value, (_, marker, face, edge) in zip(values, series):
+                if _finite(value):
+                    ax.scatter(
+                        [value],
+                        [y],
+                        marker=marker,
+                        s=46,
+                        facecolors=face,
+                        edgecolors=edge,
+                        linewidths=1.4,
+                        zorder=3,
+                    )
+            n_before, n_after = before.get("n_features"), after.get(
+                "n_features"
+            )
+            if n_before and n_after:
+                ax.annotate(
+                    f"{n_before:,} → {n_after:,}",
+                    (1.0, y),
+                    xycoords=("axes fraction", "data"),
+                    xytext=(6, 0),
+                    textcoords="offset points",
+                    va="center",
+                    fontsize=8,
+                    color="#444444",
+                )
+        ax.axvline(0.0, color="#444444", linewidth=1.0, zorder=0)
+        ax.set_yticks(range(len(order)))
+        ax.set_yticklabels(order, fontsize=8)
+        ax.set_ylim(-0.6, len(order) - 0.4)
+        low = min(plotted, default=0.0)
+        if low < floor:
+            clipped = True
+        ax.set_xlim(
+            max(min(low, 0.0), floor) - 0.05,
+            max(max(plotted, default=0.0), 0.1) + 0.05,
+        )
+        scheme = ", ".join(sorted(set(block.get_column("scheme").to_list())))
+        ax.set_title(f"{label}  ({scheme})", fontsize=10, loc="left")
+        ax.set_xlabel("$R^2$", fontsize=9)
+        ax.tick_params(axis="x", labelsize=8)
+        ax.grid(True, axis="x", alpha=0.18)
+    handles = [
+        plt.Line2D(
+            [],
+            [],
+            linestyle="none",
+            marker=marker,
+            markersize=7,
+            markerfacecolor=face,
+            markeredgecolor=edge,
+            markeredgewidth=1.4,
+            label=name,
+        )
+        for name, marker, face, edge in series
+    ]
+    fig.legend(
+        handles=handles,
+        loc="lower center",
+        ncol=3,
+        fontsize=9,
+        frameon=False,
+    )
+    note = (
+        f" The axis stops at {floor:g}; see the table for lower scores."
+        if clipped
+        else ""
+    )
+    fig.suptitle(
+        f"Benchmark: every combo, before and after pruning.{note}",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0.07, 0.98, 0.96), w_pad=5.0)
+    return _save(fig, out_dir, formats, "benchmark_scoreboard")
+
+
+def plot_runtime(
+    table: pl.DataFrame,
+    stages: List[str],
+    out_dir: Path,
+    formats: List[str],
+) -> Optional[Path]:
+    """Minutes per stage for each combination, stacked."""
+    if not table.height:
+        return None
+    names = table.get_column("combo").to_list()
+    fig, ax = plt.subplots(figsize=(9.0, 0.46 * len(names) + 1.8))
+    left = [0.0] * len(names)
+    for i, stage in enumerate(stages):
+        values = [float(v) for v in table.get_column(stage).to_list()]
+        ax.barh(
+            names,
+            values,
+            left=left,
+            height=0.62,
+            label=stage,
+            color=_CATEGORICAL_HUES[i % len(_CATEGORICAL_HUES)],
+            edgecolor="white",
+            linewidth=1.0,
+        )
+        left = [a + b for a, b in zip(left, values)]
+    for y, total in enumerate(left):
+        ax.annotate(
+            f"{total:.1f} min",
+            (total, y),
+            xytext=(4, 0),
+            textcoords="offset points",
+            va="center",
+            fontsize=8,
+        )
+    ax.set_xlim(0, max(left) * 1.14 if max(left) else 1)
+    ax.set_xlabel("minutes", fontsize=9)
+    ax.tick_params(labelsize=8)
+    ax.grid(True, axis="x", alpha=0.18)
+    ax.legend(
+        fontsize=8,
+        frameon=False,
+        ncol=len(stages),
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.14),
+    )
+    ax.set_title("What each combo cost to run", fontsize=11, loc="left")
+    fig.tight_layout()
+    return _save(fig, out_dir, formats, "benchmark_runtime")
 
 
 def main() -> None:
@@ -566,6 +1085,15 @@ def main() -> None:
         default=None,
         help="output directory (default: <summary>/figures)",
     )
+    parser.add_argument(
+        "--holdout",
+        type=Path,
+        default=None,
+        help=(
+            "holdout.tsv, for the final-test figures "
+            "(default: <summary>/holdout.tsv when it exists)"
+        ),
+    )
     parser.add_argument("--formats", nargs="+", default=["png"])
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
@@ -590,13 +1118,35 @@ def main() -> None:
         if args.summary is not None
         else models_path.parent / "figures"
     )
+    models = load_models(models_path)
     written = plot_sweep(
-        load_models(models_path),
+        models,
         out_dir,
         list(args.formats),
         headline=headline,
         labels=args.label,
     )
+
+    # Only when the final test actually ran. A CV-only sweep is the
+    # normal case and says so once, rather than failing.
+    holdout_path = args.holdout
+    if holdout_path is None and args.summary is not None:
+        holdout_path = args.summary / "holdout.tsv"
+    holdout = load_holdout(holdout_path) if holdout_path is not None else None
+    if holdout is None:
+        LOGGER.info(
+            "No holdout table, so no final-test figures. Rerun the "
+            "sweep with --holdout to produce one."
+        )
+    else:
+        written += plot_holdout(
+            holdout,
+            models,
+            out_dir,
+            list(args.formats),
+            labels=args.label,
+        )
+
     if not written:
         raise SystemExit("nothing was plotted; see the warnings above")
     LOGGER.info("Done. %d figure(s) in %s", len(written), out_dir)

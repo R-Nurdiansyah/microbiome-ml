@@ -96,6 +96,9 @@ features:
   # Unsupervised: it reads abundances only, never a label, so it cannot
   # leak the target. Counted once over the samples being built, not per
   # CV fold. Say so in your methods.
+  # Leaves NO suffix on the feature-set name, so two thresholds cannot
+  # share a base_dir without overwriting each other. Compare them with
+  #   scripts/sweep_transforms.py --min-prevalence 0.01 0.05 0.1
   min_prevalence: null
   # What prevalence counts. null (default) = samples. A grouping column
   # name (e.g. bioproject) counts DISTINCT GROUPS instead: "in how many
@@ -296,16 +299,18 @@ cv:
     - xgboost
   # run      -> evaluate EVERY parameter combination in param_path with CV
   #             and keep them all in cv_results (best is chosen per scheme).
-  # run_grid -> sklearn GridSearchCV per model/scheme; only the grid winner
-  #             is kept. Faster output to read, less detail.
+  # run_grid -> sklearn GridSearchCV per model/scheme, one model fit per
+  #             candidate. The winner per scheme goes on to the holdout, and
+  #             every candidate is in cv_results/grid_results.csv.
+  #             Point param_path at hyperparameters.yaml as well: mode alone
+  #             searches whatever single values parameters.yaml holds.
   mode: run
   # YAML of per-model parameter lists (see parameters.yaml in the repo).
   param_path: parameters.yaml
-  # Parallel jobs across feature/label/scheme combinations.
+  # run: workers across feature/label/scheme combinations.
+  # run_grid: workers per GridSearchCV; combinations run one after another.
   # null = use all detected CPU cores.
   n_jobs: null
-  # run_grid only, when n_jobs is null: parameter combos per job.
-  params_per_job: 2
   # Restrict CV to a subset. null = everything the split stage produced.
   label: null                      # e.g. ph, or [ph, temperature]
   # Schemes to actually train, e.g. [random, bioproject, ecoregion].
@@ -474,6 +479,8 @@ shap:
 
 # How a sweep enumerates its runs (scripts/run_holdout_sweep.py and
 # workflow/Snakefile). Give ONE of these; `pairs` wins if both appear.
+# scripts/sweep_transforms.py reads more keys from here; see
+# scripts/sweep_transforms.example.yaml.
 sweep:
   # Cross-product: every grouping is tried against every label.
   #   random          stratified random holdout (the positive control)

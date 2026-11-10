@@ -538,7 +538,10 @@ class SplitManager:
                 current_diff = abs(desired_test_count - achieved_test_count)
                 if achieved_test_count < desired_test_count and train_set:
                     # need more test samples -> consider moving from train to test
-                    g, new_diff = best_move(list(train_set), +1)
+                    # Sorted: best_move keeps the first of equal candidates,
+                    # and a set of strings iterates in a per-process order,
+                    # which gave one seed several different holdouts.
+                    g, new_diff = best_move(sorted(train_set), +1)
                     if g is not None and new_diff < current_diff:
                         train_set.remove(g)
                         test_set.add(g)
@@ -546,7 +549,7 @@ class SplitManager:
                         moved = True
                 elif achieved_test_count > desired_test_count and test_set:
                     # too many test samples -> move from test to train
-                    g, new_diff = best_move(list(test_set), -1)
+                    g, new_diff = best_move(sorted(test_set), -1)
                     if g is not None and new_diff < current_diff:
                         test_set.remove(g)
                         train_set.add(g)

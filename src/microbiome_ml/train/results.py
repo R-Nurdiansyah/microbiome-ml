@@ -59,6 +59,40 @@ class HoldoutEvaluation:
     shap_result: Optional[Any] = None  # SHAPResult | None
 
 
+def pooled_r2_per_candidate(cv_results: Dict[str, Any]) -> np.ndarray:
+    """Pooled R2 per candidate, from sklearn's `cv_results_`.
+
+    1 - sum(SSE) / sum(SST) over the folds with variance to explain, the same
+    number `CV_Result.pooled_validation_r2` holds for one candidate. NaN for a
+    candidate with a failed fold, or with no evaluable fold at all.
+    """
+    columns = [k for k in cv_results if re.fullmatch(r"split\d+_test_sse", k)]
+    sse = np.column_stack([cv_results[c] for c in columns]).astype(float)
+    sst = np.column_stack(
+        [cv_results[c.replace("_sse", "_sst")] for c in columns]
+    ).astype(float)
+    evaluable = sst > 0
+    total_sst = np.where(evaluable, sst, 0.0).sum(axis=1)
+    total_sse = np.where(evaluable, sse, 0.0).sum(axis=1)
+    pooled = np.full(total_sst.shape, np.nan)
+    ok = total_sst > 0
+    pooled[ok] = 1.0 - total_sse[ok] / total_sst[ok]
+    pooled[np.isnan(sse).any(axis=1)] = np.nan
+    return pooled
+
+
+def best_candidate_index(cv_results: Dict[str, Any]) -> int:
+    """The candidate a grid search keeps: best pooled R2, first on a tie.
+
+    Falls back to sklearn's mean R2 when no candidate has a pooled score, so a
+    label with no variance in any fold still returns something to report.
+    """
+    pooled = pooled_r2_per_candidate(cv_results)
+    if np.isfinite(pooled).any():
+        return int(np.nanargmax(pooled))
+    return int(np.nanargmax(np.asarray(cv_results["mean_test_r2"], float)))
+
+
 class CV_Result:
     """Container for CV outputs with simple serialization/export helpers.
 
@@ -80,7 +114,10 @@ class CV_Result:
         trained_model: Optional[Any] = None,
         feature_names: Optional[List[str]] = None,
         n_label: Optional[int] = None,
+        grid_results: Optional[Dict[str, Any]] = None,
     ) -> None:
+        # sklearn's `cv_results_` when this result is a grid-search winner.
+        self.grid_results = grid_results
         self.feature_set = feature_set
         self.label = label
         self.scheme = scheme
@@ -246,6 +283,8 @@ class CV_Result:
             return [self._serialize_value(x) for x in v.tolist()]
         if isinstance(v, (list, tuple)):
             return [self._serialize_value(x) for x in v]
+        if isinstance(v, dict):
+            return {str(k): self._serialize_value(x) for k, x in v.items()}
         try:
             return str(v)
         except Exception:
@@ -482,6 +521,7 @@ class CV_Result:
                     result.n_label,
                     best_key,
                     str(out_dir.relative_to(base_dir)),
+                    json.dumps(result._serialize_value(result.best_params)),
                 ]
             )
 
@@ -505,6 +545,7 @@ class CV_Result:
                     "n_label",
                     "result_key",
                     "path",
+                    "best_params",
                 ]
             )
             writer.writerows(summary_rows)
@@ -667,6 +708,10 @@ class CV_Result:
         if fold_table:
             result_files.append("results_folds.csv")
         result_files.append("feature_importances.csv")
+        if CV_Result.export_grid_results(
+            results_map, out_dir / "grid_results.csv"
+        ):
+            result_files.append("grid_results.csv")
 
         models_dir = out_dir / "models"
         model_files: List[str] = []
@@ -711,6 +756,67 @@ class CV_Result:
             len(model_files),
             n_feature_rows,
         )
+
+    @staticmethod
+    def export_grid_results(
+        results_map: Dict[str, "CV_Result"],
+        path: Union[str, Path],
+    ) -> int:
+        """Write sklearn's `cv_results_` as a table, one row per candidate.
+
+        Every column sklearn reports, unchanged (`pd.DataFrame(cv_results_)`:
+        per-fold `split<i>_test_*`, `mean_`/`std_`/`rank_test_*`, timings,
+        `param_*` and `params`), led by where it came from and the pooled R2
+        the winner is chosen on. MSE keeps sklearn's sign: negated, so higher
+        is better. Writes nothing and returns 0 when no result came from a
+        grid search.
+        """
+        import pandas as pd
+
+        frames = []
+        for key, result in results_map.items():
+            cvres = getattr(result, "grid_results", None)
+            if not cvres:
+                continue
+            (
+                feature_set,
+                label,
+                scheme,
+                model,
+            ) = CV_Result._extract_metadata(key, result)
+            pooled = pooled_r2_per_candidate(cvres)
+            best = best_candidate_index(cvres)
+            # NaN sorts last, so a failed candidate ranks at the bottom. Stable,
+            # so a tie ranks the first candidate top, as selection does.
+            ranks = np.empty(pooled.shape, dtype=int)
+            ranks[np.argsort(-pooled, kind="stable")] = np.arange(
+                1, pooled.size + 1
+            )
+            ours = pd.DataFrame(
+                {
+                    "feature_set": feature_set,
+                    "label": label,
+                    "scheme": scheme,
+                    "model": model,
+                    "selected": np.arange(pooled.size) == best,
+                    "rank_pooled_r2": ranks,
+                    "pooled_r2": pooled,
+                }
+            )
+            frames.append(pd.concat([ours, pd.DataFrame(cvres)], axis=1))
+        if not frames:
+            return 0
+
+        # sort=False keeps first-seen column order, so each model's
+        # param_* columns follow the ones before them instead of mixing in.
+        table = pd.concat(frames, ignore_index=True, sort=False).sort_values(
+            ["label", "scheme", "feature_set", "model", "rank_pooled_r2"],
+            kind="stable",
+        )
+        outp = Path(path)
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        table.to_csv(outp, index=False)
+        return len(table)
 
     @staticmethod
     def save_cv_result(
@@ -788,6 +894,7 @@ class CV_Result:
                     "n_folds",
                     "n_label",
                     "cross_val_scores",
+                    "best_params",
                 ]
             )
 
@@ -846,6 +953,7 @@ class CV_Result:
                         json.dumps(
                             out_record.get("cross_val_scores", []), default=str
                         ),
+                        json.dumps(out_record.get("best_params"), default=str),
                     ]
                 )
 

@@ -715,11 +715,7 @@ def run_from_dataset(
     n_jobs: Optional[int] = None if n_jobs_raw is None else int(n_jobs_raw)
 
     if mode == "run_grid":
-        results = cv.run_grid(
-            param_path=param_path,
-            n_jobs=n_jobs,
-            params_per_job=int(cv_cfg.get("params_per_job", 2)),
-        )
+        results = cv.run_grid(param_path=param_path, n_jobs=n_jobs)
     elif mode == "run":
         results = cv.run(param_path=param_path, n_jobs=n_jobs)
     else:

@@ -88,9 +88,10 @@ def taxon_icc(
     """Per-taxon ICC against the grouping column in `groups`.
 
     Args:
-        long_lf: `{sample, taxonomy, <value_col>}`, one row per taxon
+        long_lf: `{sample, taxonomy, <value_col>}`, with rows only for taxa
             actually present. Absences are inferred from `groups`, so the
-            frame does not need the zeros spelled out.
+            frame does not need the zeros spelled out. Several rows for one
+            taxon in one sample are summed.
         groups: `{sample, <group>}` -- the second column is the grouping.
         samples: Restrict to these samples. None uses every sample that
             `groups` covers.
@@ -122,8 +123,16 @@ def taxon_icc(
 
     # An inner join against the design both attaches the group and
     # drops any sample outside it, which is what `samples` asked for.
-    present = long_lf.filter(pl.col(value_col) != 0).join(
-        design.lazy(), on="sample", how="inner"
+    #
+    # Then one value per sample x taxon, because the algebra above needs
+    # it: the frame can hold one row per lineage under a taxon, and squaring
+    # those separately makes Q too small. SSW then clamps to zero and the
+    # taxon reads ICC 1.0, with a prevalence above 1.
+    present = (
+        long_lf.filter(pl.col(value_col) != 0)
+        .join(design.lazy(), on="sample", how="inner")
+        .group_by(["sample", "taxonomy", gcol])
+        .agg(pl.col(value_col).sum())
     )
 
     per_group = present.group_by(["taxonomy", gcol]).agg(

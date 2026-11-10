@@ -1156,13 +1156,92 @@ What is an axis here and what is not:
 | | |
 |---|---|
 | `transform` | a real axis — one run per value (default: all three) |
+| `--min-prevalence 0.01 0.05` | a real axis — one run per value per transform |
 | `--icc-max 0.9 0.75` | one *extra* run per transform per cutoff |
 | `shadow` | **not** an axis — `<set>_shad` is built beside the clean set and both train in the same run, so it is one flag |
 
-So the grid is `len(transforms) × (1 + len(icc-max))` runs. With no `--icc-max`
-that is three. Note that `icc.enabled: true, max_icc: null` returns the feature
-frame *untouched* — report-only ICC is a diagnostic, not a variant, so it never
-forks the grid.
+So the grid is
+`len(transforms) × max(1, len(min-prevalence)) × (1 + len(icc-max))` runs.
+With neither optional flag that is three. Note that
+`icc.enabled: true, max_icc: null` returns the feature frame *untouched* —
+report-only ICC is a diagnostic, not a variant, so it never forks the grid.
+
+`min_prevalence` is worth sweeping precisely because it leaves **no mark on
+the feature-set name**: `tax_genus_bio` at 1 % and at 5 % are the same string,
+so the only safe way to compare them is one `base_dir` each, which is what the
+driver gives them. Omit the flag and each run keeps whatever the template sets.
+
+### From one YAML, top to bottom
+
+Every setting can live in the config's `sweep:` section, so one file and one
+command run the whole benchmark. `scripts/sweep_transforms.example.yaml` lists
+every key.
+
+```bash
+pixi run python scripts/sweep_transforms.py --config sweep.yaml
+```
+
+| Stage | What runs | Written to |
+|---|---|---|
+| 1 | `sweep.subset`: up to `n_per_label` samples per label (optional) | `<out>/subset_n<N>_seed<S>/` |
+| 2-3 | the grid, one `config.yaml` per combination, checked before anything starts | `<combo>/config.yaml` |
+| 4 | prepare, split, CV, feature report | `<combo>/` |
+| 5 | the summary, then one figure set per CV scheme (`sweep.figure_schemes`) | `summary/`, `summary/figures/` |
+| 6 | ICC and shadow-floor figures | `summary/figures/` |
+| 7 | `sweep.prune`: pruning on each combination × label, on `sweep.prune.scheme` (null = each row's best grouped scheme, never `random`) | `<combo>/prune/<settings>/` |
+| 8 | CV, whole-pool fit and holdout, on all features and on those pruning kept | `<combo>/prune/<settings>/<target>/{unpruned,pruned}/` |
+| 9 | scoreboard and runtime figures, the ranking table | `summary/benchmark_ranking.tsv` |
+| 10 | a list of what was written | printed at the end |
+
+A flag on the command line wins over the file, so `--models rf` still works for
+a cheap first pass. Stages 7 to 9 only run when `sweep.prune.enabled` is true.
+
+**`sweep.runner`** picks how stage 4 runs:
+
+- `snakemake` (the default) is the workflow, which can submit to a queue.
+- `local` runs the same steps in the same folder layout on the machine you are
+  on, with no Snakemake and no queue. Use it inside an interactive job. With
+  `cores: null` it shares `PBS_NCPUS` across `max_workers`.
+
+Stages 7 and 8 always run on the machine running the script. With Snakemake
+submitting to a queue from a login node, leave `sweep.prune` off.
+
+Each combination runs as its own process, logging to
+`<combo>/sweep_transforms.log` and `<combo>/sweep_finish.log`. One that fails
+or runs out of memory is recorded and the rest carry on. Rerunning skips every
+step with finished output, so changing only `sweep.prune` costs just the new
+pruning, in a new folder.
+
+`--rerun` is refused with the local runner, because skipped steps would leave
+old results under new settings. Use a new `sweep.out`, or delete the
+combination's folder. A subset folder also refuses to be rebuilt with different
+settings.
+
+### How far each combination runs
+
+By default, exactly as far as your template does. A template carrying
+`holdout_evaluation: {enabled: false}` stops at CV for every combination, and
+the summary then ranks **validation folds** — which makes the winner a
+candidate, not a result.
+
+| flag | effect on every derived config |
+|---|---|
+| `--holdout` | `holdout_evaluation.enabled: true` — each combination runs through to the final test |
+| `--final-fit` | `final_fit.enabled: true` — whole-training-pool diagnostics (see below) |
+
+Both are forced on for *every* combination rather than merged per combination,
+on purpose: a holdout that ran for two combinations out of six is not a
+benchmark. With `--holdout`, `summary/SUMMARY.txt` gains a **HOLDOUT** block
+ranking the combinations on samples no fold ever saw, and `summary/holdout.tsv`
+collects the rows.
+
+```bash
+pixi run python scripts/sweep_transforms.py \
+    --config test_transform.yaml --out out/transform_sweep \
+    --min-prevalence 0.01 0.05 0.1 --holdout --final-fit --cores 24
+```
+
+That is 3 transforms × 3 thresholds = 9 runs, each ending in its own holdout.
 
 Each combination gets its own directory holding a derived `config.yaml`, its
 prepared dataset, splits and CV outputs, so nothing collides and any one can be
@@ -1180,13 +1259,80 @@ out/transform_sweep/
 
 `summary/SUMMARY.txt` is the one file to read — one block per label, the
 combinations ranked, the winner starred. A combination that fails does not stop
-the sweep or poison the summary: it is absent from the tables and named with
-its exit code.
+the sweep or poison the summary: it is absent from the tables, even if an
+earlier run left its results on disk, and named with its exit code. A job
+stopped by SIGTERM (`qdel`, walltime) or Ctrl-C ends its running combinations,
+marks them `interrupted` and still writes the summary. Rerun a combination by
+hand? Delete `sweep_transforms_status.json`, then use `--summary-only`.
+
+Relative paths in `data`, `groupings.file` and `cv.param_path` are taken from
+the directory you launch the sweep from, and written into each derived config
+as absolute paths. `cv.feature_set` in your template picks the ranks to build,
+as it does in a normal run; only the names are re-derived.
+
+### Growing a sweep, and keeping it fast
+
+The summary covers **every combination under `--out`**, not only the ones on
+this command line, and a combination that already finished with the same config
+is not launched again. So adding a threshold costs only the new runs:
+
+```bash
+pixi run python scripts/sweep_transforms.py --config pipeline.yaml --out out/transform_sweep --min-prevalence 0.01 0.05
+pixi run python scripts/sweep_transforms.py --config pipeline.yaml --out out/transform_sweep --min-prevalence 0.1
+```
+
+If settings that affect results have changed, the sweep refuses to start.
+Snakemake does not treat the config as an input, so finished steps would not
+rerun and old results would sit under the new settings. Use a new `--out`, or
+pass `--rerun`, adding `--extra -R prepare` or `--extra -R cv` to rebuild from
+that step. Missing input files and a `--min-prevalence` outside 0 to 1 are also
+refused before any job starts.
+
+CV is nearly all of the runtime: in one 18S run `prepare` and each `split` took
+under a minute, against 89 minutes of RF and 175 of XGBoost summed over its nine
+CV jobs. Shadow sets add a second feature set for CV to train. So screen first,
+into its own `--out`:
+
+```bash
+pixi run python scripts/sweep_transforms.py --config pipeline.yaml --out out/screen --min-prevalence 0.01 0.05 0.1 --models rf --no-shadow
+```
+
+Then run the full models and `--holdout` on the candidates. Fewer CV schemes
+help too: every grouping in `split.cv.grouping` adds one CV job per label.
 
 Useful flags: `--dry-run` writes every `config.yaml` and prints the commands
-without running anything; `--summary-only` re-reads what is on disk and
+without running anything, leaving the status file and summary as they were;
+`--summary-only` re-reads what is on disk (no axis flags needed) and
 rewrites the summary; `--stop-on-error` abandons the sweep at the first
-failure; `--extra` passes everything after it to the runner (must be last).
+failure and marks the rest `not run`; `--extra` passes everything after it to
+Snakemake (must be last).
+
+### Running the combinations in parallel
+
+`--max-workers N` makes the driver a manager: it writes every `config.yaml`
+first, then keeps N combinations in flight at once, records each one into
+`sweep_transforms_status.json` as it lands, and collates the summary when the
+last one is done.
+
+```bash
+pixi run python scripts/sweep_transforms.py \
+    --config pipeline.yaml --out out/transform_sweep \
+    --min-prevalence 0.01 0.05 0.1 --holdout \
+    --max-workers 3 --cores 8
+```
+
+Each combination is a separate Snakemake process given its own
+`--directory`, so they keep separate `.snakemake` state and never contend
+for one lock — which also means an interrupted combination is unlocked on
+its own rather than blocking the whole sweep.
+
+**The budgets multiply.** `--max-workers 3 --cores 8` asks for 24 cores, not
+8. Size them against the node you are on. Snakemake still schedules rules
+within each combination, so there are two levels of parallelism at once.
+
+A worker that fails, or even raises, is recorded as `failed` and the other
+combinations continue; `--stop-on-error` starts nothing further, lets the ones
+already running finish, and records the rest as `not run`.
 
 ### Sending a transform sweep to a cluster
 
@@ -1199,8 +1345,8 @@ nohup pixi run python scripts/sweep_transforms.py --config pipeline.yaml --out o
 The driver drops its own `--cores` when `--extra` sets `--jobs`, and `--extra`
 reaches `subprocess` as a list, so a quoted submit command stays one argument.
 
-Or submit each combination as its own job, which is the only way to get
-combination-level parallelism — the driver's own loop is serial:
+Or submit each combination as its own job, so that each gets its own
+allocation:
 
 ```bash
 pixi run python scripts/sweep_transforms.py --config pipeline.yaml --out out/transform_sweep --dry-run
@@ -1209,6 +1355,10 @@ pixi run python scripts/sweep_transforms.py --config pipeline.yaml --out out/tra
 ```
 
 ### Plotting a transform sweep
+
+A sweep now draws these itself, one figure set per CV scheme, into
+`summary/figures/`. To redraw them by hand, which draws the best-scoring scheme
+only:
 
 ```bash
 pixi run python scripts/plot_transform_sweep.py \
@@ -1228,6 +1378,19 @@ one panel hides the comparison inside each. Three panels, left to right:
 - **(c) how stable** — per-fold R², one dot per fold, with the median and the
   pooled score marked. A pooled 0.74 built from folds spanning 0.07 to 0.92 is
   a different claim from twelve folds at 0.74.
+
+When the sweep ran with `--holdout`, a second figure per label is written,
+`transform_sweep_holdout_<label>.png`, with two panels:
+
+- **(a) final test, ranked** — holdout R² per combination, best first, coloured
+  by transform. This is the ranking to quote.
+- **(b) CV vs final test** — the same combinations with their CV score beside
+  their holdout score. A combination whose dark bar sits well below its light
+  one won CV optimistically; the gap is what a grouped split was supposed to
+  predict and sometimes does not.
+
+It is drawn for the best-scoring scheme only, because two schemes mean two
+different test sets and one bar chart cannot honestly hold both.
 
 ## Scoring the fit on the whole training pool
 
@@ -1404,15 +1567,18 @@ cv = CrossValidator(
 # large data -- see "Keeping memory down on large data")
 cv = CrossValidator(dataset, models=["rf", "xgboost"], feature_set=["tax_order"])
 
+# Short names: "rf", "gb", "xgb" (or "xgboost") and "svm" (or "svr"). "svm" is
+# sklearn's LinearSVR behind a MaxAbsScaler, so its grid keys take the step
+# prefix (`svr__C`, `svr__epsilon`); see hyperparameters.yaml. Linear, not
+# kernel, so it scales to the full 16S sets. It has no feature importances.
+
 # Cross validation run; parameters is required and n_jobs is number of CV done in parallel. Default will detect CPU core
 results = cv.run(param_path="parameters.yaml", n_jobs = 8)
 
-# Grid Cross validation run -> using GridCV from sklearn
-# n_jobs=None estimates parallelism from CPU count and the number of
-# hyperparameter combinations, at params_per_job combinations per worker
-results_grid = cv.run_grid(
-    param_path="hyperparameters.yaml", n_jobs=None, params_per_job=2
-)
+# Grid Cross validation run -> using GridSearchCV from sklearn
+# n_jobs=None uses every core this job can use. Every candidate is written to
+# grid_results.csv by export_result; see "Grid search on all four datasets"
+results_grid = cv.run_grid(param_path="hyperparameters.yaml", n_jobs=None)
 
 # Export CV result package. save_models/fold_table default to True here;
 # the pipeline turns them off via outputs.cv_save_models / cv_fold_table
@@ -1420,6 +1586,43 @@ CV_Result.export_result(
     results, "out/cv_results", save_models=False, fold_table=False
 )
 ```
+
+### Grid search on all four datasets
+
+`cv.run_grid` is a thin layer over sklearn's `GridSearchCV`: one search per
+feature set x label x scheme x model, on the predefined folds. Each estimator
+trains on one thread while `GridSearchCV` spreads the fits across `n_jobs`
+workers. The winner is the best pooled R2, the score the rest of the workflow
+ranks on, and is refit once with all the threads.
+
+```bash
+pixi run python scripts/run_grid_search.py --dataset 18S_marine
+```
+
+`--dataset` also takes `ITS_soil`, `16S_marine`, `16S_soil` or `all`. They share
+one config, `scripts/grid_search.yaml`, so no copy of it can keep the previous
+dataset's paths. The grids are in `hyperparameters.yaml`. Rerunning the same
+command resumes, skipping every finished label x scheme.
+
+Every labelled sample is used unless `--n-per-label N` caps each label. The
+holdout is split off and left unscored: the run stops at the final fit of each
+winner on the CV pool (`final_fit/`), and saves that model under `best_models/`
+so the holdout can be scored once a setting is chosen.
+
+Under `ML_outputs/grid_search_full/`, or `grid_search_n<N>/` with a cap
+(`--root` changes it):
+
+| Path | Contents |
+|---|---|
+| `<dataset>/relabund_prev0/holdout_*/runs/<label>/<scheme>/cv_results/grid_results.csv` | Every candidate: every column of sklearn's `cv_results_` unchanged (per-fold scores, means, ranks, timings, `param_*`), led by `pooled_r2`, `rank_pooled_r2` and `selected` |
+| `.../runs/<label>/<scheme>/final_fit/full_fit_metrics.csv` | Each winner refit on the whole CV pool: in-sample and out-of-bag R2 beside its CV score |
+| `grid_report.csv`, `figures/grid_report__<dataset>.png` | Per label x scheme, the settings each model chose (searched ones only), its CV score, and the holdout score of the model sent to the holdout |
+| `grid_winners.csv` | The model each dataset x label x scheme sent to the holdout, with both scores |
+| `figures/grid_overview.png` | That table as a figure: CV beside holdout |
+| `figures/grid_params__<dataset>__<label>__<model>.png` | Pooled R2 against each searched hyperparameter, per scheme |
+
+`scripts/plot_grid_search.py --root <root>` redraws the figures from whatever
+has finished so far.
 
 ### Picking the best: per label, per scheme
 
@@ -1911,7 +2114,8 @@ pixi run pre-commit run --all-files
 | `scripts/pipeline_steps.py` | the pipeline split into `prepare` / `split` / `cv` / `collate` / `split_report` CLI steps |
 | `scripts/sweep_tokens.py` | token parsing (`random`, `<column>`, `taxon:<rank>`), dependency-free so the Snakefile can import it without pulling in the package |
 | `scripts/check_holdout_metadata.py` | holdout groupings from a metadata table alone |
-| `scripts/sweep_transforms.py` | one full run per transform into its own directory, then one summary across them |
+| `scripts/sweep_transforms.py` | a whole transform benchmark from one YAML: optional subset, one run per combination, summary, figures, pruning and final fit |
+| `scripts/sweep_transforms.example.yaml` | every key that script reads |
 | `scripts/plot_transform_sweep.py` | one figure per label from a transform sweep |
 | `scripts/rank_feature_report.py` | rank comparison, importance concentration and the shadow floor, from finished CV exports |
 | `scripts/prune_iterate_cv.py` | the prune/re-run loop |

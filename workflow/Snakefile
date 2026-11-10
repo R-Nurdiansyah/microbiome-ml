@@ -68,67 +68,15 @@ BASE_S = str(BASE)
 
 
 def _run_specs():
-    """The runs this sweep performs, as {dir_name: spec}.
-
-    Two modes:
-      sweep.holdout_groupings: [random, bioproject, "taxon:family"]
-          every grouping x every label -- the cross-product.
-      sweep.pairs: {geo_ph: organism, geo_temperature: realm}
-          one run per label, each with its own holdout grouping.
-    `pairs` wins if both are given. A pair run restricts the label at
-    every stage, so a label without a holdout cannot trip up CV.
-    """
+    """The runs this sweep performs; see sweep_tokens.run_specs."""
     sweep = config.get("sweep") or {}
-    pairs = config.get("pairs") or sweep.get("pairs")
-    if pairs:
-        if isinstance(pairs, str):  # --config pairs=geo_ph:organism,...
-            pairs = dict(
-                item.split(":", 1) for item in pairs.split(",") if item
-            )
-        if not isinstance(pairs, dict):
-            raise WorkflowError(
-                "sweep.pairs must be a mapping of label -> holdout grouping"
-            )
-        specs = {}
-        for label, tokens in pairs.items():
-            # A label may name several groupings; each becomes its own run,
-            # so adding one later does not disturb the runs already done.
-            if tokens is None or isinstance(tokens, str):
-                tokens = [tokens]
-            elif not isinstance(tokens, (list, tuple)):
-                raise WorkflowError(
-                    f"sweep.pairs[{label}] must be a grouping or a list of "
-                    f"groupings, got {tokens!r}"
-                )
-            for token in tokens:
-                token = "random" if token is None else str(token).strip()
-                gname = steps.spec_dir_name(token)
-                specs[f"holdout_{gname}__{label}"] = {
-                    "token": token,
-                    "label": str(label),
-                    "stamp": f"{gname}__{label}",
-                }
-        return specs
-
-    raw = config.get("holdout_groupings") or sweep.get("holdout_groupings")
-    if raw is None:
-        raise WorkflowError(
-            "Nothing to sweep. Give either sweep.holdout_groupings "
-            "([random, bioproject, ...]) or sweep.pairs "
-            "({label: grouping}); --config holdout_groupings=... and "
-            "--config pairs=label:grouping,... also work."
+    try:
+        return steps.run_specs(
+            config.get("pairs") or sweep.get("pairs"),
+            config.get("holdout_groupings") or sweep.get("holdout_groupings"),
         )
-    if isinstance(raw, str):
-        raw = [x for x in raw.split(",")]
-    specs = {}
-    for g in raw:
-        token = "random" if g is None else str(g).strip()
-        gname = steps.spec_dir_name(token)
-        specs.setdefault(
-            f"holdout_{gname}",
-            {"token": token, "label": None, "stamp": gname},
-        )
-    return specs
+    except ValueError as exc:
+        raise WorkflowError(str(exc)) from exc
 
 
 RUNS = _run_specs()
@@ -287,6 +235,10 @@ COLLATED = (
 )
 if FEATREP_ENABLED:
     COLLATED.append(f"{BASE_S}/feature_report/feature_report.txt")
+
+
+# Quick and light, so on a cluster they run inside the Snakemake process.
+localrules: split, split_report, collate, feature_report
 
 
 rule all:
