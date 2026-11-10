@@ -199,6 +199,7 @@ MODEL_ALIASES = {
     "RandomForestRegressor": "rf",
     "XGBRegressor": "xgboost",
     "GradientBoostingRegressor": "gb",
+    "ScaledLinearSVR": "svm",
 }
 PRUNE_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
@@ -629,12 +630,18 @@ def _stop_running(signum: int, _frame: Any) -> None:
         "signal %s: stopping %d running combination(s)", signum, len(RUNNING)
     )
     STOPPING.set()
-    for proc in list(RUNNING):
+    # Only these: a process started after the signal was never asked to
+    # stop. The timer is never cancelled, so reading RUNNING when it fires
+    # killed whatever had started since -- in the tests, the next test's
+    # child, seconds later and in the same process.
+    targets = list(RUNNING)
+    for proc in targets:
         proc.terminate()
 
     def kill_stragglers() -> None:
-        for proc in list(RUNNING):
-            proc.kill()
+        for proc in targets:
+            if proc.poll() is None:
+                proc.kill()
 
     timer = threading.Timer(KILL_AFTER, kill_stragglers)
     timer.daemon = True
@@ -1547,6 +1554,16 @@ def run_stages(config_path: Path, cores: int) -> None:
 # ---------------------------------------------------------------------------
 # Stages 7 and 8: pruning, then the final fit
 # ---------------------------------------------------------------------------
+def draws_transform_figures(template: Dict[str, Any]) -> bool:
+    """False for a grid search, whose figures compare its settings instead.
+
+    The transform figures rank transforms and read one model per cell; on a
+    grid run they show a single transform under headings about choosing one.
+    """
+    mode = str((template.get("cv") or {}).get("mode", "run")).strip().lower()
+    return mode != "run_grid"
+
+
 def prune_settings(sweep: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """`sweep.prune` over the defaults."""
     return {**PRUNE_DEFAULTS, **((sweep or {}).get("prune") or {})}
@@ -2112,7 +2129,13 @@ def final_stages(
                     holdout, models, figures, formats, scheme=scheme
                 )
 
-    _best_effort("draw the sweep figures", draw_schemes)
+    if draws_transform_figures(template):
+        _best_effort("draw the sweep figures", draw_schemes)
+    else:
+        LOGGER.info(
+            "cv.mode is run_grid: transform figures skipped; "
+            "plot_grid_search.py draws the grid report"
+        )
     cutoffs = sorted({c.max_icc for c in on_disk if c.max_icc is not None})
     _best_effort(
         "draw the ICC figure",

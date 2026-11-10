@@ -1,0 +1,121 @@
+# Grid search on one dataset: relative abundance, no prevalence filter.
+#
+# Do not run this file directly. scripts/run_grid_search.py fills in {root} and
+# {dataset} once per dataset, so one config serves all four and no copy of it
+# can keep the previous dataset's paths. It also adds a `subset` block when
+# given --n-per-label; without one, every labelled sample is used.
+#
+# The grids themselves are in hyperparameters.yaml.
+#
+# The holdout is split off and never seen here: CV, then the final fit of each
+# winner on the CV pool (final_fit/), with its model saved under best_models/.
+# Score the holdout later, once a setting is chosen.
+
+sweep:
+  out: {root}/{dataset}
+  runner: local
+  cores: null        # PBS_NCPUS if set, else 8
+  max_workers: 1
+  log_level: INFO
+
+  # One run: no transform to compare, no ICC filter, no shadow features.
+  transforms: [relabund]
+  min_prevalence: [0]
+  icc_max: []
+  icc_group: bioproject
+  shadow: false
+
+  pairs:
+    temperature: bioproject
+    geo_temperature: bioproject
+
+  # false: the sweep would otherwise switch holdout_evaluation back on.
+  holdout: false
+  final_fit: true
+  figure_schemes: [random, month, ecoregion, bioproject]
+
+  prune:
+    enabled: false
+
+data:
+  metadata: /home/n11702427/m/big_data_microbiome/rizky/machine_learning/all/all_amplicon/ML_inputs/order_95/{dataset}/{dataset}_metadata.csv
+  attributes: /home/n11702427/m/big_data_microbiome/rizky/machine_learning/all/all_amplicon/ML_inputs/order_95/{dataset}/{dataset}_attributes.csv
+  study_titles: null
+  profiles: /home/n11702427/m/big_data_microbiome/rizky/machine_learning/all/all_amplicon/ML_inputs/order_95/{dataset}/{dataset}_community_coverage.csv
+  root: null
+  labels:
+    temperature: /home/n11702427/m/big_data_microbiome/rizky/machine_learning/all/all_amplicon/ML_inputs/order_95/{dataset}/label_temperature.csv
+    geo_temperature: /home/n11702427/m/big_data_microbiome/rizky/machine_learning/all/all_amplicon/ML_inputs/order_95/{dataset}/label_geo_temp.csv
+
+groupings:
+  defaults: false
+  columns: [month, ecoregion, bioproject]
+  file: null
+
+features:
+  add_taxonomic_features: true
+  all: false
+  ranks: [order]
+  prefix: tax
+  chunk_samples: 5000
+  format: parquet
+  labelled_only: true
+  prevalence_by: bioproject
+  presence_threshold: 0.0
+
+preprocessing:
+  enabled: false
+
+split:
+  holdout:
+    label: null
+    test_size: 0.2
+    n_bins: 5
+    grouping: null
+    random_state: 42
+    force: true
+  cv:
+    label: null
+    n_folds: 5
+    n_bins: 5
+    methods: [kfold]
+    grouping: all
+    random_state: 42
+    logo_max_groups: 50
+    use_holdout: true
+    force: true
+    strict: false
+
+cv:
+  enabled: true
+  models: [rf, xgboost]
+  mode: run_grid
+  param_path: hyperparameters.yaml
+  label: null
+  scheme: null
+  feature_set: [tax_order]
+
+holdout_evaluation:
+  enabled: false
+
+final_fit:
+  enabled: true
+  oob: true
+  top_n: 10
+
+outputs:
+  cv_save_models: false
+  cv_fold_table: false
+
+visualise:
+  enabled: true
+  formats: [png]
+  top_n: 10
+  holdout_distribution:
+    enabled: true
+    grouping: auto
+    bins: 10
+    stat: [count, probability]
+
+shap:
+  enabled: false

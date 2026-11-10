@@ -278,11 +278,7 @@ def step_cv(args: argparse.Namespace) -> None:
     n_jobs_raw = cv_cfg.get("n_jobs")
     n_jobs = None if n_jobs_raw is None else int(n_jobs_raw)
     if mode == "run_grid":
-        results = cv.run_grid(
-            param_path=param_path,
-            n_jobs=n_jobs,
-            params_per_job=int(cv_cfg.get("params_per_job", 2)),
-        )
+        results = cv.run_grid(param_path=param_path, n_jobs=n_jobs)
     elif mode == "run":
         results = cv.run(param_path=param_path, n_jobs=n_jobs)
     else:

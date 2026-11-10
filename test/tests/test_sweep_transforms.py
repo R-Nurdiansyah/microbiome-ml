@@ -15,6 +15,7 @@ import copy
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -1003,6 +1004,50 @@ def test_stopping_ends_the_running_combo_and_starts_no_more(
     assert (combos[0].dir / "sweep_transforms.log").exists()
     assert not (combos[1].dir / "sweep_transforms.log").exists()
     assert not sw.RUNNING
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="terminate is already a kill on Windows"
+)
+def test_the_kill_timer_spares_a_process_started_after_the_signal(
+    monkeypatch, clean_stop
+):
+    """The timer killed the next test's child (rc=-9) when it read RUNNING
+    at fire time rather than at the signal."""
+    monkeypatch.setattr(sw, "KILL_AFTER", 0.5)
+    # Ignores SIGTERM, so only the timer's kill can end it.
+    stubborn = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); time.sleep(60)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    later = None
+    try:
+        assert stubborn.stdout.readline().strip() == "ready"
+        sw.RUNNING.add(stubborn)
+        sw._stop_running(signal.SIGTERM, None)
+        sw.RUNNING.discard(stubborn)
+
+        later = subprocess.Popen(SLEEP)
+        sw.RUNNING.add(later)
+        time.sleep(1.5)
+
+        assert stubborn.poll() == -signal.SIGKILL
+        assert later.poll() is None, "a process started later was killed"
+    finally:
+        for proc in (stubborn, later):
+            if proc is not None:
+                sw.RUNNING.discard(proc)
+                proc.kill()
+                proc.wait()
+                if proc.stdout is not None:
+                    proc.stdout.close()
 
 
 def test_a_combo_that_finishes_as_the_signal_lands_stays_ok(

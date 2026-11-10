@@ -195,6 +195,8 @@ def test_string_alias_and_mixed_models(tmp_path):
     assert isinstance(res_run, dict)
     assert len(res_run) >= 1
 
+    # run_grid needs a key per named model; an empty one means defaults.
+    p.write_text(json.dumps({"rf": None}))
     res_grid = cv.run_grid(param_path=str(p))
     assert isinstance(res_grid, dict)
     assert len(res_grid) >= 1

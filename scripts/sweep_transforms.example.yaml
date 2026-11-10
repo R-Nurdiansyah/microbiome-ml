@@ -135,7 +135,6 @@ cv:
   models: [rf, xgboost]
   mode: run
   param_path: parameters.yaml
-  params_per_job: 2
   label: null
   scheme: null        # null = every scheme; [month] to go faster
   feature_set: [tax_genus]  # only the rank counts; the full name is derived

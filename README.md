@@ -1567,15 +1567,18 @@ cv = CrossValidator(
 # large data -- see "Keeping memory down on large data")
 cv = CrossValidator(dataset, models=["rf", "xgboost"], feature_set=["tax_order"])
 
+# Short names: "rf", "gb", "xgb" (or "xgboost") and "svm" (or "svr"). "svm" is
+# sklearn's LinearSVR behind a MaxAbsScaler, so its grid keys take the step
+# prefix (`svr__C`, `svr__epsilon`); see hyperparameters.yaml. Linear, not
+# kernel, so it scales to the full 16S sets. It has no feature importances.
+
 # Cross validation run; parameters is required and n_jobs is number of CV done in parallel. Default will detect CPU core
 results = cv.run(param_path="parameters.yaml", n_jobs = 8)
 
-# Grid Cross validation run -> using GridCV from sklearn
-# n_jobs=None estimates parallelism from CPU count and the number of
-# hyperparameter combinations, at params_per_job combinations per worker
-results_grid = cv.run_grid(
-    param_path="hyperparameters.yaml", n_jobs=None, params_per_job=2
-)
+# Grid Cross validation run -> using GridSearchCV from sklearn
+# n_jobs=None uses every core this job can use. Every candidate is written to
+# grid_results.csv by export_result; see "Grid search on all four datasets"
+results_grid = cv.run_grid(param_path="hyperparameters.yaml", n_jobs=None)
 
 # Export CV result package. save_models/fold_table default to True here;
 # the pipeline turns them off via outputs.cv_save_models / cv_fold_table
@@ -1583,6 +1586,43 @@ CV_Result.export_result(
     results, "out/cv_results", save_models=False, fold_table=False
 )
 ```
+
+### Grid search on all four datasets
+
+`cv.run_grid` is a thin layer over sklearn's `GridSearchCV`: one search per
+feature set x label x scheme x model, on the predefined folds. Each estimator
+trains on one thread while `GridSearchCV` spreads the fits across `n_jobs`
+workers. The winner is the best pooled R2, the score the rest of the workflow
+ranks on, and is refit once with all the threads.
+
+```bash
+pixi run python scripts/run_grid_search.py --dataset 18S_marine
+```
+
+`--dataset` also takes `ITS_soil`, `16S_marine`, `16S_soil` or `all`. They share
+one config, `scripts/grid_search.yaml`, so no copy of it can keep the previous
+dataset's paths. The grids are in `hyperparameters.yaml`. Rerunning the same
+command resumes, skipping every finished label x scheme.
+
+Every labelled sample is used unless `--n-per-label N` caps each label. The
+holdout is split off and left unscored: the run stops at the final fit of each
+winner on the CV pool (`final_fit/`), and saves that model under `best_models/`
+so the holdout can be scored once a setting is chosen.
+
+Under `ML_outputs/grid_search_full/`, or `grid_search_n<N>/` with a cap
+(`--root` changes it):
+
+| Path | Contents |
+|---|---|
+| `<dataset>/relabund_prev0/holdout_*/runs/<label>/<scheme>/cv_results/grid_results.csv` | Every candidate: every column of sklearn's `cv_results_` unchanged (per-fold scores, means, ranks, timings, `param_*`), led by `pooled_r2`, `rank_pooled_r2` and `selected` |
+| `.../runs/<label>/<scheme>/final_fit/full_fit_metrics.csv` | Each winner refit on the whole CV pool: in-sample and out-of-bag R2 beside its CV score |
+| `grid_report.csv`, `figures/grid_report__<dataset>.png` | Per label x scheme, the settings each model chose (searched ones only), its CV score, and the holdout score of the model sent to the holdout |
+| `grid_winners.csv` | The model each dataset x label x scheme sent to the holdout, with both scores |
+| `figures/grid_overview.png` | That table as a figure: CV beside holdout |
+| `figures/grid_params__<dataset>__<label>__<model>.png` | Pooled R2 against each searched hyperparameter, per scheme |
+
+`scripts/plot_grid_search.py --root <root>` redraws the figures from whatever
+has finished so far.
 
 ### Picking the best: per label, per scheme
 
