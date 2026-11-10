@@ -15,6 +15,14 @@ from microbiome_ml.wrangle.icc import taxon_icc
 
 logger = logging.getLogger(__name__)
 
+# Column carried through create_features' long frame: how many `;` the
+# matched row's full lineage had, so the rows of one sample x taxon can be
+# told apart by depth after the lineage is cut down to the rank name.
+_DEPTH = "__rank_depth"
+# A relative-abundance table at one rank cannot sum above 1 per sample;
+# float32 rounding stays well inside this.
+_SUM_TOLERANCE = 1e-4
+
 # How a feature table's values are expressed. The key is canonical -- it
 # is what the feature set name is built from -- and the tuple is what a
 # config may say instead. Adding one here means adding its name suffix
@@ -889,11 +897,17 @@ class TaxonomicProfiles:
             .with_columns(
                 pl.col("taxonomy").str.replace_all(r";\s+", ";")
             )  # normalize
+            # Depth of the full lineage, read before it is cut to the rank
+            # name: _collapse_rank_rows needs it to tell a taxon's own row
+            # from its descendants'.
+            .with_columns(
+                pl.col("taxonomy").str.count_matches(";").alias(_DEPTH)
+            )
             .with_columns(
                 pl.col("taxonomy").str.extract(pattern).alias("taxonomy")
             )
             .filter(pl.col("taxonomy").is_not_null())
-            .select(["sample", "taxonomy", "relabund"])
+            .select(["sample", "taxonomy", "relabund", _DEPTH])
         )
         if samples is not None:
             long_lf = long_lf.filter(pl.col("sample").is_in(list(samples)))
@@ -922,11 +936,13 @@ class TaxonomicProfiles:
             )
 
         if stream_path is None:
-            features = long_lf.collect().pivot(
+            # One row per sample x taxon before the pivot, so no
+            # aggregate is needed and a duplicate would raise.
+            features = self._collapse_rank_rows(long_lf.collect()).pivot(
                 values="relabund",
                 index="sample",
                 on="taxonomy",
-                aggregate_function="first",
+                aggregate_function=None,
             )
             features = self._pad_samples(features, all_samples)
             # Same shape as the streamed path: a sample without a taxon
@@ -937,6 +953,8 @@ class TaxonomicProfiles:
                 features = features.with_columns(
                     pl.col(taxa_cols).fill_null(0.0).cast(pl.Float32)
                 )
+                over, top = self._rank_sum_excess(features, taxa_cols)
+                self._warn_rank_sums(rank, over, features.height, top)
                 if mode == "clr":
                     features = self._apply_clr(
                         features, taxa_cols, float(clr_pseudocount)
@@ -958,6 +976,75 @@ class TaxonomicProfiles:
             transform=mode,
             clr_pseudocount=float(clr_pseudocount),
             presence_threshold=float(presence_threshold),
+        )
+
+    @staticmethod
+    def _collapse_rank_rows(long_df: pl.DataFrame) -> pl.DataFrame:
+        """One value per sample x taxon: the sum of its shallowest rows.
+
+        The rank filter matches a taxon's own row and every row beneath
+        it, and the two profile layouts need opposite treatment:
+
+        - filled (a row at every rank, as in the unit-test data): the
+          taxon's own row already holds the total, and its descendants
+          repeat parts of it. The own row is the shallowest, so it is
+          kept alone.
+        - leaf-only (one row per species, as in the PR2, UNITE and MFD
+          profiles): every row is a disjoint share of the taxon and all
+          sit at the same depth, empty ranks such as `f__;g__` included,
+          so they are all kept and summed.
+
+        This used to be pivot(aggregate_function="first"), which was
+        right on filled profiles only because parents came first, and on
+        leaf-only profiles kept the most abundant species alone.
+
+        A leaf-only profile that also has rows ending at the rank itself
+        (reads assigned no deeper) cannot be told from a filled one by
+        shape; it is read as filled, and those deeper reads drop out.
+        """
+        depth = pl.col(_DEPTH)
+        return long_df.group_by(
+            ["sample", "taxonomy"], maintain_order=True
+        ).agg(pl.col("relabund").filter(depth == depth.min()).sum())
+
+    @staticmethod
+    def _rank_sum_excess(
+        wide: pl.DataFrame, taxa: List[str]
+    ) -> Tuple[int, float]:
+        """Samples whose relative abundances at one rank sum above 1.
+
+        Returns that count and the largest per-sample sum.
+        """
+        if not taxa or not wide.height:
+            return 0, 0.0
+        totals = (
+            wide.select(pl.sum_horizontal(taxa).alias("t"))
+            .get_column("t")
+            .to_list()
+        )
+        over = sum(1 for t in totals if t > 1.0 + _SUM_TOLERANCE)
+        return over, float(max(totals))
+
+    @staticmethod
+    def _warn_rank_sums(
+        rank: TaxonomicRanks, over: int, n_samples: int, top: float
+    ) -> None:
+        """Warn when a rank's relative abundances exceed 1 in any sample.
+
+        A warning, not an error: hand-built tables in tests use values
+        that are not proportions. On real profiles it means rows are being
+        counted more than once, e.g. a layout _collapse_rank_rows misread.
+        """
+        if not over:
+            return
+        logger.warning(
+            "%d of %d sample(s) have %s relative abundances summing above 1 "
+            "(largest %.4g). Proportions cannot, so rows are probably being "
+            "counted more than once: check the profile layout.",
+            over,
+            n_samples,
+            rank.name.lower(),
+            top,
         )
 
     @staticmethod
@@ -1298,18 +1385,23 @@ class TaxonomicProfiles:
             stream_path.mkdir(parents=True, exist_ok=True)
         else:
             handle = stream_path.open("wb")
+        over, top = 0, 0.0
         try:
             for part, start in enumerate(
                 range(0, len(sample_ids), chunk_samples)
             ):
                 batch = sample_ids[start : start + chunk_samples]
-                sub = long_lf.filter(pl.col("sample").is_in(batch)).collect()
+                # A chunk holds every row of its samples, so collapsing
+                # here gives the same cells as collapsing the whole frame.
+                sub = self._collapse_rank_rows(
+                    long_lf.filter(pl.col("sample").is_in(batch)).collect()
+                )
                 wide = (
                     sub.pivot(
                         values="relabund",
                         index="sample",
                         on="taxonomy",
-                        aggregate_function="first",
+                        aggregate_function=None,
                     )
                     if sub.height
                     else pl.DataFrame({"sample": batch})
@@ -1330,6 +1422,8 @@ class TaxonomicProfiles:
                 wide = wide.select(columns).with_columns(
                     pl.col(taxa).fill_null(0.0).cast(pl.Float32)
                 )
+                n_over, chunk_top = self._rank_sum_excess(wide, taxa)
+                over, top = over + n_over, max(top, chunk_top)
                 if transform == "clr":
                     wide = self._apply_clr(wide, taxa, clr_pseudocount)
                 elif transform == "presence":
@@ -1345,6 +1439,8 @@ class TaxonomicProfiles:
             if handle is not None:
                 handle.close()
 
+        # Once for the whole table, not once per chunk.
+        self._warn_rank_sums(rank, over, len(sample_ids), top)
         return SampleFeatureSet.scan(
             stream_path, name=f"{rank.name.lower()}_features"
         )
