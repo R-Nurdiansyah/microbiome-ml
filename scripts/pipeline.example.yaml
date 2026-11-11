@@ -32,6 +32,8 @@ data:
   study_titles: null
   # Taxonomic profiles, one row per sample x taxon:
   #   acc,coverage,taxonomy   (taxonomy = "Root; d__...; p__...; c__...; ...")
+  # Coverage or relative abundance, filled or unfilled: see
+  # features.profile_layout.
   profiles: /path/to/profiles.csv
   # Optional per-sample root coverage CSV (total reads) if not derivable
   # from the profiles. null = not needed.
@@ -72,6 +74,19 @@ features:
   ranks: null
   # Feature-set name prefix: tax -> tax_phylum, tax_class, ...
   prefix: tax
+  # How the rows of data.profiles relate (SingleM's glossary terms):
+  #   unfilled -> a row holds only the reads assigned to that taxon and no
+  #               deeper, so a taxon's total is the sum of every row under
+  #               it. SingleM's standard (condensed) output; a table with
+  #               one row per species is unfilled too.
+  #   filled   -> a row already includes all of its descendants, so a
+  #               taxon's total is its own row.
+  #   auto     -> (default) decided from the data and logged. Set it when
+  #               you know: a wrong guess sums a filled table several times
+  #               over, or keeps one row of an unfilled one.
+  # Coverage or relative abundance alike; coverage is divided by the
+  # per-sample domain total (data.root, if given, instead).
+  profile_layout: auto
   # Memory controls for building the wide feature tables. Under the
   # Snakemake workflow each rank is streamed straight to the prepared
   # dataset a chunk of samples at a time, so peak memory is roughly

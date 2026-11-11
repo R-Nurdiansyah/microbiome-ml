@@ -837,7 +837,13 @@ def step_collate(args: argparse.Namespace) -> None:
         )
 
     best_frames = _gather(out, "holdout_*/**/best_models_summary.csv", True)
-    all_frames = _gather(out, "holdout_*/**/results_summary.csv", True)
+    # cv_results/ only: best_models/<label>/<scheme>/ repeats the winning
+    # row and holdout/ holds final-test rows under the same file name, so
+    # `**/results_summary.csv` listed every winner twice. An older tree
+    # without cv_results/ keeps the old pattern.
+    all_frames = _gather(
+        out, "holdout_*/**/cv_results/results_summary.csv", True
+    ) or _gather(out, "holdout_*/**/results_summary.csv", True)
     holdout_frames = _gather(out, "holdout_*/**/holdout_summary.csv", False)
 
     if statuses:

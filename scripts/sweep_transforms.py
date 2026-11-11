@@ -199,7 +199,7 @@ MODEL_ALIASES = {
     "RandomForestRegressor": "rf",
     "XGBRegressor": "xgboost",
     "GradientBoostingRegressor": "gb",
-    "ScaledLinearSVR": "svm",
+    "ScaledSVR": "svm",
 }
 PRUNE_DEFAULTS: Dict[str, Any] = {
     "enabled": False,

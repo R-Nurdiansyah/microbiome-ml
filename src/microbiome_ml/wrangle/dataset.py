@@ -247,6 +247,7 @@ class Dataset:
         root: Optional[Union[str, Path, pl.LazyFrame, pl.DataFrame]] = None,
         check_filled: bool = True,
         sample_size: int = 1000,
+        layout: str = "auto",
         **kwargs: Any,
     ) -> "Dataset":
         """Add profiles component with flexible input handling.
@@ -256,6 +257,7 @@ class Dataset:
             root: Optional root coverage data
             check_filled: Whether to check if profiles are filled
             sample_size: Sample size for filled format checking
+            layout: "auto" (detect), "filled" or "unfilled"
             **kwargs: Additional TaxonomicProfiles parameters
 
         Returns:
@@ -271,6 +273,7 @@ class Dataset:
                 root=root,
                 check_filled=check_filled,
                 sample_size=sample_size,
+                layout=layout,
                 **kwargs,
             )
 
@@ -2530,13 +2533,13 @@ class Dataset:
             and self.profiles is not None
             and not self.profiles_qc_done
         ):
-            # Ensure profiles have root coverage data (do this BEFORE fill to avoid double counting)
+            # Ensure profiles have root coverage data
             if self.profiles.root is None:
                 self.profiles = self.profiles.create_root()
 
-            # Ensure profiles are filled
-            if not self.profiles.is_filled:
-                self.profiles = self.profiles.fill_profiles()
+            # No fill: the total, the dominated-sample filter and the rank
+            # features all read either layout as it is, and filling a
+            # species-level table multiplies its rows by the rank count.
 
             # Convert to relative abundance if needed
             profiles_lf = self.profiles.profiles
@@ -2641,6 +2644,7 @@ class Dataset:
                     else ["profiles.csv"]
                 ),
                 "is_filled": self.profiles.is_filled,
+                "layout": self.profiles.layout,
             }
 
         # Save feature sets
@@ -2840,8 +2844,13 @@ class Dataset:
         if "profiles" in manifest["components"]:
             profiles_dir = path / "profiles"
             if profiles_dir.exists():
+                # A manifest from before `layout` was saved carries only
+                # is_filled, which the old check got wrong for one-row-
+                # per-species profiles: detect again rather than trust it.
+                info = manifest["components"]["profiles"]
+                layout = info.get("layout", "auto")
                 dataset.profiles = TaxonomicProfiles.load(
-                    profiles_dir, check_filled=False
+                    profiles_dir, check_filled=layout == "auto", layout=layout
                 )
 
         # Load feature sets

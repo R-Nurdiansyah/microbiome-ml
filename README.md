@@ -1568,9 +1568,10 @@ cv = CrossValidator(
 cv = CrossValidator(dataset, models=["rf", "xgboost"], feature_set=["tax_order"])
 
 # Short names: "rf", "gb", "xgb" (or "xgboost") and "svm" (or "svr"). "svm" is
-# sklearn's LinearSVR behind a MaxAbsScaler, so its grid keys take the step
-# prefix (`svr__C`, `svr__epsilon`); see hyperparameters.yaml. Linear, not
-# kernel, so it scales to the full 16S sets. It has no feature importances.
+# sklearn's SVR with a linear kernel behind a MaxAbsScaler, so its grid keys
+# take the step prefix (`svr__C`, `svr__epsilon`, `svr__kernel`); see
+# hyperparameters.yaml. Its fit time grows with the square of the sample
+# count, so cap the 16S sets before adding it. It has no feature importances.
 
 # Cross validation run; parameters is required and n_jobs is number of CV done in parallel. Default will detect CPU core
 results = cv.run(param_path="parameters.yaml", n_jobs = 8)

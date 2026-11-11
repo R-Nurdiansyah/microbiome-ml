@@ -683,8 +683,12 @@ class TestDatasetPreprocessingEdgeCases:
 
         assert dataset.profiles_qc_done is True
 
-    def test_preprocessing_fills_unfilled_profiles(self, tmp_path):
-        """Test preprocessing fills profiles if not in filled format."""
+    def test_preprocessing_keeps_unfilled_profiles_unfilled(self, tmp_path):
+        """Preprocessing reads an unfilled profile as it is.
+
+        It used to fill it, with a fill step that lost every row above
+        species and multiplied the rest by the number of ranks.
+        """
         # Create unfilled profiles (just species level)
         unfilled_data = {
             "sample": ["S1", "S2", "S3"] * 2,
@@ -715,10 +719,22 @@ class TestDatasetPreprocessingEdgeCases:
 
         assert dataset.profiles.is_filled is False
 
-        # Preprocessing should fill
         dataset.apply_preprocessing(profiles_qc=True, sync_after=False)
 
-        assert dataset.profiles.is_filled is True
+        assert dataset.profiles.is_filled is False
+        # The 6 input rows stay 6: nothing is added per rank
+        assert dataset.profiles.profiles.collect().height == 6
+        # The lists above zip to one species per sample, listed twice
+        # (S1: coli 0.4 + 0.4). Unfilled rows are separate reads, so the
+        # order total is the sum of the sample's rows.
+        orders = dataset.profiles.create_features("order").to_df()
+        totals = dict(
+            zip(
+                orders["sample"].to_list(),
+                orders.drop("sample").sum_horizontal().to_list(),
+            )
+        )
+        assert totals == pytest.approx({"S1": 0.8, "S2": 0.7, "S3": 0.5})
 
     def test_preprocessing_converts_coverage_to_relabund(self, tmp_path):
         """Test preprocessing converts coverage to relabund format."""

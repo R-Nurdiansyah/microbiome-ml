@@ -39,7 +39,7 @@ from sklearn.model_selection import (
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MaxAbsScaler
-from sklearn.svm import LinearSVR
+from sklearn.svm import SVR
 
 # from sklearn.linear_model import ElasticNet, LinearRegression
 # from sklearn.neural_network import MLPRegressor
@@ -76,11 +76,13 @@ class ComboMeta(NamedTuple):
 RANDOM_STATE = 42
 
 
-class ScaledLinearSVR(Pipeline):
-    """LinearSVR behind a MaxAbsScaler, as one estimator.
+class ScaledSVR(Pipeline):
+    """SVR with a linear kernel behind a MaxAbsScaler, as one estimator.
 
-    Linear rather than kernel SVR: liblinear's cost grows with the sample
-    count, libsvm's with its square or worse, which ruled out 16S soil.
+    sklearn's SVR (libsvm), not LinearSVR (liblinear): the standard
+    epsilon-SVR, which leaves the intercept unpenalised and can take
+    another kernel from the grid (`svr__kernel`). The price is fit time,
+    which grows with the square of the sample count or worse.
 
     The penalty on the coefficients is what needs the scaling. Unscaled, a
     rare taxon peaking at 0.001 needs a coefficient 300 times larger than an
@@ -90,7 +92,7 @@ class ScaledLinearSVR(Pipeline):
 
     A subclass rather than a bare Pipeline so reports name it, and so another
     Pipeline is never mistaken for it. Grid keys take the step prefix:
-    `svr__C`, `svr__epsilon`, `svr__loss`.
+    `svr__C`, `svr__epsilon`, `svr__kernel`.
     """
 
     def __init__(
@@ -102,16 +104,9 @@ class ScaledLinearSVR(Pipeline):
         verbose: bool = False,
     ) -> None:
         if steps is None:
-            # liblinear penalises the intercept as if it were a coefficient
-            # on a constant feature of intercept_scaling. At the default of 1
-            # a temperature intercept near 15 is shrunk towards 0; at 10 its
-            # penalty is a hundredth of that. max_iter: the default 1,000
-            # stops short on thousands of sparse columns.
-            svr = LinearSVR(
-                random_state=RANDOM_STATE,
-                intercept_scaling=10.0,
-                max_iter=10_000,
-            )
+            # cache_size: libsvm's kernel cache in MB. The default 200 is
+            # spent within a few thousand samples; past that it recomputes.
+            svr = SVR(kernel="linear", cache_size=1000)
             steps = [("scale", MaxAbsScaler()), ("svr", svr)]
         super().__init__(
             steps,
@@ -125,8 +120,9 @@ _MODEL_CONSTRUCTORS = {
     "rf": lambda: RandomForestRegressor(random_state=RANDOM_STATE),
     "gb": lambda: GradientBoostingRegressor(random_state=RANDOM_STATE),
     "xgb": lambda: XGBRegressor(random_state=RANDOM_STATE),
-    # Seeded inside: svr__random_state.
-    "svm": lambda: ScaledLinearSVR(),
+    # Deterministic, so no seed. Fit time grows with the square of the sample
+    # count or worse: fine at tens of thousands, not at 150,000.
+    "svm": lambda: ScaledSVR(),
 }
 
 # Alias lists map many human-friendly synonyms to the canonical short keys above
@@ -159,7 +155,6 @@ _MODEL_ALIASES = {
         "svm",
         "svr",
         "linear svr",
-        "linearsvr",
         "linear svm",
         "support vector",
         "support vector machine",
@@ -252,6 +247,22 @@ def _cv_parallelism(
     if parallel_jobs > 1:
         return parallel_jobs, 1
     return 1, -1 if n_jobs is None else max(1, requested)
+
+
+def _model_threads(
+    n_jobs: Optional[int], parallel_jobs: int, inner_cv_jobs: int
+) -> int:
+    """Threads each model may use, so the three levels share one budget.
+
+    Combination workers x fold workers x model threads stays within
+    `n_jobs`. Left to itself XGBoost takes every core the node reports
+    -- not the job's allocation -- in every worker at once, while a
+    random forest stays on one core.
+    """
+    # int(): joblib is untyped, so mypy sees its count as Any.
+    budget = int(effective_n_jobs(-1 if n_jobs is None else n_jobs))
+    folds = budget if inner_cv_jobs == -1 else max(1, inner_cv_jobs)
+    return max(1, budget // (max(1, parallel_jobs) * folds))
 
 
 class CrossValidator:
@@ -568,12 +579,14 @@ class CrossValidator:
         parallel_jobs, inner_cv_jobs = _cv_parallelism(
             n_jobs, max_combos, cpu_total
         )
+        model_threads = _model_threads(n_jobs, parallel_jobs, inner_cv_jobs)
 
         logger.info(
             "Dispatching CV combinations across %d worker(s) "
-            "(inner_cv_jobs=%d)",
+            "(inner_cv_jobs=%d, model_threads=%d)",
             parallel_jobs,
             inner_cv_jobs,
+            model_threads,
         )
 
         parallel = Parallel(n_jobs=parallel_jobs)
@@ -586,6 +599,7 @@ class CrossValidator:
                 inner_cv_jobs,
                 self.full_fit,
                 self.full_fit_oob,
+                model_threads,
             )
             for payload in payloads()
         )
@@ -624,11 +638,17 @@ class CrossValidator:
         inner_cv_jobs: int,
         full_fit: bool = False,
         full_fit_oob: bool = True,
+        model_threads: Optional[int] = None,
     ) -> Tuple[
         str,
         Dict[str, CV_Result],
         Optional[Tuple[str, CV_Result, Any, float]],
     ]:
+        """CV every model and setting on one combination.
+
+        `model_threads` sets each estimator's own n_jobs (see
+        `_model_threads`); None leaves the library default.
+        """
         (
             key,
             feature_name,
@@ -649,6 +669,8 @@ class CrossValidator:
                 for params in ParameterGrid(grid):
                     estimator = _MODEL_CONSTRUCTORS[model_key]()
                     estimator.set_params(**params)
+                    if model_threads:
+                        _set_threads(estimator, model_threads)
                     cvres = cross_validate(
                         estimator,
                         X_arr,
@@ -700,6 +722,8 @@ class CrossValidator:
             for params in ParameterGrid(grid):
                 estimator = clone(model)
                 estimator.set_params(**params)
+                if model_threads:
+                    _set_threads(estimator, model_threads)
                 cvres = cross_validate(
                     estimator,
                     X_arr,

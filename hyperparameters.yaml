@@ -24,15 +24,15 @@ xgb:
   min_child_weight: [1, 5]
   subsample: [0.8]
 
-# LinearSVR after a MaxAbsScaler (cv.ScaledLinearSVR), so keys take the
-# `svr__` prefix. Only used when cv.models lists svm. 20 candidates.
+# SVR with a linear kernel after a MaxAbsScaler (cv.ScaledSVR), so keys take
+# the `svr__` prefix. Only used when cv.models lists svm. 10 candidates.
+# Fit time grows with the square of the sample count or worse: cap 16S
+# (--n-per-label) before adding svm there.
 svm:
-  # liblinear sums the loss over samples rather than averaging it, so the
-  # same C regularises less as the data grows: wide on purpose.
-  svr__C: [0.001, 0.01, 0.1, 1, 10]
+  svr__kernel: [linear]
+  # libsvm sums the loss over samples rather than averaging it, so the same
+  # C regularises less as the data grows: wide on purpose. Large C is also
+  # the slow end.
+  svr__C: [0.01, 0.1, 1, 10, 100]
   # In label units (degrees C here): errors smaller than this cost nothing.
-  svr__epsilon: [0.0, 0.5]
-  # epsilon_insensitive is the classic SVR loss (absolute error past epsilon).
-  # squared_epsilon_insensitive squares it, and with far more samples than
-  # taxa lets dual="auto" pick the primal solver, the fast one.
-  svr__loss: [epsilon_insensitive, squared_epsilon_insensitive]
+  svr__epsilon: [0.1, 0.5]

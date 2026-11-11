@@ -61,9 +61,9 @@ class _Dataset:
 
 def _cv_results(sse, sst, mean_r2=None):
     sse, sst = np.asarray(sse, float), np.asarray(sst, float)
-    out = {
-        f"split{i}_test_sse": sse[:, i] for i in range(sse.shape[1])
-    } | {f"split{i}_test_sst": sst[:, i] for i in range(sst.shape[1])}
+    out = {f"split{i}_test_sse": sse[:, i] for i in range(sse.shape[1])} | {
+        f"split{i}_test_sst": sst[:, i] for i in range(sst.shape[1])
+    }
     out["mean_test_r2"] = np.asarray(
         mean_r2 if mean_r2 is not None else [0.0] * len(sse), float
     )
@@ -151,7 +151,9 @@ def test_a_tie_ranks_the_selected_candidate_first(tmp_path):
         mean_fit_time=[0.1, 0.1],
         mean_score_time=[0.1, 0.1],
     )
-    result = CV_Result(feature_set="f", label="l", scheme="s", grid_results=cvres)
+    result = CV_Result(
+        feature_set="f", label="l", scheme="s", grid_results=cvres
+    )
     path = tmp_path / "grid.csv"
     assert CV_Result.export_grid_results({"k": result}, path) == 2
 
@@ -212,7 +214,9 @@ def test_winning_params_are_real_json_in_the_tables(tmp_path):
     CV_Result.export_result(results, tmp_path / "out", save_models=False)
 
     record = json.loads(
-        (tmp_path / "out" / "results.ndjson").read_text("utf-8").splitlines()[0]
+        (tmp_path / "out" / "results.ndjson")
+        .read_text("utf-8")
+        .splitlines()[0]
     )
     assert record["best_params"] == expected
     summary = pl.read_csv(tmp_path / "out" / "results_summary.csv")
@@ -256,12 +260,22 @@ def test_a_second_run_gives_the_same_scores(tmp_path):
     assert scores() == scores()
 
 
-@pytest.mark.parametrize("model", sorted(cv_module._MODEL_CONSTRUCTORS))
+# SVR (libsvm) is deterministic and has no random_state. Listed by name, so a
+# new stochastic model cannot slip through unseeded.
+_DETERMINISTIC = {"svm"}
+
+
+@pytest.mark.parametrize(
+    "model", sorted(set(cv_module._MODEL_CONSTRUCTORS) - _DETERMINISTIC)
+)
 def test_every_named_model_is_seeded(model):
     params = cv_module._MODEL_CONSTRUCTORS[model]().get_params()
-    # A pipeline carries its model's seed under the step prefix.
-    seed = params.get("random_state", params.get("svr__random_state"))
-    assert seed == cv_module.RANDOM_STATE
+    assert params["random_state"] == cv_module.RANDOM_STATE
+
+
+def test_the_svm_has_nothing_to_seed():
+    params = cv_module._MODEL_CONSTRUCTORS["svm"]().get_params()
+    assert not any(k.endswith("random_state") for k in params)
 
 
 def test_threads_go_to_the_refit_and_not_the_search(tmp_path, monkeypatch):
@@ -292,7 +306,9 @@ def test_an_estimator_passed_in_is_left_as_it_was(tmp_path):
         scheme="schemeA",
         full_fit=True,
     )
-    cv.run_grid(param_path=_params(tmp_path, {"rf": {"max_depth": [2]}}), n_jobs=2)
+    cv.run_grid(
+        param_path=_params(tmp_path, {"rf": {"max_depth": [2]}}), n_jobs=2
+    )
     assert model.get_params()["n_jobs"] is None
     assert model.get_params()["oob_score"] is False
 
@@ -316,7 +332,7 @@ def test_oob_is_asked_of_the_winner_only(tmp_path):
     [
         "svm",
         "SVR",
-        "LinearSVR",
+        "linear svr",
         "linear svm",
         "support vector machine",
         "Support-Vector Regression",
@@ -328,14 +344,22 @@ def test_svm_answers_to_its_usual_names(alias):
 
 def test_svm_runs_the_grid_search_like_the_other_models(tmp_path):
     cv = CrossValidator(
-        _Dataset(), models="svm", label="target", scheme="schemeA", full_fit=True
+        _Dataset(),
+        models="svm",
+        label="target",
+        scheme="schemeA",
+        full_fit=True,
     )
-    path = _params(tmp_path, {"svm": {"svr__C": [1, 10], "svr__epsilon": [0.1]}})
+    path = _params(
+        tmp_path, {"svm": {"svr__C": [1, 10], "svr__epsilon": [0.1]}}
+    )
     result = next(iter(cv.run_grid(param_path=path, n_jobs=1).values()))
 
     # Named for itself in every report, not "Pipeline".
-    assert type(result.model).__name__ == "ScaledLinearSVR"
-    assert type(result.model.named_steps["svr"]).__name__ == "LinearSVR"
+    assert type(result.model).__name__ == "ScaledSVR"
+    # SVR with a linear kernel, not LinearSVR
+    assert type(result.model.named_steps["svr"]).__name__ == "SVR"
+    assert result.model.get_params()["svr__kernel"] == "linear"
     assert len(result.grid_results["params"]) == 2
     assert result.model.get_params()["svr__C"] in (1, 10)
     # No OOB and no importances to give, and neither stops the run.
@@ -347,7 +371,7 @@ def test_svm_runs_the_grid_search_like_the_other_models(tmp_path):
 def test_svm_settings_survive_a_clone():
     from sklearn.base import clone
 
-    model = cv_module.ScaledLinearSVR().set_params(svr__C=5, svr__epsilon=0.3)
+    model = cv_module.ScaledSVR().set_params(svr__C=5, svr__epsilon=0.3)
     copy = clone(model)
     assert copy.get_params()["svr__C"] == 5
     assert copy.get_params()["svr__epsilon"] == 0.3
@@ -360,8 +384,10 @@ def test_svm_scaling_keeps_sparse_input_sparse():
     rng = np.random.RandomState(0)
     X = rng.rand(40, 6) * (rng.rand(40, 6) < 0.2)
     y = X[:, 0] * 10
-    model = cv_module.ScaledLinearSVR().fit(sparse.csr_matrix(X), y)
-    assert sparse.issparse(model.named_steps["scale"].transform(sparse.csr_matrix(X)))
+    model = cv_module.ScaledSVR().fit(sparse.csr_matrix(X), y)
+    assert sparse.issparse(
+        model.named_steps["scale"].transform(sparse.csr_matrix(X))
+    )
     assert np.allclose(model.predict(sparse.csr_matrix(X)), model.predict(X))
 
 
@@ -369,8 +395,12 @@ def test_a_plain_pipeline_is_not_taken_for_the_svm(tmp_path):
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
-    model = make_pipeline(StandardScaler(), DecisionTreeRegressor(random_state=0))
-    cv = CrossValidator(_Dataset(), models=model, label="target", scheme="schemeA")
+    model = make_pipeline(
+        StandardScaler(), DecisionTreeRegressor(random_state=0)
+    )
+    cv = CrossValidator(
+        _Dataset(), models=model, label="target", scheme="schemeA"
+    )
     # The svm grid would fail on this pipeline: it has no `svr` step.
     path = _params(tmp_path, {"svm": {"svr__C": [1, 10]}})
     result = next(iter(cv.run_grid(param_path=path, n_jobs=1).values()))
@@ -484,7 +514,7 @@ def test_the_shipped_grids_cover_the_configured_models():
     assert "ccp_alpha" not in grids["rf"]
     # Every svm key must name a real setting of the pipeline.
     first = {key: values[0] for key, values in grids["svm"].items()}
-    cv_module.ScaledLinearSVR().set_params(**first)
+    cv_module.ScaledSVR().set_params(**first)
 
 
 def _write_run(root, dataset, label, scheme, holdout_r2=0.2):
@@ -520,9 +550,9 @@ def _write_run(root, dataset, label, scheme, holdout_r2=0.2):
                     extra: value,
                 }
             )
-    pl.concat(
-        [pl.DataFrame([row]) for row in rows], how="diagonal"
-    ).write_csv(run / "cv_results" / "grid_results.csv")
+    pl.concat([pl.DataFrame([row]) for row in rows], how="diagonal").write_csv(
+        run / "cv_results" / "grid_results.csv"
+    )
     pl.DataFrame(
         {
             "label": [label],
@@ -610,7 +640,9 @@ def test_the_holdout_score_goes_to_the_model_that_was_tested(tmp_path):
         ("month", "XGBRegressor", 0.63),
         ("random", "XGBRegressor", -2.2),
     ]
-    assert table.filter(~pl.col("sent_to_holdout"))["holdout_r2"].is_null().all()
+    assert (
+        table.filter(~pl.col("sent_to_holdout"))["holdout_r2"].is_null().all()
+    )
 
 
 def test_settings_show_only_what_the_grid_searched(tmp_path):

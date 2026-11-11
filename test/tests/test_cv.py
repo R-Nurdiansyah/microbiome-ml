@@ -65,6 +65,41 @@ def test_cv_stays_within_its_core_budget(n_jobs, max_combos, expected):
     assert cv_module._cv_parallelism(n_jobs, max_combos, 128) == expected
 
 
+@pytest.mark.parametrize(
+    "n_jobs,parallel_jobs,inner_cv_jobs,expected",
+    [
+        (8, 2, 1, 4),  # two combinations share 8 cores
+        (16, 4, 1, 4),
+        (3, 2, 1, 1),  # never below one thread
+        (8, 1, 8, 1),  # the folds already use the budget
+        (8, 8, 1, 1),
+    ],
+)
+def test_models_get_their_share_of_the_threads(
+    n_jobs, parallel_jobs, inner_cv_jobs, expected
+):
+    got = cv_module._model_threads(n_jobs, parallel_jobs, inner_cv_jobs)
+    assert got == expected
+
+
+def test_run_gives_each_model_its_threads(tmp_path):
+    # XGBoost took every core of the node in each worker; a forest took 1.
+    samples = [f"s{i}" for i in range(8)]
+    X = np.arange(16).reshape(8, 2).astype(float)
+    y = X[:, 0] + np.random.RandomState(0).randn(8) * 0.01
+    ds = DummyDataset(samples, X, y)
+    ds.feature_sets["feat2"] = DummyFeatureSet(samples, X[:, ::-1])
+    p = tmp_path / "params.json"
+    p.write_text(json.dumps({"rf": [{"n_estimators": [5]}]}))
+
+    cv = CrossValidator(ds, models="rf", label="target", scheme="schemeA")
+    results = cv.run(param_path=str(p), n_jobs=4)
+
+    # 2 combinations x 1 fold worker x 2 threads = the 4 cores given
+    assert len(results) == 2
+    assert {r.model.get_params()["n_jobs"] for r in results.values()} == {2}
+
+
 def test_run_and_run_grid(tmp_path):
     # simple dataset: y = f0 + noise
     samples = [f"s{i}" for i in range(6)]

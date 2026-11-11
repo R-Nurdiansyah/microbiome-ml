@@ -165,6 +165,40 @@ def test_collate_accumulates_runs_already_on_disk(tmp_path):
     assert status.height == 2
 
 
+def test_collate_counts_each_model_once(tmp_path):
+    """best_models/ and holdout/ repeat results_summary.csv; only the
+    cv_results/ copy belongs in cv_sweep_all.tsv."""
+    import argparse
+
+    import pipeline_steps as steps
+
+    run = tmp_path / "holdout_bioproject" / "runs" / "t" / "random"
+    rows = pl.DataFrame(
+        {
+            "feature_set": ["tax_order", "tax_order"],
+            "label": ["t", "t"],
+            "scheme": ["random", "random"],
+            "model": ["RandomForestRegressor", "XGBRegressor"],
+            "avg_validation_r2": [0.7, 0.6],
+        }
+    )
+    for where, frame in [
+        (run / "cv_results", rows),
+        (run / "best_models" / "t" / "random", rows.head(1)),
+        (run / "holdout", rows.head(1)),
+    ]:
+        where.mkdir(parents=True)
+        frame.write_csv(where / "results_summary.csv")
+
+    steps.step_collate(argparse.Namespace(out=str(tmp_path), runs=[]))
+    got = pl.read_csv(tmp_path / "cv_sweep_all.tsv", separator="\t")
+    assert got.height == 2
+    assert sorted(got["model"].to_list()) == [
+        "RandomForestRegressor",
+        "XGBRegressor",
+    ]
+
+
 def test_stack_by_is_a_column_not_the_run_stamp(tmp_path, monkeypatch):
     """The Snakemake run stamp is not a column, so it cannot stack bars.
 

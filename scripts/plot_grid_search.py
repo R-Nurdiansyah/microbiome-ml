@@ -25,10 +25,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import matplotlib.pyplot as plt
+import plot_transform_sweep as pts
 import polars as pl
 from matplotlib.lines import Line2D
-
-import plot_transform_sweep as pts
 
 LOGGER = logging.getLogger("plot-grid-search")
 
@@ -45,7 +44,7 @@ _SCORES = ("pooled_r2", "mean_test_r2", "std_test_r2", "mean_fit_time")
 _MODEL_SHORT = {
     "RandomForestRegressor": "RF",
     "XGBRegressor": "XGB",
-    "ScaledLinearSVR": "LinSVR",
+    "ScaledSVR": "SVR",
 }
 _KEYS = ["dataset", "label", "scheme", "model"]
 # The report's x axis stops here; a worse score is drawn at the edge with its
@@ -123,7 +122,9 @@ def report_table(
     """
     cv = (
         models.filter(pl.col("n_folds") > 1)
-        .unique(subset=[*_KEYS, "feature_set"], keep="first", maintain_order=True)
+        .unique(
+            subset=[*_KEYS, "feature_set"], keep="first", maintain_order=True
+        )
         .select(
             *_KEYS,
             "feature_set",
@@ -214,7 +215,9 @@ def plot_report(
                 if pts._finite(v)
             ]
             if len(finite) == 2:
-                ax.plot(finite, [y, y], color=GRID_INK, linewidth=1.2, zorder=1)
+                ax.plot(
+                    finite, [y, y], color=GRID_INK, linewidth=1.2, zorder=1
+                )
         ax.axvline(0.0, color=INK_MUTED, linewidth=0.8, zorder=2)
         ax.set_yticks(range(len(names)))
         ax.set_yticklabels(names, fontsize=7.5, color=INK)

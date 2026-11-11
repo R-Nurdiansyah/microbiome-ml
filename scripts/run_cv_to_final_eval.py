@@ -413,6 +413,9 @@ def build_dataset(
         .add_profiles(
             profiles=data_cfg["profiles"],
             root=data_cfg.get("root"),
+            # Under features, not data: the sweep scripts read every
+            # string under data as a file path.
+            layout=str(feature_cfg.get("profile_layout") or "auto"),
         )
         .add_labels(labels)
     )
@@ -494,13 +497,18 @@ def build_dataset(
             wanted = wanted if isinstance(wanted, list) else [wanted]
             # tax_genus_clr_bio names the genus rank; the suffixes
             # record how it was built, not what to extract.
-            needed = [
-                r
-                for r in (
-                    rank_from_feature_set(str(name), prefix) for name in wanted
+            # Once per rank: tax_order and tax_order_shad both name order,
+            # and building it twice repeated ICC and the whole stream.
+            needed = list(
+                dict.fromkeys(
+                    r
+                    for r in (
+                        rank_from_feature_set(str(name), prefix)
+                        for name in wanted
+                    )
+                    if r
                 )
-                if r
-            ]
+            )
             if needed:
                 skipped = (
                     [r for r in ranks if r not in needed]

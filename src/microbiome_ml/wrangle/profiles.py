@@ -15,13 +15,50 @@ from microbiome_ml.wrangle.icc import taxon_icc
 
 logger = logging.getLogger(__name__)
 
-# Column carried through create_features' long frame: how many `;` the
-# matched row's full lineage had, so the rows of one sample x taxon can be
-# told apart by depth after the lineage is cut down to the rank name.
-_DEPTH = "__rank_depth"
+# How a profile's rows relate to each other (SingleM's glossary terms):
+#   unfilled -- each row is the reads assigned to that taxon and no deeper,
+#               so a taxon's total is the sum of every row under it. This is
+#               SingleM's condensed output; one row per species is a special
+#               case of it.
+#   filled   -- each row already includes all of its descendants, so a
+#               taxon's total is its own row.
+FILLED = "filled"
+UNFILLED = "unfilled"
+LAYOUTS = ("auto", FILLED, UNFILLED)
 # A relative-abundance table at one rank cannot sum above 1 per sample;
 # float32 rounding stays well inside this.
 _SUM_TOLERANCE = 1e-4
+# Lineage depth, carried through a filled profile's rank rows so the
+# shallowest of a taxon's rows can be kept (see _rank_long).
+_DEPTH = "__rank_depth"
+# _detect_layout calls a profile filled when at least this share of its
+# rows has its parent row present...
+_MIN_PARENT_SHARE = 0.5
+# ...and no more than this share of parents falls short of its children.
+_MAX_SHORT_SHARE = 0.01
+
+
+def _tidy_taxonomy(expr: pl.Expr) -> pl.Expr:
+    """`a; b` -> `a;b`, and drop trailing empty ranks (`o__X;f__;g__`).
+
+    An empty rank is "not assigned this deep", so a row's depth is its
+    deepest *named* rank. Without this, `o__X;f__;g__;s__` would look like
+    a species row and never like the order row it is.
+    """
+    return expr.str.replace_all(r";\s+", ";").str.replace(
+        r"(?:;[a-z]__)+$", ""
+    )
+
+
+def _ends_at(rank: TaxonomicRanks) -> str:
+    """Regex for rows whose deepest named rank is `rank`."""
+    return f"(?:^|;){rank.prefix}[^;]+$"
+
+
+def _names(rank: TaxonomicRanks) -> str:
+    """Regex for rows with a named `rank` anywhere in the lineage."""
+    return f"(?:^|;){rank.prefix}[^;]+(?:;|$)"
+
 
 # How a feature table's values are expressed. The key is canonical -- it
 # is what the feature set name is built from -- and the tuple is what a
@@ -158,7 +195,8 @@ class TaxonomicProfiles:
     Attributes:
         profiles: Polars LazyFrame
         root: Optional Polars LazyFrame
-        is_filled: Boolean indicating if profiles are in filled format
+        is_filled: True for a filled profile, False for an unfilled one
+            (see FILLED / UNFILLED above). `layout` gives the same as text.
     """
 
     def __init__(
@@ -167,31 +205,41 @@ class TaxonomicProfiles:
         root: Optional[Union[Path, str, pl.LazyFrame, pl.DataFrame]] = None,
         check_filled: bool = True,
         sample_size: int = 1000,
+        layout: str = "auto",
     ):
         """Initialize TaxonomicProfiles with validation and standardization.
-        Optionally checks if profiles are filled and sets is_filled attribute.
+
+        The profile is kept in the layout it arrives in. Nothing is filled
+        here: every consumer (the per-sample total, rank features, the
+        dominated-sample filter) reads either layout directly, and filling
+        a species-level table multiplies its rows by the number of ranks.
 
         Args:
             profiles: Path to profiles file or LazyFrame/DataFrame with profiles data
             root: Optional path to root file or LazyFrame/DataFrame with root coverage data
-            check_filled: Whether to check if profiles are in filled format
-            sample_size: Sample size for filled format checking
+            check_filled: With `layout="auto"`, detect the layout from the
+                data. False keeps the old behaviour of assuming filled.
+            sample_size: Samples read when detecting the layout
+            layout: "auto", "filled" or "unfilled". Anything but "auto"
+                is taken as given and skips detection.
         """
+        layout = str(layout).strip().lower()
+        if layout not in LAYOUTS:
+            raise ValueError(
+                f"layout must be one of {list(LAYOUTS)}, got {layout!r}"
+            )
+
         # Load and standardize profiles
         profiles_lf = self._load_and_standardize(profiles, ProfilesFields)
         profiles_lf = self._standardize_tax_strings(profiles_lf)
 
         self.profiles = profiles_lf
 
-        # Check if profiles are filled and store the result
-        if check_filled:
-            self.is_filled = self._is_filled(sample_size=sample_size)
-
-            if not self.is_filled:
-                filled_lf = self._fill_profiles_lf()
-                # Update instance with filled profiles
-                self.profiles = filled_lf
-                self.is_filled = True  # Now filled after correction
+        if layout != "auto":
+            self.is_filled = layout == FILLED
+            logger.info("Profiles layout given as %s", layout)
+        elif check_filled:
+            self.is_filled = self._detect_layout(sample_size) == FILLED
         else:
             self.is_filled = True  # Assume filled if not checking
 
@@ -207,7 +255,6 @@ class TaxonomicProfiles:
 
         self.root = root_lf
 
-        # Get current profiles state (may have been updated by fill)
         profiles_lf = self.profiles
 
         if "coverage" in profiles_lf.collect_schema().names():
@@ -230,6 +277,11 @@ class TaxonomicProfiles:
                 )
         else:
             self.is_relabund = True  # Already in relative abundance format
+
+    @property
+    def layout(self) -> str:
+        """FILLED or UNFILLED, the same thing `is_filled` says."""
+        return FILLED if self.is_filled else UNFILLED
 
     def _load_data(
         self, data_source: Union[Path, str, pl.LazyFrame, pl.DataFrame]
@@ -317,11 +369,7 @@ class TaxonomicProfiles:
             LazyFrame with standardized taxonomy strings
         """
         return lf.with_columns(
-            [
-                pl.col("taxonomy")
-                .str.replace_all(r";\s+", ";")
-                .alias("taxonomy")
-            ]
+            _tidy_taxonomy(pl.col("taxonomy")).alias("taxonomy")
         )
 
     @classmethod
@@ -331,6 +379,7 @@ class TaxonomicProfiles:
         root: Optional[Union[Path, str]] = None,
         check_filled: bool = True,
         sample_size: int = 1000,
+        layout: str = "auto",
     ) -> "TaxonomicProfiles":
         """Lazily load TaxonomicProfiles from files.
 
@@ -339,6 +388,7 @@ class TaxonomicProfiles:
             root: Optional path to root CSV file
             check_filled: Whether to check if profiles are in filled format
             sample_size: Sample size for filled format checking
+            layout: "auto", "filled" or "unfilled"; see __init__
 
         Returns:
             TaxonomicProfiles instance
@@ -356,6 +406,7 @@ class TaxonomicProfiles:
             root=root,
             check_filled=check_filled,
             sample_size=sample_size,
+            layout=layout,
         )
 
     def save(self, path: Union[Path, str]) -> None:
@@ -377,13 +428,17 @@ class TaxonomicProfiles:
 
     @classmethod
     def load(
-        cls, path: Union[Path, str], check_filled: bool = True
+        cls,
+        path: Union[Path, str],
+        check_filled: bool = True,
+        layout: str = "auto",
     ) -> "TaxonomicProfiles":
         """Load TaxonomicProfiles from directory containing CSV files.
 
         Args:
             path: Directory path containing profiles.csv and optionally root.csv
             check_filled: Whether to check if profiles are in filled format
+            layout: "auto", "filled" or "unfilled"; see __init__
 
         Returns:
             TaxonomicProfiles instance
@@ -402,99 +457,96 @@ class TaxonomicProfiles:
             profiles=str(profiles_path),
             root=str(root) if root else None,
             check_filled=check_filled,
+            layout=layout,
         )
 
-    def _is_filled_for_rank(
-        self,
-        parent_rank: Optional[TaxonomicRanks],
-        child_rank: TaxonomicRanks,
-        sample_size: int = 1000,
-    ) -> bool:
-        """Check if profiles are filled for a specific parent/child rank pair.
+    def _detect_layout(self, sample_size: int = 1000) -> str:
+        """FILLED or UNFILLED, judged from up to `sample_size` samples.
 
-        Args:
-            parent_rank: Parent taxonomic rank
-            child_rank: Child taxonomic rank
-            sample_size: Maximum number of samples to check
+        Each row is compared with its *direct* parent row only: the same
+        lineage one named rank shorter, in the same sample.
 
-        Returns:
-            True if profiles are filled for this rank pair
+        - Filled means a parent row exists for most rows, and holds at
+          least the sum of its direct children (descendants included).
+        - Unfilled means parent rows are mostly absent -- one row per
+          species is the extreme, with none at all -- or fall short of
+          their children, because they hold only their own reads.
+
+        The old check compared each parent with every row beneath it at
+        any depth, so a filled profile always failed it, and a profile
+        with no parent rows passed it by making no comparison.
         """
-        if parent_rank is None:
-            return True  # Cannot check if no parent
-
-        cached_profiles = self.profiles
-
-        schema_names = cached_profiles.collect_schema().names()
-        abundance_col = (
-            "relabund" if "relabund" in schema_names else "coverage"
+        lf = self.profiles
+        value = (
+            "relabund"
+            if "relabund" in lf.collect_schema().names()
+            else "coverage"
         )
-
-        # Subset for efficiency
-        unique_samples = cached_profiles.select("sample").unique()
-        if unique_samples.collect().height > sample_size:
-            subset_samples = (
-                unique_samples.collect().sample(n=sample_size, seed=42).lazy()
+        samples = lf.select("sample").unique().collect()
+        if samples.height > sample_size:
+            keep = samples.sample(n=sample_size, seed=42)
+            lf = lf.join(keep.lazy(), on="sample", how="semi")
+        rows = (
+            lf.select(
+                "sample",
+                _tidy_taxonomy(pl.col("taxonomy")).alias("taxonomy"),
+                pl.col(value).cast(pl.Float64).alias("value"),
             )
-            df = cached_profiles.join(subset_samples, on="sample", how="semi")
-        else:
-            df = cached_profiles
-
-        # Use get_rank to get child and parent entries
-        children = self._get_rank(df, child_rank)
-        parents = self._get_rank(df, parent_rank)
-
-        if children.collect().height == 0 or parents.collect().height == 0:
-            return False
-
-        # Extract parent taxonomy from child taxonomy
-        children = children.with_columns(
-            [
-                pl.col("taxonomy")
-                .str.extract(f"^(.*?{parent_rank.prefix}[^;]+)")
-                .alias("parent_taxonomy")
-            ]
-        ).filter(pl.col("parent_taxonomy").is_not_null())
-
-        # Sum child abundances by parent/sample
-        child_sums = children.group_by(["sample", "parent_taxonomy"]).agg(
-            pl.col(abundance_col).sum().alias("child_sum")
+            .filter(pl.col("taxonomy").str.contains(r"(?:^|;)[a-z]__[^;]+$"))
+            .collect()
         )
+        # Rows below a named rank, with that rank's lineage as `parent`.
+        # A parent of `Root` alone is not a taxon, so it does not count.
+        children = rows.with_columns(
+            pl.col("taxonomy").str.replace(r";[^;]+$", "").alias("parent")
+        ).filter(
+            pl.col("taxonomy").str.contains(";")
+            & pl.col("parent").str.contains(r"(?:^|;)[a-z]__[^;]+$")
+        )
+        if not children.height:
+            logger.info(
+                "Profiles layout: unfilled (no lineage has more than one "
+                "named rank)"
+            )
+            return UNFILLED
 
-        # Prepare parent abundances
-        parents = parents.select(["sample", "taxonomy", abundance_col]).rename(
-            {"taxonomy": "parent_taxonomy", abundance_col: "parent_abundance"}
+        parents = rows.rename({"taxonomy": "parent", "value": "parent_value"})
+        with_parent = children.join(
+            parents.select(["sample", "parent"]).unique(),
+            on=["sample", "parent"],
+            how="semi",
+        ).height
+        compared = (
+            children.group_by(["sample", "parent"])
+            .agg(pl.col("value").sum().alias("child_sum"))
+            .join(parents, on=["sample", "parent"], how="inner")
         )
+        short = compared.filter(
+            pl.col("parent_value") < pl.col("child_sum") * (1 - 1e-6) - 1e-12
+        ).height
 
-        # Join and compare
-        comparison = parents.join(
-            child_sums, on=["sample", "parent_taxonomy"], how="inner"
+        parent_share = with_parent / children.height
+        short_share = short / compared.height if compared.height else 0.0
+        layout = (
+            FILLED
+            if parent_share >= _MIN_PARENT_SHARE
+            and short_share <= _MAX_SHORT_SHARE
+            else UNFILLED
         )
-        invalid = comparison.filter(
-            pl.col("parent_abundance") < (pl.col("child_sum") - 1e-10)
+        logger.info(
+            "Profiles layout: %s (%.0f%% of %d rows have their parent row; "
+            "%d of %d parents hold less than their children)",
+            layout,
+            100 * parent_share,
+            children.height,
+            short,
+            compared.height,
         )
-        invalid_count = invalid.collect().height
-        return bool(invalid_count == 0)
+        return layout
 
     def _is_filled(self, sample_size: int = 1000) -> bool:
-        """Check if profiles are in filled format.
-
-        Args:
-            sample_size: Maximum number of samples to check
-
-        Returns:
-            True if profiles are filled
-        """
-        # Get profiles as LazyFrame regardless of mode
-        self.profiles.lazy()
-
-        for rank in TaxonomicRanks.PHYLUM.iter_down():
-            parent = rank.parent
-            if not self._is_filled_for_rank(
-                parent, rank, sample_size=sample_size
-            ):
-                return False
-        return True
+        """True when `_detect_layout` reads the profile as filled."""
+        return self._detect_layout(sample_size) == FILLED
 
     def _filter_by_sample(
         self, samples: Union[pl.LazyFrame, pl.DataFrame]
@@ -637,14 +689,11 @@ class TaxonomicProfiles:
                 "Profiles must be in relative abundance format to filter dominated samples."
             )
 
-        # Find samples that are NOT dominated
+        # Find samples that are NOT dominated, from each taxon's total at
+        # this rank. Reading only rows that *end* at the rank found nothing
+        # in an unfilled profile, so it dropped every sample.
         non_dominated_samples = (
-            self.profiles.filter(
-                pl.col("taxonomy").str.contains(rank.prefix)
-                & ~pl.col("taxonomy").str.contains(
-                    rank.child.prefix if rank.child else "NONE"
-                )
-            )
+            self._sum_rank_rows(self._rank_long(self.profiles, rank))
             .group_by("sample")
             .agg(pl.col("relabund").max().alias("max_abund"))
             .filter(pl.col("max_abund") < dominated_cutoff)
@@ -673,45 +722,46 @@ class TaxonomicProfiles:
         )
 
     def _fill_profiles_lf(self) -> pl.LazyFrame:
-        """Internal method: fill profiles and return LazyFrame."""
-        # Get profiles as LazyFrame
-        profiles_lf = self.profiles
+        """An unfilled profile as a filled one: a row per taxon per rank.
 
-        schema_names = profiles_lf.collect_schema().names()
-        abundance_col = (
-            "relabund" if "relabund" in schema_names else "coverage"
+        Each rank is built straight from the unfilled rows: a taxon's
+        filled value is the sum of every row whose lineage names it, its
+        own reads included. Building each rank from the one below instead
+        lost every row that stopped above that rank, and filled again a
+        profile that was already filled.
+
+        Rows naming no domain (a bare `Root`) have no place in a filled
+        table and are left out, as SingleM's relative abundance leaves
+        them out of its total.
+        """
+        profiles_lf = self.profiles.with_columns(
+            _tidy_taxonomy(pl.col("taxonomy")).alias("taxonomy")
         )
-
-        filled_profiles = profiles_lf
-        species = self._get_rank(profiles_lf, TaxonomicRanks.SPECIES)
-
-        filled_ranks = [species]
-
-        # Traverse from most specific to most general (lowest to highest rank)
-        for rank in TaxonomicRanks.GENUS.iter_up():
-            # Get entries at this rank (using get_rank helper)
-            filled_profiles = (
-                filled_profiles.with_columns(
-                    pl.col("taxonomy").str.extract(f"^(.*?{rank.prefix}[^;]+)")
+        value = (
+            "relabund"
+            if "relabund" in profiles_lf.collect_schema().names()
+            else "coverage"
+        )
+        ranks = []
+        for rank in TaxonomicRanks.iter_from_domain():
+            lineage = rf"^((?:[^;]+;)*?{rank.prefix}[^;]+)(?:;|$)"
+            ranks.append(
+                profiles_lf.filter(
+                    pl.col("taxonomy").str.contains(_names(rank))
                 )
-                .with_columns(
-                    pl.col(abundance_col).sum().over(["sample", "taxonomy"])
-                )
-                .unique()
+                .with_columns(pl.col("taxonomy").str.extract(lineage))
+                .group_by(["sample", "taxonomy"], maintain_order=True)
+                .agg(pl.col(value).sum())
             )
-
-            filled_ranks.append(
-                filled_profiles.filter(
-                    pl.col("taxonomy").str.contains(rank.prefix)
-                )
-            )
-
-        # Combine all filled ranks
-        return pl.concat(filled_ranks).unique()
+        return pl.concat(ranks)
 
     def _create_root_lf(self) -> pl.LazyFrame:
-        """Internal method: create root and return LazyFrame."""
-        # Get profiles as LazyFrame
+        """Per-sample total for coverage -> relative abundance.
+
+        SingleM's denominator: the domain totals. Filled, that is the rows
+        ending at a domain; unfilled, every row with a named domain, since
+        each holds reads no other row does.
+        """
         profiles_lf = self.profiles
 
         schema_names = profiles_lf.collect_schema().names()
@@ -720,21 +770,16 @@ class TaxonomicProfiles:
                 "Cannot create root from relative abundance profiles."
             )
 
-        # If filled, sum domain-level coverages per sample
-        if self.is_filled:
-            domain_entries = self._get_rank(profiles_lf, TaxonomicRanks.DOMAIN)
-            return (
-                domain_entries.group_by("sample")
-                .agg(pl.col("coverage").sum().alias("root_coverage"))
-                .select(["sample", "root_coverage"])
+        domain = TaxonomicRanks.DOMAIN
+        pattern = _ends_at(domain) if self.is_filled else _names(domain)
+        return (
+            profiles_lf.filter(
+                _tidy_taxonomy(pl.col("taxonomy")).str.contains(pattern)
             )
-        else:
-            # If not filled, sum all coverages per sample
-            return (
-                profiles_lf.group_by("sample")
-                .agg(pl.col("coverage").sum().alias("root_coverage"))
-                .select(["sample", "root_coverage"])
-            )
+            .group_by("sample")
+            .agg(pl.col("coverage").sum().alias("root_coverage"))
+            .select(["sample", "root_coverage"])
+        )
 
     def _to_relabund_lf(self) -> pl.LazyFrame:
         """Convert coverage profiles to relative abundance.
@@ -870,10 +915,6 @@ class TaxonomicProfiles:
         """
         if self.profiles is None:
             raise ValueError("No profiles available to create features.")
-        if self.is_filled is False:
-            raise ValueError(
-                "Profiles must be in filled format to create features. Use fill_profiles() first."
-            )
 
         if isinstance(rank, str):
             rank = TaxonomicRanks.from_name(rank)
@@ -886,29 +927,16 @@ class TaxonomicProfiles:
                 "Profiles must be in relative abundance format to create features. Use _to_relabund_lf() first."
             )
 
-        # regex that captures the token at the requested rank anywhere in the taxonomy string
-        pattern = f"(?:^|;)((?:{rank.prefix}[^;]+))(?:;|$)"
-
-        # Long-format view: one row per (sample, taxon at this rank).
-        long_lf = (
-            profiles_lf.filter(
-                pl.col("taxonomy").str.contains(rank.get_regex())
-            )
-            .with_columns(
-                pl.col("taxonomy").str.replace_all(r";\s+", ";")
-            )  # normalize
-            # Depth of the full lineage, read before it is cut to the rank
-            # name: _collapse_rank_rows needs it to tell a taxon's own row
-            # from its descendants'.
-            .with_columns(
-                pl.col("taxonomy").str.count_matches(";").alias(_DEPTH)
-            )
-            .with_columns(
-                pl.col("taxonomy").str.extract(pattern).alias("taxonomy")
-            )
-            .filter(pl.col("taxonomy").is_not_null())
-            .select(["sample", "taxonomy", "relabund", _DEPTH])
-        )
+        # Long-format view: the rows that make up each taxon's total at
+        # this rank, already cut down to the rank name. Unfilled rows are
+        # summed per sample x taxon before each pivot. Filled ones are
+        # collapsed here, so prevalence and ICC see one row per taxon
+        # rather than the taxon plus its descendants; filled tables are
+        # small, so the extra pass is cheap.
+        long_lf = self._rank_long(profiles_lf, rank)
+        if self.is_filled:
+            long_lf = self._sum_rank_rows(long_lf)
+        long_lf = long_lf.select(["sample", "taxonomy", "relabund"])
         if samples is not None:
             long_lf = long_lf.filter(pl.col("sample").is_in(list(samples)))
 
@@ -938,7 +966,7 @@ class TaxonomicProfiles:
         if stream_path is None:
             # One row per sample x taxon before the pivot, so no
             # aggregate is needed and a duplicate would raise.
-            features = self._collapse_rank_rows(long_lf.collect()).pivot(
+            features = self._sum_rank_rows(long_lf.collect()).pivot(
                 values="relabund",
                 index="sample",
                 on="taxonomy",
@@ -978,34 +1006,55 @@ class TaxonomicProfiles:
             presence_threshold=float(presence_threshold),
         )
 
-    @staticmethod
-    def _collapse_rank_rows(long_df: pl.DataFrame) -> pl.DataFrame:
-        """One value per sample x taxon: the sum of its shallowest rows.
+    def _rank_long(
+        self, lf: pl.LazyFrame, rank: TaxonomicRanks
+    ) -> pl.LazyFrame:
+        """Every row naming `rank`, with the lineage cut to that name.
 
-        The rank filter matches a taxon's own row and every row beneath
-        it, and the two profile layouts need opposite treatment:
+        What makes up a taxon's total depends on the layout, and
+        `_sum_rank_rows` applies it:
 
-        - filled (a row at every rank, as in the unit-test data): the
-          taxon's own row already holds the total, and its descendants
-          repeat parts of it. The own row is the shallowest, so it is
-          kept alone.
-        - leaf-only (one row per species, as in the PR2, UNITE and MFD
-          profiles): every row is a disjoint share of the taxon and all
-          sit at the same depth, empty ranks such as `f__;g__` included,
-          so they are all kept and summed.
+        - unfilled: all of these rows. Each holds reads no other row does,
+          the taxon's own (assigned no deeper) included.
+        - filled: the shallowest of them. That is the taxon's own row,
+          which already includes the rest; where a lineage has no row of
+          its own at this rank, its shallowest rows, which in a filled
+          table are disjoint. Their depth travels in `_DEPTH`.
 
-        This used to be pivot(aggregate_function="first"), which was
-        right on filled profiles only because parents came first, and on
-        leaf-only profiles kept the most abundant species alone.
-
-        A leaf-only profile that also has rows ending at the rank itself
-        (reads assigned no deeper) cannot be told from a filled one by
-        shape; it is read as filled, and those deeper reads drop out.
+        This replaces pivot(aggregate_function="first"), which was right
+        on filled profiles only because parents came first, and on
+        species-only profiles kept the most abundant species alone.
         """
-        depth = pl.col(_DEPTH)
-        return long_df.group_by(
-            ["sample", "taxonomy"], maintain_order=True
-        ).agg(pl.col("relabund").filter(depth == depth.min()).sum())
+        token = rf"(?:^|;)({rank.prefix}[^;]+)(?:;|$)"
+        tidy = _tidy_taxonomy(pl.col("taxonomy"))
+        out = lf.with_columns(tidy.alias("taxonomy")).filter(
+            pl.col("taxonomy").str.contains(_names(rank))
+        )
+        if self.is_filled:
+            out = out.with_columns(
+                pl.col("taxonomy").str.count_matches(";").alias(_DEPTH)
+            )
+        return out.with_columns(pl.col("taxonomy").str.extract(token))
+
+    @staticmethod
+    def _sum_rank_rows(frame: Any) -> Any:
+        """One value per sample x taxon, so the pivot needs no aggregate.
+
+        Sums every row, or only the shallowest where `_DEPTH` is present
+        (a filled profile). Takes a DataFrame or a LazyFrame.
+        """
+        names = (
+            frame.collect_schema().names()
+            if isinstance(frame, pl.LazyFrame)
+            else frame.columns
+        )
+        value = pl.col("relabund")
+        if _DEPTH in names:
+            depth = pl.col(_DEPTH)
+            value = value.filter(depth == depth.min())
+        return frame.group_by(["sample", "taxonomy"], maintain_order=True).agg(
+            value.sum()
+        )
 
     @staticmethod
     def _rank_sum_excess(
@@ -1033,14 +1082,16 @@ class TaxonomicProfiles:
 
         A warning, not an error: hand-built tables in tests use values
         that are not proportions. On real profiles it means rows are being
-        counted more than once, e.g. a layout _collapse_rank_rows misread.
+        counted more than once, most likely a filled profile read as
+        unfilled; give the layout explicitly.
         """
         if not over:
             return
         logger.warning(
             "%d of %d sample(s) have %s relative abundances summing above 1 "
             "(largest %.4g). Proportions cannot, so rows are probably being "
-            "counted more than once: check the profile layout.",
+            "counted more than once: a filled profile read as unfilled? Set "
+            "features.profile_layout (or layout=) to say which it is.",
             over,
             n_samples,
             rank.name.lower(),
@@ -1391,9 +1442,9 @@ class TaxonomicProfiles:
                 range(0, len(sample_ids), chunk_samples)
             ):
                 batch = sample_ids[start : start + chunk_samples]
-                # A chunk holds every row of its samples, so collapsing
-                # here gives the same cells as collapsing the whole frame.
-                sub = self._collapse_rank_rows(
+                # A chunk holds every row of its samples, so summing here
+                # gives the same cells as summing the whole frame.
+                sub = self._sum_rank_rows(
                     long_lf.filter(pl.col("sample").is_in(batch)).collect()
                 )
                 wide = (
