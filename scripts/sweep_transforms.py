@@ -93,6 +93,13 @@ SIGTERM or Ctrl-C, so it still compares the ones that worked. SIGKILL
 cannot be caught; rerun with --summary-only after one. A combo that did
 not finish is left out, even if an earlier run left its tables on disk.
 
+Stopping the sweep stops what it started: each combination runs in its
+own process group, and the group gets SIGINT (as Ctrl-C would), so
+Snakemake cancels its queued cluster jobs and releases its lock, then
+SIGKILL after KILL_AFTER seconds. A SIGKILL to the sweep itself reaches
+none of them: kill the combinations' Snakemake processes and qdel their
+jobs by hand.
+
 TOP TO BOTTOM FROM ONE YAML. Everything above can also be set in the
 config's `sweep:` section (a flag still wins), so this is enough:
 
@@ -200,6 +207,14 @@ SHARED = ("data", "groupings", "preprocessing", "split")
 # Seconds from asking running combos to stop to killing them. PBS allows
 # 10 s between SIGTERM and SIGKILL, and the summary has to fit in that.
 KILL_AFTER = 5.0
+
+# Each combination runs in its own process group, so stopping reaches the
+# whole tree. With `pixi run snakemake`, the child is pixi: signalling only
+# it left Snakemake orphaned and still submitting jobs (18S_marine feature
+# sweep, 2026-11-12). The group is sent SIGINT, as Ctrl-C would: Snakemake
+# treats that as a stop on user request, cancels its cluster jobs (the
+# profile's cancel command, qdel on aqua) and releases its lock.
+OWN_GROUP = hasattr(os, "killpg")
 
 # Set by the signal handler: nothing new starts, and everything already
 # in flight winds down through the normal path to the summary.
@@ -679,28 +694,56 @@ def command_for(
     return [*cmd, *extra]
 
 
+def _signal_tree(proc: subprocess.Popen, sig: int) -> None:
+    """Send `sig` to `proc`'s whole process group, else to `proc` alone.
+
+    The group can outlive its leader (pixi gone, Snakemake still there),
+    so it is signalled even when `proc` itself has exited.
+    """
+    if OWN_GROUP:
+        try:
+            os.killpg(proc.pid, sig)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass  # not a group leader, or the whole group is gone
+    if proc.poll() is None:
+        if sig == getattr(signal, "SIGKILL", None):
+            proc.kill()
+        elif OWN_GROUP:
+            proc.send_signal(sig)
+        else:
+            proc.terminate()
+
+
 def _stop_running(signum: int, _frame: Any) -> None:
     """Signal handler: wind the sweep down so the summary still gets written.
 
     Raises nothing on purpose. The combos end, each is recorded as
     interrupted, and `main` carries on to the summary as usual.
     """
-    LOGGER.error(
-        "signal %s: stopping %d running combination(s)", signum, len(RUNNING)
-    )
     STOPPING.set()
     # Only these: a process started after the signal was never asked to
     # stop. The timer is never cancelled, so reading RUNNING when it fires
     # killed whatever had started since -- in the tests, the next test's
     # child, seconds later and in the same process.
     targets = list(RUNNING)
+    # Logged from a thread: a handler that logs while the main thread is
+    # mid-write to stdout fails with "reentrant call inside BufferedWriter".
+    threading.Thread(
+        target=LOGGER.error,
+        args=(
+            "signal %s: stopping %d running combination(s)",
+            signum,
+            len(targets),
+        ),
+        daemon=True,
+    ).start()
     for proc in targets:
-        proc.terminate()
+        _signal_tree(proc, signal.SIGINT)
 
     def kill_stragglers() -> None:
         for proc in targets:
-            if proc.poll() is None:
-                proc.kill()
+            _signal_tree(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
 
     timer = threading.Timer(KILL_AFTER, kill_stragglers)
     timer.daemon = True
@@ -710,14 +753,18 @@ def _stop_running(signum: int, _frame: Any) -> None:
 def _run_to_end(cmd: List[str], handle: Any) -> int:
     """Run `cmd`, keeping it where `_stop_running` can reach it."""
     proc = subprocess.Popen(
-        cmd, cwd=ROOT, stdout=handle, stderr=subprocess.STDOUT
+        cmd,
+        cwd=ROOT,
+        stdout=handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=OWN_GROUP,
     )
     RUNNING.add(proc)
     try:
         # The signal may have landed between the check in run_combo and
         # RUNNING.add, in which case nothing has told this one to stop.
         if STOPPING.is_set():
-            proc.terminate()
+            _signal_tree(proc, signal.SIGINT)
         return proc.wait()
     finally:
         RUNNING.discard(proc)

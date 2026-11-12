@@ -1015,13 +1015,14 @@ def test_the_kill_timer_spares_a_process_started_after_the_signal(
     """The timer killed the next test's child (rc=-9) when it read RUNNING
     at fire time rather than at the signal."""
     monkeypatch.setattr(sw, "KILL_AFTER", 0.5)
-    # Ignores SIGTERM, so only the timer's kill can end it.
+    # Ignores SIGINT and SIGTERM, so only the timer's kill can end it.
     stubborn = subprocess.Popen(
         [
             sys.executable,
             "-c",
             "import signal, time; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "signal.signal(signal.SIGINT, signal.SIG_IGN); "
             "print('ready', flush=True); time.sleep(60)",
         ],
         stdout=subprocess.PIPE,
@@ -1048,6 +1049,59 @@ def test_the_kill_timer_spares_a_process_started_after_the_signal(
                 proc.wait()
                 if proc.stdout is not None:
                     proc.stdout.close()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="no process groups on Windows"
+)
+def test_stopping_reaches_the_grandchild(tmp_path, monkeypatch, clean_stop):
+    """`pixi run snakemake`: the sweep's child is pixi, and Snakemake under
+    it was left running, still submitting jobs, after the child was killed.
+    Here the child is a shell that ignores the stop, and the grandchild must
+    still get it."""
+    monkeypatch.setattr(sw, "KILL_AFTER", 0.5)
+    pid_file = tmp_path / "grandchild.pid"
+    grandchild = (
+        "import os, sys, time; "
+        "open(sys.argv[1], 'w').write(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    # The parent ignores SIGINT and waits, so only a group-wide signal
+    # (or the kill after the grace period) reaches the grandchild.
+    parent = (
+        "import signal, subprocess, sys; "
+        "signal.signal(signal.SIGINT, signal.SIG_IGN); "
+        "child = subprocess.Popen("
+        "[sys.executable, '-c', sys.argv[1], sys.argv[2]], "
+        "preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL)); "
+        "sys.exit(child.wait() or 1)"
+    )
+    cmd = [sys.executable, "-c", parent, grandchild, str(pid_file)]
+    combo = sw.Combo("clr", None, True, tmp_path)
+    monkeypatch.setattr(sw, "command_for", lambda *a, **k: cmd)
+    rows = []
+    thread = threading.Thread(
+        target=lambda: rows.append(sw.run_combo(combo, 1, False, [], False))
+    )
+    thread.start()
+    deadline = time.time() + 30
+    while not pid_file.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    grandchild_pid = int(pid_file.read_text())
+    sw._stop_running(signal.SIGTERM, None)
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "the combination did not end"
+    assert rows[0]["status"] == "interrupted"
+
+    deadline = time.time() + 5
+    alive = True
+    while alive and time.time() < deadline:
+        try:
+            os.kill(grandchild_pid, 0)
+            time.sleep(0.05)
+        except ProcessLookupError:
+            alive = False
+    assert not alive, "the grandchild outlived the stop"
 
 
 def test_a_combo_that_finishes_as_the_signal_lands_stays_ok(
