@@ -17,6 +17,7 @@ environments:
     - https://pypi.org/simple
     packages:
       linux-64:
+      - conda: https://conda.anaconda.org/bioconda/noarch/snakemake-executor-plugin-cluster-generic-1.0.9-pyhdfd78af_0.tar.bz2
       - conda: https://conda.anaconda.org/bioconda/noarch/snakemake-interface-common-1.23.1-pyhdfd78af_0.conda
       - conda: https://conda.anaconda.org/bioconda/noarch/snakemake-interface-executor-plugins-9.4.0-pyh84498cf_0.conda
       - conda: https://conda.anaconda.org/bioconda/noarch/snakemake-interface-logger-plugins-2.1.0-pyhdfd78af_0.conda
@@ -287,6 +288,7 @@ environments:
     - https://pypi.org/simple
     packages:
       linux-64:
+      - conda: https://conda.anaconda.org/bioconda/noarch/snakemake-executor-plugin-cluster-generic-1.0.9-pyhdfd78af_0.tar.bz2
       - conda: https://conda.anaconda.org/bioconda/noarch/snakemake-interface-common-1.23.1-pyhdfd78af_0.conda
       - conda: https://conda.anaconda.org/bioconda/noarch/snakemake-interface-executor-plugins-9.4.0-pyh84498cf_0.conda
       - conda: https://conda.anaconda.org/bioconda/noarch/snakemake-interface-logger-plugins-2.1.0-pyhdfd78af_0.conda
@@ -1173,6 +1175,8 @@ packages:
   - python >=3.8
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/snakemake-interface-common?source=hash-mapping
   run_exports:
     weak:
     - snakemake-interface-common >=1.23.1,<2.0a0
@@ -1294,6 +1298,8 @@ packages:
   - yte >=1.5.5,<2.0
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/snakemake?source=hash-mapping
   run_exports:
     weak:
     - snakemake-minimal >=9.27.0,<10.0a0
@@ -6394,7 +6400,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/configargparse?source=compressed-mapping
+  - pkg:pypi/configargparse?source=hash-mapping
   run_exports: {}
   size: 63749
   timestamp: 1788789827928
@@ -6713,7 +6719,7 @@ packages:
   license: BSD-3-Clause
   license_family: BSD
   purls:
-  - pkg:pypi/gitpython?source=compressed-mapping
+  - pkg:pypi/gitpython?source=hash-mapping
   run_exports: {}
   size: 178869
   timestamp: 1788802794188
@@ -7761,7 +7767,7 @@ packages:
   license: BSD-3-Clause
   license_family: BSD
   purls:
-  - pkg:pypi/fastjsonschema?source=compressed-mapping
+  - pkg:pypi/fastjsonschema?source=hash-mapping
   run_exports: {}
   size: 254446
   timestamp: 1786892280524

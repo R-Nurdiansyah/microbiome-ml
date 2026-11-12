@@ -315,8 +315,9 @@ def test_transform_defaults_to_relabund():
 
 
 def test_unknown_transform_raises():
+    # `log` was the example here until it became a real transform.
     with pytest.raises(ValueError, match="relabund"):
-        _clr_profiles().create_features("family", transform="log")
+        _clr_profiles().create_features("family", transform="cube_root")
 
 
 # ---------------------------------------------------------------------------

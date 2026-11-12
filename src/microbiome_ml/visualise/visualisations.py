@@ -1179,7 +1179,10 @@ class Visualiser:
             if model_name:
                 title_parts.append(model_name)
             elif model_obj is not None:
-                title_parts.append(model_obj.__class__.__name__)
+                title_parts.append(
+                    getattr(model_obj, "model_name", None)
+                    or model_obj.__class__.__name__
+                )
             if feature_set or label or scheme_from_path or scheme:
                 fs = feature_set or "feature_set"
                 lb = label or "label"

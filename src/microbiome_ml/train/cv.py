@@ -26,6 +26,7 @@ from typing import (
 
 import numpy as np
 import polars as pl
+import scipy.sparse as sp
 import yaml  # type: ignore[import]
 from joblib import Parallel, delayed, effective_n_jobs
 from sklearn.base import clone
@@ -46,10 +47,16 @@ from sklearn.svm import SVR
 from xgboost import XGBRegressor
 
 from microbiome_ml.train.full_fit import enable_oob, full_fit_diagnostics
+from microbiome_ml.train.matrix import feature_matrix, sparse_mode
 from microbiome_ml.train.results import (
     CV_Result,
     LabelSchemeKey,
     best_candidate_index,
+)
+from microbiome_ml.transforms.labels import (
+    canonical_target_transform,
+    estimator_name,
+    wrap_target,
 )
 from microbiome_ml.wrangle.dataset import Dataset
 
@@ -171,6 +178,39 @@ def _set_threads(estimator: Any, n_threads: int) -> Any:
     return estimator
 
 
+# Models whose own threads share one copy of the data. Given the job's
+# whole thread budget, they run their folds one after another instead of
+# in parallel worker processes, each of which cut its own copy of the
+# fold's rows: on a 13.7 GB dense genus matrix that was 8 copies and an
+# out-of-memory kill. Others (the SVR, linear models) have no useful
+# threads of their own and keep the parallel folds.
+_THREADED_MODELS = frozenset(
+    {"RandomForestRegressor", "ExtraTreesRegressor", "XGBRegressor"}
+)
+
+
+def _fold_and_model_threads(
+    estimator: Any,
+    inner_cv_jobs: int,
+    model_threads: Optional[int],
+    combo_threads: Optional[int],
+) -> Tuple[int, Optional[int]]:
+    """(fold workers, model threads) for one estimator.
+
+    Only changes anything when the folds would have run in parallel
+    (`inner_cv_jobs != 1`, i.e. one combination owns the budget) and the
+    model can use threads: then the folds run in sequence and the model
+    gets the threads. Total cores stay the same; the data is held once.
+    """
+    if (
+        combo_threads
+        and inner_cv_jobs != 1
+        and estimator_name(estimator) in _THREADED_MODELS
+    ):
+        return 1, combo_threads
+    return inner_cv_jobs, model_threads
+
+
 def _coerce_param_grid(raw: Optional[object]) -> object:
     """Ensure ParameterGrid input is valid; fall back to [{}] when empty."""
 
@@ -282,6 +322,8 @@ class CrossValidator:
         feature_set: Optional[Union[str, List[str]]] = None,
         full_fit: bool = False,
         full_fit_oob: bool = True,
+        target_transform: Optional[str] = None,
+        sparse: Union[str, bool, None] = "auto",
     ) -> None:
         if isinstance(dataset, Dataset):
             self.dataset = dataset
@@ -307,6 +349,14 @@ class CrossValidator:
         # and with `full_fit_oob` an out-of-bag pass on every fit.
         self.full_fit: bool = bool(full_fit)
         self.full_fit_oob: bool = bool(full_fit_oob)
+        # Every model is trained on this transform of the label, fitted
+        # per fold, and scored back in label units (see transforms/labels.py).
+        self.target_transform: str = canonical_target_transform(
+            target_transform
+        )
+        # `cv.sparse`: auto keeps a mostly-zero feature table as a CSR
+        # matrix (see train/matrix.py); true/false force it.
+        self.sparse: str = sparse_mode(sparse)
         self._best_validation_r2: float = float("-inf")
         self.best_result_key: Optional[str] = None
         self.best_result: Optional[CV_Result] = None
@@ -348,10 +398,7 @@ class CrossValidator:
             self.best_result_by_label.items(),
             key=lambda item: "" if item[0] is None else str(item[0]),
         ):
-            model = cv_result.model
-            model_name = (
-                model.__class__.__name__ if model is not None else "None"
-            )
+            model_name = estimator_name(cv_result.model) or "None"
             avg_r2 = cv_result.rank_score
             avg_r2_text = (
                 f"{float(avg_r2):.6f}" if avg_r2 is not None else "None"
@@ -369,10 +416,7 @@ class CrossValidator:
                 "" if item[0][1] is None else str(item[0][1]),
             ),
         ):
-            model = cv_result.model
-            model_name = (
-                model.__class__.__name__ if model is not None else "None"
-            )
+            model_name = estimator_name(cv_result.model) or "None"
             avg_r2 = cv_result.rank_score
             avg_r2_text = (
                 f"{float(avg_r2):.6f}" if avg_r2 is not None else "None"
@@ -551,7 +595,7 @@ class CrossValidator:
                     label_name,
                     scheme_name,
                     meta.feature_columns,
-                    np.asarray(X_np),
+                    X_np if sp.issparse(X_np) else np.asarray(X_np),
                     np.asarray(y_np, dtype=float),
                     PredefinedSplit(test_fold=fold_arr),
                 )
@@ -580,6 +624,12 @@ class CrossValidator:
             n_jobs, max_combos, cpu_total
         )
         model_threads = _model_threads(n_jobs, parallel_jobs, inner_cv_jobs)
+        # What one combination may use in all: its share of the budget.
+        combo_threads = max(
+            1,
+            int(effective_n_jobs(-1 if n_jobs is None else n_jobs))
+            // max(1, parallel_jobs),
+        )
 
         logger.info(
             "Dispatching CV combinations across %d worker(s) "
@@ -600,6 +650,8 @@ class CrossValidator:
                 self.full_fit,
                 self.full_fit_oob,
                 model_threads,
+                self.target_transform,
+                combo_threads,
             )
             for payload in payloads()
         )
@@ -639,6 +691,8 @@ class CrossValidator:
         full_fit: bool = False,
         full_fit_oob: bool = True,
         model_threads: Optional[int] = None,
+        target_transform: Optional[str] = None,
+        combo_threads: Optional[int] = None,
     ) -> Tuple[
         str,
         Dict[str, CV_Result],
@@ -648,6 +702,11 @@ class CrossValidator:
 
         `model_threads` sets each estimator's own n_jobs (see
         `_model_threads`); None leaves the library default.
+        `target_transform` wraps each estimator so it trains on that
+        transform of the label and predicts in label units.
+        `combo_threads` is this combination's whole thread budget, which
+        a threaded model takes in place of parallel folds (see
+        `_fold_and_model_threads`).
         """
         (
             key,
@@ -669,8 +728,12 @@ class CrossValidator:
                 for params in ParameterGrid(grid):
                     estimator = _MODEL_CONSTRUCTORS[model_key]()
                     estimator.set_params(**params)
-                    if model_threads:
-                        _set_threads(estimator, model_threads)
+                    fold_jobs, threads = _fold_and_model_threads(
+                        estimator, inner_cv_jobs, model_threads, combo_threads
+                    )
+                    if threads:
+                        _set_threads(estimator, threads)
+                    estimator = wrap_target(estimator, target_transform)
                     cvres = cross_validate(
                         estimator,
                         X_arr,
@@ -678,14 +741,14 @@ class CrossValidator:
                         cv=ps,
                         scoring=scorers,
                         return_train_score=False,
-                        n_jobs=inner_cv_jobs,
+                        n_jobs=fold_jobs,
                     )
                     per_r2 = list(cvres["test_r2"])
                     per_mse = [-m for m in cvres["test_mse"]]
                     per_sse = list(cvres["test_sse"])
                     per_sst = list(cvres["test_sst"])
                     result_key = (
-                        f"{key}::{estimator.__class__.__name__}::{params}"
+                        f"{key}::{estimator_name(estimator)}::{params}"
                     )
                     # Asked for before the fit, so the out-of-bag pass
                     # rides along with it instead of costing a refit.
@@ -722,8 +785,12 @@ class CrossValidator:
             for params in ParameterGrid(grid):
                 estimator = clone(model)
                 estimator.set_params(**params)
-                if model_threads:
-                    _set_threads(estimator, model_threads)
+                fold_jobs, threads = _fold_and_model_threads(
+                    estimator, inner_cv_jobs, model_threads, combo_threads
+                )
+                if threads:
+                    _set_threads(estimator, threads)
+                estimator = wrap_target(estimator, target_transform)
                 cvres = cross_validate(
                     estimator,
                     X_arr,
@@ -731,13 +798,13 @@ class CrossValidator:
                     cv=ps,
                     scoring=scorers,
                     return_train_score=False,
-                    n_jobs=inner_cv_jobs,
+                    n_jobs=fold_jobs,
                 )
                 per_r2 = list(cvres["test_r2"])
                 per_mse = [-v for v in cvres["test_mse"]]
                 per_sse = list(cvres["test_sse"])
                 per_sst = list(cvres["test_sst"])
-                result_key = f"{key}::{estimator.__class__.__name__}::{params}"
+                result_key = f"{key}::{estimator_name(estimator)}::{params}"
                 if full_fit and full_fit_oob:
                     enable_oob(estimator)
                 estimator.fit(X_arr, y_arr)
@@ -875,7 +942,7 @@ class CrossValidator:
                 continue
 
             ps = PredefinedSplit(test_fold=fold_arr)
-            X_arr = np.asarray(X_np)
+            X_arr = X_np if sp.issparse(X_np) else np.asarray(X_np)
             y_arr = np.asarray(y_np, dtype=float)
             feature_columns = meta.feature_columns
 
@@ -914,6 +981,9 @@ class CrossValidator:
                     estimator = clone(model)
                     if raw_grid is not None:
                         grid = _coerce_param_grid(raw_grid)
+                # Grid keys stay the regressor's own: the wrapper passes
+                # them through, so `max_depth` needs no `regressor__`.
+                estimator = wrap_target(estimator, self.target_transform)
                 # refit=False, because sklearn's refit would run on one
                 # thread and pick by mean R2. Refitting below uses the whole
                 # budget, and asks for the out-of-bag score on this one fit
@@ -954,7 +1024,7 @@ class CrossValidator:
                     for i in range(n_splits)
                 ]
 
-                result_key = f"{key}::{best_estimator.__class__.__name__}"
+                result_key = f"{key}::{estimator_name(best_estimator)}"
                 cv_result = CV_Result(
                     feature_set=feature_name,
                     label=label_name,
@@ -1298,40 +1368,26 @@ class CrossValidator:
                     # disk. float32 matches what sklearn's tree code uses
                     # internally, so float64 would only buy a conversion
                     # copy per fit.
-                    joined = (
-                        keys.lazy()
-                        .join(feat_lf, on="sample", how="left")
-                        # One expression over all the feature columns,
-                        # not one per column: a genus table has ~60k of
-                        # them, and polars' optimiser walking 60k
-                        # expression nodes is itself a memory problem.
-                        .with_columns(
-                            pl.col(feature_cols)
-                            .fill_null(fillna)
-                            .cast(pl.Float32, strict=False)
-                        )
-                        .collect()
+                    # Read in row slices and kept as CSR when mostly zero
+                    # (train/matrix.py): a dense genus matrix was 13.7 GB
+                    # here, and each parallel fold worker copied it.
+                    drop_cols = {"sample", "fold", label_value_col}
+                    columns = [c for c in feature_cols if c not in drop_cols]
+                    X_np = feature_matrix(
+                        feat_lf,
+                        keys["sample"].to_list(),
+                        columns,
+                        fillna=fillna,
+                        sparse=self.sparse,
                     )
-
-                    drop_cols = ["sample", "fold", label_value_col]
-                    X_np = joined.drop(drop_cols).to_numpy()
                     y_np = np.asarray(
-                        joined.select(pl.col(label_value_col))
-                        .to_numpy()
-                        .ravel(),
-                        dtype=float,
+                        keys[label_value_col].to_numpy(), dtype=float
                     )
 
-                    # Keep only what the CV loops need; retaining the frame
-                    # would double the cost of every combination.
+                    # Keep only what the CV loops need.
                     meta = ComboMeta(
-                        fold=joined.select("fold")
-                        .to_numpy()
-                        .ravel()
-                        .astype(int),
-                        feature_columns=[
-                            c for c in joined.columns if c not in drop_cols
-                        ],
+                        fold=keys["fold"].to_numpy().astype(int),
+                        feature_columns=columns,
                     )
                     logger.info(
                         "Prepared data for feature set '%s', label '%s', scheme '%s' with %d samples and %d features.",

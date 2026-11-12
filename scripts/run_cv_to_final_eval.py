@@ -38,6 +38,11 @@ from microbiome_ml.train.results import (  # noqa: E402
     CV_Result,
     HoldoutEvaluation,
 )
+from microbiome_ml.transforms.labels import (  # noqa: E402
+    apply_label_limits,
+    estimator_name,
+    transforms_for,
+)
 from microbiome_ml.train.trainer import ModelTrainer  # noqa: E402
 from microbiome_ml.utils.logging import setup_logging  # noqa: E402
 from microbiome_ml.visualise.visualisations import Visualiser  # noqa: E402
@@ -156,7 +161,7 @@ def _log_best_combinations(cv: CrossValidator) -> None:
             "avg_r2=%s",
             label,
             scheme,
-            model.__class__.__name__ if model is not None else "None",
+            estimator_name(model) or "None",
             result.feature_set,
             f"{r2:.4f}" if r2 is not None else "None",
         )
@@ -313,6 +318,7 @@ def _write_holdout_summary(
                 "label",
                 "scheme",
                 "feature_set",
+                "model",
                 *_HOLDOUT_SUMMARY_METRICS,
             ]
         )
@@ -325,6 +331,7 @@ def _write_holdout_summary(
                     m.get("label"),
                     m.get("scheme"),
                     m.get("feature_set"),
+                    m.get("model"),
                     *(m.get(name) for name in _HOLDOUT_SUMMARY_METRICS),
                 ]
             )
@@ -378,6 +385,57 @@ def _sections(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         raise ValueError("Section 'groupings' must be a mapping")
     out["groupings"] = group_cfg
     return out
+
+
+def clean_labels(dataset: Dataset, cfg: Dict[str, Any]) -> Dataset:
+    """Null label values outside `data.label_limits`, before any split.
+
+        data:
+          label_limits:          # inclusive; null leaves a side open
+            temperature: [-30, 122]
+            ph: [0, 14]
+            oxy: [0, 600]
+
+    A key also covers its geo_/comb_ versions (`oxy` -> geo_oxy,
+    comb_oxy). The values are dropped like any missing label, so the
+    holdout, the folds and every transform see the same samples.
+    """
+    limits = (cfg.get("data") or {}).get("label_limits")
+    if not limits or dataset.labels is None:
+        return dataset
+    dataset.labels, removed = apply_label_limits(dataset.labels, limits)
+    for column, count in removed.items():
+        LOGGER.info(
+            "label_limits: %d %s value(s) outside the limits set missing",
+            count,
+            column,
+        )
+    return dataset
+
+
+def single_target_transform(cv_cfg: Dict[str, Any]) -> Optional[str]:
+    """The one `cv.target_transform` a single run can take.
+
+    Several transforms per label are label variants (`ph@zscore`), which
+    the Snakemake workflow runs as separate jobs; this script trains each
+    label once, so it accepts one transform for all of them.
+    """
+    spec = cv_cfg.get("target_transform")
+    if spec is None:
+        return None
+    labels = cv_cfg.get("label")
+    names = {
+        t
+        for label in ([labels] if isinstance(labels, str) else labels or [""])
+        for t in transforms_for(str(label), spec)
+    }
+    if len(names) > 1:
+        raise ValueError(
+            "cv.target_transform lists several transforms; run them with "
+            "the Snakemake workflow, which trains one job per label "
+            f"variant. Got {sorted(names)}"
+        )
+    return next(iter(names))
 
 
 def build_dataset(
@@ -592,6 +650,7 @@ def run_from_dataset(
     vis_cfg = sec["visualise"]
     shap_cfg = sec["shap"]
     holdout_eval_cfg = sec["holdout_evaluation"]
+    dataset = clean_labels(dataset, cfg)
 
     base_dir = output_dir or Path(str(out_cfg.get("base_dir", "out/pipeline")))
     cv_out = base_dir / "cv_results"
@@ -715,6 +774,8 @@ def run_from_dataset(
         feature_set=cv_cfg.get("feature_set"),
         full_fit=final_fit_on,
         full_fit_oob=bool(final_fit_cfg.get("oob", True)),
+        sparse=cv_cfg.get("sparse", "auto"),
+        target_transform=single_target_transform(cv_cfg),
     )
 
     mode = str(cv_cfg.get("mode", "run")).strip().lower()
@@ -805,6 +866,7 @@ def run_from_dataset(
         dataset=dataset,
         best_result=best_for_holdout,
         output_model_path=holdout_out,
+        sparse=cv_cfg.get("sparse", "auto"),
     )
     evaluation = trainer.train_and_evaluate(
         compute_shap=shap_enabled,

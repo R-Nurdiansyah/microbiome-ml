@@ -44,7 +44,15 @@ sweep:
   min_prevalence: [0.1]  # [] = whatever features.min_prevalence says
   icc_max: [0.9]         # [] = report ICC only
   icc_group: bioproject
+  # icc_rare_below: 0.05  # ICC cut only for taxa in < 5% of samples
   shadow: true           # trains <set>_shad beside each clean set
+
+  # One prepare for the whole grid: a prepared dataset holding the rank's
+  # unfiltered relative abundance (tax_<rank>). Each combination's CV jobs
+  # then build their own features from it (src/microbiome_ml/wrangle/
+  # recipe.py) and no combination runs prepare. Needs shadow: false.
+  # base_prepared: /path/to/prepared
+  # variance_threshold: [1.0e-6, 1.0e-5]  # one more axis; base_prepared only
   models: null           # null = cv.models; [rf] is a cheap first pass
 
   # label -> holdout grouping. A label may name a list of groupings.

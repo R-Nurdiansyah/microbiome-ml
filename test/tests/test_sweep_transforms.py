@@ -1489,6 +1489,9 @@ def _cli(**kw):
         max_workers=None,
         log_level=None,
         cores=None,
+        variance_threshold=None,
+        icc_rare_below=None,
+        base_prepared=None,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -1498,6 +1501,23 @@ def _resolved(sweep=None, **cli):
     args = _cli(**cli)
     sw.resolve_settings(args, {"sweep": sweep} if sweep is not None else {})
     return args
+
+
+def test_the_sweep_section_sets_the_one_prepare_settings():
+    args = _resolved(
+        {
+            "base_prepared": "/base/prepared",
+            "variance_threshold": [1e-6, 1e-5],
+            "icc_rare_below": 0.05,
+        }
+    )
+    assert args.base_prepared == "/base/prepared"
+    assert args.variance_threshold == [1e-6, 1e-5]
+    assert args.icc_rare_below == 0.05
+    plain = _resolved()
+    assert plain.base_prepared is None
+    assert plain.variance_threshold == []
+    assert plain.icc_rare_below is None
 
 
 def test_with_no_sweep_section_the_old_defaults_hold():

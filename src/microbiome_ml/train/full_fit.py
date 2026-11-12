@@ -140,8 +140,10 @@ def full_fit_diagnostics(
     truth = np.asarray(y, dtype=float)
     out: Dict[str, Any] = {
         "n_fit_samples": int(truth.shape[0]),
-        "n_fit_features": int(np.asarray(X).shape[1])
-        if np.asarray(X).ndim == 2
+        # .shape, not np.asarray(X).shape: a sparse matrix has no array
+        # form, and densifying it to count columns would undo the point.
+        "n_fit_features": int(X.shape[1])
+        if len(getattr(X, "shape", ())) == 2
         else None,
         "cv_pooled_r2": None if cv_score is None else float(cv_score),
         "in_sample_r2": None,
@@ -219,7 +221,12 @@ def top_importances(
 
 def _model_name(result: Any) -> Optional[str]:
     model = getattr(result, "model", None)
-    return None if model is None else type(model).__name__
+    if model is None:
+        return None
+    # Through a label-transform wrapper to the regressor (duck-typed, so
+    # this module still needs no sklearn).
+    named = getattr(model, "model_name", None)
+    return named if isinstance(named, str) else type(model).__name__
 
 
 def collect_rows(

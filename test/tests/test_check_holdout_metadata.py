@@ -199,6 +199,100 @@ def test_collate_counts_each_model_once(tmp_path):
     ]
 
 
+def _baseline_like_runs(tmp_path, labels, holdout):
+    """One bioproject holdout run per label x scheme, as a sweep leaves it.
+
+    The holdout summary is the pre-`model` layout; the model is only in
+    the results_summary.csv saved beside it, as in older sweeps.
+    """
+    for label in labels:
+        for scheme, r2 in [("random", 0.8), ("organism", 0.4)]:
+            run = tmp_path / "holdout_bioproject" / "runs" / label / scheme
+            (run / "cv_results").mkdir(parents=True)
+            (run / "final_fit").mkdir()
+            pl.DataFrame(
+                {
+                    "feature_set": ["tax_genus", "tax_genus"],
+                    "label": [label, label],
+                    "scheme": [scheme, scheme],
+                    "model": ["RandomForestRegressor", "XGBRegressor"],
+                    "avg_validation_r2": [r2, r2 - 0.1],
+                    "cross_val_scores": [f"[{r2}, {r2 - 0.2}]", "[0.1, 0.2]"],
+                }
+            ).write_csv(run / "cv_results" / "results_summary.csv")
+            if holdout:
+                (run / "holdout").mkdir()
+                pl.DataFrame(
+                    {
+                        "label": [label],
+                        "scheme": [scheme],
+                        "feature_set": ["tax_genus"],
+                        "r2": [0.1],
+                    }
+                ).write_csv(run / "holdout" / "holdout_summary.csv")
+                pl.DataFrame(
+                    {
+                        "feature_set": ["tax_genus"],
+                        "label": [label],
+                        "scheme": [scheme],
+                        "model": ["RandomForestRegressor"],
+                    }
+                ).write_csv(run / "holdout" / "results_summary.csv")
+            pl.DataFrame(
+                {
+                    "label": [label],
+                    "scheme": [scheme],
+                    "feature_set": ["tax_genus"],
+                    "model": ["RandomForestRegressor"],
+                    "in_sample_r2": [0.97],
+                    "oob_r2": [0.5],
+                }
+            ).write_csv(run / "final_fit" / "full_fit_metrics.csv")
+
+
+def test_collate_tables_final_fit_and_draws_the_sweep(tmp_path):
+    """One holdout run holding every label family: final_fit_all.tsv
+    stacks each job's full_fit_metrics.csv, the holdout table names the
+    model tested, and the top-3 and all-runs figures are drawn."""
+    import argparse
+
+    import pipeline_steps as steps
+
+    labels = ["ph", "geo_ph", "comb_ph"]
+    _baseline_like_runs(tmp_path, labels, holdout=True)
+    steps.step_collate(argparse.Namespace(out=str(tmp_path), runs=[]))
+
+    held = pl.read_csv(tmp_path / "holdout_sweep_summary.tsv", separator="\t")
+    assert held.height == 6
+    assert set(held["model"]) == {"RandomForestRegressor"}
+
+    full = pl.read_csv(tmp_path / "final_fit_all.tsv", separator="\t")
+    assert full.height == 6
+    assert set(full["holdout_grouping"]) == {"bioproject"}
+    assert set(full["label"]) == set(labels)
+
+    figs = tmp_path / "sweep_visualisations"
+    assert (figs / "cv_sweep_top3_avg_validation_r2.png").exists()
+    assert (figs / "cv_sweep_all_avg_validation_r2.png").exists()
+    assert (figs / "fit_vs_cv_top3.png").exists()
+    assert (figs / "fit_vs_cv_all.png").exists()
+
+
+def test_fit_vs_cv_is_drawn_without_a_holdout(tmp_path):
+    """holdout_evaluation off: train vs CV only, no holdout table."""
+    import argparse
+
+    import pipeline_steps as steps
+
+    _baseline_like_runs(tmp_path, ["ph", "geo_ph"], holdout=False)
+    steps.step_collate(argparse.Namespace(out=str(tmp_path), runs=[]))
+
+    assert not (tmp_path / "holdout_sweep_summary.tsv").exists()
+    figs = tmp_path / "sweep_visualisations"
+    assert (figs / "fit_vs_cv_top3.png").exists()
+    assert (figs / "fit_vs_cv_all.png").exists()
+
+
 def test_stack_by_is_a_column_not_the_run_stamp(tmp_path, monkeypatch):
     """The Snakemake run stamp is not a column, so it cannot stack bars.
 

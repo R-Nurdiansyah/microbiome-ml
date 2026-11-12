@@ -9,6 +9,11 @@ from typing import Any, List, Optional, Set, Tuple, Type, Union
 
 import polars as pl
 
+from microbiome_ml.transforms import features as feature_transforms
+from microbiome_ml.transforms.features import (  # noqa: F401
+    TRANSFORMS,
+    canonical_transform,
+)
 from microbiome_ml.utils.taxonomy import TaxonomicRanks
 from microbiome_ml.wrangle.features import SampleFeatureSet
 from microbiome_ml.wrangle.icc import taxon_icc
@@ -60,27 +65,10 @@ def _names(rank: TaxonomicRanks) -> str:
     return f"(?:^|;){rank.prefix}[^;]+(?:;|$)"
 
 
-# How a feature table's values are expressed. The key is canonical -- it
-# is what the feature set name is built from -- and the tuple is what a
-# config may say instead. Adding one here means adding its name suffix
-# to _TRANSFORM_SUFFIX in wrangle/dataset.py.
-TRANSFORMS = {
-    "relabund": ("relabund",),
-    "clr": ("clr",),
-    "presence": ("presence", "pa", "binary", "presence_absence"),
-}
-
-
-def canonical_transform(transform: str) -> str:
-    """Resolve a configured transform name to its canonical spelling."""
-    text = str(transform).strip().lower()
-    for canonical, aliases in TRANSFORMS.items():
-        if text in aliases:
-            return canonical
-    raise ValueError(
-        f"transform must be one of {', '.join(sorted(TRANSFORMS))}, "
-        f"got {transform!r}"
-    )
+# How a feature table's values are expressed (relabund, clr, presence,
+# log) lives in microbiome_ml/transforms/features.py, with the label
+# transforms beside it. Re-exported here for the callers that import it
+# from this module.
 
 
 def _sink_or_collect(frame: pl.LazyFrame, path: Path) -> None:
@@ -983,14 +971,13 @@ class TaxonomicProfiles:
                 )
                 over, top = self._rank_sum_excess(features, taxa_cols)
                 self._warn_rank_sums(rank, over, features.height, top)
-                if mode == "clr":
-                    features = self._apply_clr(
-                        features, taxa_cols, float(clr_pseudocount)
-                    )
-                elif mode == "presence":
-                    features = self._apply_presence(
-                        features, taxa_cols, float(presence_threshold)
-                    )
+                features = feature_transforms.apply(
+                    features,
+                    taxa_cols,
+                    mode,
+                    clr_pseudocount=float(clr_pseudocount),
+                    presence_threshold=float(presence_threshold),
+                )
             return SampleFeatureSet.from_df(
                 df=features, name=f"{rank.name.lower()}_features"
             )
@@ -1097,65 +1084,6 @@ class TaxonomicProfiles:
             rank.name.lower(),
             top,
         )
-
-    @staticmethod
-    def _apply_clr(
-        wide: pl.DataFrame, taxa: List[str], pseudocount: float
-    ) -> pl.DataFrame:
-        """Centred log-ratio across the taxa of one sample.
-
-        clr(x)_j = ln(x_j + p) - mean_k ln(x_k + p). Subtracting the mean
-        of the logs is the same as dividing by the geometric mean, with
-        no separate product to overflow. The pseudocount is unavoidable:
-        the table is mostly zeros and log(0) is undefined, so the choice
-        of p sets how far below the smallest real value a zero lands.
-
-        Row-wise, so a streamed chunk can be transformed on its own --
-        but only because each chunk already carries every taxon column.
-        It is a *subcomposition* of whatever taxa survived the prevalence
-        filter, which is the usual compromise.
-        """
-        if not taxa:
-            return wide
-        logged = wide.with_columns(
-            pl.col(taxa).cast(pl.Float64).add(pseudocount).log()
-        )
-        logged = logged.with_columns(
-            pl.mean_horizontal(taxa).alias("__clr_gm")
-        )
-        return logged.with_columns(
-            (pl.col(taxa) - pl.col("__clr_gm")).cast(pl.Float32)
-        ).drop("__clr_gm")
-
-    @staticmethod
-    def _apply_presence(
-        wide: pl.DataFrame, taxa: List[str], threshold: float = 0.0
-    ) -> pl.DataFrame:
-        """Presence/absence: 1 where the taxon is detected, 0 where not.
-
-        Throws away abundance and keeps membership. Sequencing depth and
-        library protocol move abundances a great deal more than they move
-        which taxa are detectable at all, so a binary table carries less
-        of the between-study artefact that a leave-one-bioproject-out
-        split asks the model to survive.
-
-        `threshold` is a floor a taxon's relative abundance must exceed
-        before it counts as present, for shedding barcode bleed and other
-        near-zero detections. The default 0.0 means any non-zero value is
-        presence, which is also how the prevalence filter counts, so the
-        two agree unless the threshold is raised.
-
-        Row-wise and independent of the other samples, so a streamed
-        chunk can be transformed on its own -- unlike CLR, this does not
-        even need the full column list.
-
-        Stays Float32 rather than becoming boolean or UInt8: every other
-        path here writes Float32, streamed chunks must share one schema,
-        and the models take floats regardless.
-        """
-        if not taxa:
-            return wide
-        return wide.with_columns((pl.col(taxa) > threshold).cast(pl.Float32))
 
     @staticmethod
     def _pad_samples(
@@ -1475,10 +1403,13 @@ class TaxonomicProfiles:
                 )
                 n_over, chunk_top = self._rank_sum_excess(wide, taxa)
                 over, top = over + n_over, max(top, chunk_top)
-                if transform == "clr":
-                    wide = self._apply_clr(wide, taxa, clr_pseudocount)
-                elif transform == "presence":
-                    wide = self._apply_presence(wide, taxa, presence_threshold)
+                wide = feature_transforms.apply(
+                    wide,
+                    taxa,
+                    transform,
+                    clr_pseudocount=float(clr_pseudocount),
+                    presence_threshold=float(presence_threshold),
+                )
                 if parquet:
                     wide.write_parquet(
                         stream_path / f"part_{part:05d}.parquet"

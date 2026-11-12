@@ -9,7 +9,9 @@ transform, into its own `base_dir`. This drives that loop.
 
 What is an axis here and what is not:
 
-  transform   relabund / clr / presence. A real axis: one run each.
+  transform   relabund / clr / presence / log. A real axis: one run each.
+              (log, defined in transforms/features.py, changes little
+              for RF or XGBoost; it is for the SVR. Not a default.)
   prevalence  `features.min_prevalence`. A real axis: one run per value
               of `--min-prevalence`. It leaves NO suffix on the
               feature-set name, so two thresholds cannot share a
@@ -22,9 +24,23 @@ What is an axis here and what is not:
   shadow      Not an axis. Shadows are added as a companion `<set>_shad`
               beside the untouched clean set, both trained in the same
               run, so `--shadow` is one flag applied to every combo.
+  variance    `features.variance_threshold`, sklearn's VarianceThreshold
+              on relative abundance. One run per `--variance-threshold`
+              value, plus one without the filter. Needs --base-prepared.
 
 So the grid is
-`len(transforms) x max(1, len(min_prevalence)) x (1 + len(icc_max))`.
+`len(transforms) x max(1, len(min_prevalence)) x (1 + len(icc_max))
+x (1 + len(variance_threshold))`.
+
+ONE PREPARE FOR THE WHOLE GRID: with `--base-prepared DIR` (or
+`sweep.base_prepared`), no combination runs `prepare`. DIR is a dataset
+that one prepare built with the rank's relative abundance and nothing
+filtered (`tax_order`), and every combination's CV jobs build their own
+feature set from it -- prevalence, ICC, variance, then the transform --
+fitted on each job's training samples (src/microbiome_ml/wrangle/
+recipe.py). `--icc-rare-below F` (or `sweep.icc_rare_below`) limits the
+ICC cut to taxa present in fewer than F of the samples. Shadows are not
+supported this way.
 
 HOW FAR EACH COMBO RUNS is the template's business, not the grid's. A
 template with `holdout_evaluation: {enabled: false}` stops at CV, and so
@@ -166,6 +182,7 @@ COMBO_KEYS = [
     "transform",
     "min_prevalence",
     "max_icc",
+    "variance_threshold",
     "shadow",
 ]
 
@@ -231,11 +248,13 @@ class Combo:
         shadow: bool,
         out_root: Path,
         min_prevalence: Optional[float] = None,
+        variance_threshold: Optional[float] = None,
     ) -> None:
         self.transform = canonical_transform(transform)
         self.max_icc = max_icc
         self.shadow = shadow
         self.min_prevalence = min_prevalence
+        self.variance_threshold = variance_threshold
         parts = [self.transform]
         if min_prevalence is not None:
             # 0.01 -> prev0p01, for the same reason as the ICC part.
@@ -244,6 +263,9 @@ class Combo:
             # 0.9 -> icc0p9: a dot in a directory name reads as an
             # extension to half the tools that will touch this tree.
             parts.append(f"icc{max_icc:g}".replace(".", "p"))
+        if variance_threshold is not None:
+            # 1e-06 -> var1e-06, 0.0001 -> var0p0001
+            parts.append(f"var{variance_threshold:g}".replace(".", "p"))
         self.id = "_".join(parts)
         self.dir = out_root / self.id
         self.config_path = self.dir / "config.yaml"
@@ -254,6 +276,7 @@ class Combo:
             "transform": self.transform,
             "min_prevalence": self.min_prevalence,
             "max_icc": self.max_icc,
+            "variance_threshold": self.variance_threshold,
             "shadow": self.shadow,
         }
 
@@ -267,8 +290,11 @@ def build_grid(
     shadow: bool,
     out_root: Path,
     min_prevalence: Optional[List[float]] = None,
+    variance_threshold: Optional[List[float]] = None,
 ) -> List[Combo]:
-    """Transform x prevalence, no ICC filter then one per cutoff.
+    """Transform x prevalence x ICC x variance.
+
+    ICC and variance each start with no filter, then one per value.
 
     An empty (or absent) `min_prevalence` is not a zero-length axis:
     it means one run per transform at whatever the template sets.
@@ -277,11 +303,16 @@ def build_grid(
     prevalences: List[Optional[float]] = (
         [float(v) for v in min_prevalence] if min_prevalence else [None]
     )
+    variances: List[Optional[float]] = [
+        None,
+        *[float(v) for v in variance_threshold or []],
+    ]
     combos = [
-        Combo(transform, cutoff, shadow, out_root, prevalence)
+        Combo(transform, cutoff, shadow, out_root, prevalence, variance)
         for transform in transforms
         for prevalence in prevalences
         for cutoff in cutoffs
+        for variance in variances
     ]
     # `pa` and `presence`, or a value given twice, are one id and so one
     # directory. Two runs there would overwrite each other.
@@ -302,10 +333,14 @@ def discover_combos(out_root: Path) -> List[Combo]:
         icc = (features.get("icc") or {}).get("max_icc")
         shadow = bool((features.get("shadow") or {}).get("enabled"))
         transform = features.get("transform", "relabund")
+        variance = features.get("variance_threshold")
+        variance = None if variance is None else float(variance)
         # The id only carries a prevalence when it was a sweep axis, so
         # the directory name says which of these two this one was.
         for prevalence in (features.get("min_prevalence"), None):
-            combo = Combo(transform, icc, shadow, out_root, prevalence)
+            combo = Combo(
+                transform, icc, shadow, out_root, prevalence, variance
+            )
             if combo.id == path.parent.name:
                 combos.append(combo)
                 break
@@ -411,8 +446,15 @@ def derive_config(
     holdout: bool = False,
     final_fit: bool = False,
     models: Optional[List[str]] = None,
+    base_prepared: Optional[str] = None,
+    icc_rare_below: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """The template with this combo's build options and its own paths."""
+    """The template with this combo's build options and its own paths.
+
+    With *base_prepared*, the combo runs no prepare: it reuses that
+    dataset (outputs.prepared_dir) and its CV jobs build the feature set
+    from the base table (features.base_set), see wrangle/recipe.py.
+    """
     cfg = copy.deepcopy(template)
     features = cfg.setdefault("features", {})
     features["transform"] = combo.transform
@@ -432,6 +474,12 @@ def derive_config(
         "report": True,
         "max_icc": combo.max_icc,
     }
+    if icc_rare_below is not None:
+        features["icc"]["rare_below"] = float(icc_rare_below)
+    if combo.variance_threshold is None:
+        features.pop("variance_threshold", None)
+    else:
+        features["variance_threshold"] = combo.variance_threshold
     features["shadow"] = {
         "enabled": bool(combo.shadow),
         "n": int(template_shadow.get("n", 200)),
@@ -459,6 +507,17 @@ def derive_config(
     # and shared, so leaving them would have every combo overwrite the
     # same splits and the same saved dataset.
     outputs["splits_dir"] = (base / "holdout_splits").as_posix()
+    if base_prepared:
+        outputs["prepared_dir"] = Path(base_prepared).as_posix()
+        ranks = ranks_of(features)
+        if len(ranks) != 1:
+            raise ValueError(
+                "--base-prepared builds one rank per sweep; set "
+                f"features.ranks to one rank, got {ranks}"
+            )
+        features["base_set"] = feature_set_name(
+            str(features.get("prefix", "tax")), ranks[0], "relabund"
+        )
     if outputs.get("save_dataset_path"):
         outputs["save_dataset_path"] = (base / "dataset").as_posix()
 
@@ -878,13 +937,19 @@ def report_text(
             if combo.min_prevalence is None
             else format(combo.min_prevalence, "g")
         )
+        var = (
+            "none"
+            if combo.variance_threshold is None
+            else format(combo.variance_threshold, "g")
+        )
         add(
-            "  {:<28} transform={:<9} min_prev={:<9} "
-            "icc={:<14} shadow={}".format(
+            "  {:<34} transform={:<9} min_prev={:<9} "
+            "icc={:<14} var={:<8} shadow={}".format(
                 combo.id,
                 combo.transform,
                 prev,
                 icc,
+                var,
                 "on" if combo.shadow else "off",
             )
         )
@@ -1153,6 +1218,13 @@ def summarise(combos: List[Combo], out_root: Path) -> Path:
     return report
 
 
+def _was_built(combo_dir: Path) -> bool:
+    """A combo that prepared, or (reusing a base) split, at least once."""
+    return (combo_dir / "prepared" / "manifest.json").exists() or any(
+        combo_dir.glob("holdout_*/splits/schemes.json")
+    )
+
+
 def run_all(
     combos: List[Combo],
     template: Dict[str, Any],
@@ -1186,6 +1258,8 @@ def run_all(
                     holdout=args.holdout,
                     final_fit=args.final_fit,
                     models=args.models,
+                    base_prepared=getattr(args, "base_prepared", None),
+                    icc_rare_below=getattr(args, "icc_rare_below", None),
                 ),
                 sort_keys=False,
             )
@@ -1203,9 +1277,7 @@ def run_all(
             {
                 name: cfg
                 for name, cfg in earlier.items()
-                if (
-                    combos[0].dir.parent / name / "prepared" / "manifest.json"
-                ).exists()
+                if _was_built(combos[0].dir.parent / name)
             },
         )
         if conflicts:
@@ -1460,7 +1532,10 @@ def run_stages(config_path: Path, cores: int) -> None:
         encoding="utf-8",
     )
     common = {"config": str(resolved)}
-    prepared = base / "prepared"
+    reuse = (cfg.get("outputs") or {}).get("prepared_dir")
+    prepared = Path(reuse) if reuse else base / "prepared"
+    if reuse and not (prepared / "manifest.json").exists():
+        raise FileNotFoundError(prepared / "manifest.json")
     prepared.mkdir(parents=True, exist_ok=True)
 
     if not (prepared / "manifest.json").exists():
@@ -2235,6 +2310,18 @@ def resolve_settings(
             _first(args.min_prevalence, sweep.get("min_prevalence"))
         )
     ]
+    args.variance_threshold = [
+        float(v)
+        for v in _as_list(
+            _first(args.variance_threshold, sweep.get("variance_threshold"))
+        )
+    ]
+    rare = _first(args.icc_rare_below, sweep.get("icc_rare_below"))
+    args.icc_rare_below = None if rare is None else float(rare)
+    base_prepared = _first(args.base_prepared, sweep.get("base_prepared"))
+    args.base_prepared = (
+        None if base_prepared is None else Path(base_prepared).as_posix()
+    )
     args.icc_group = (
         args.icc_group
         or sweep.get("icc_group")
@@ -2326,6 +2413,34 @@ def main() -> None:
         help=(
             "min_prevalence values to compare, one run per value "
             "per transform. Omit to keep whatever the template sets."
+        ),
+    )
+    parser.add_argument(
+        "--variance-threshold",
+        nargs="*",
+        type=float,
+        default=None,
+        help=(
+            "variance thresholds on relative abundance to also try, one "
+            "extra run each (needs --base-prepared)"
+        ),
+    )
+    parser.add_argument(
+        "--icc-rare-below",
+        type=float,
+        default=None,
+        help=(
+            "with --icc-max, drop only taxa present in fewer than this "
+            "fraction of samples (default: any taxon)"
+        ),
+    )
+    parser.add_argument(
+        "--base-prepared",
+        default=None,
+        help=(
+            "a prepared dataset with the rank's unfiltered relative "
+            "abundance; every combination builds its features from it "
+            "instead of running prepare"
         ),
     )
     parser.add_argument(
@@ -2450,12 +2565,22 @@ def main() -> None:
         )
     # A percentage typed by mistake would otherwise run for a long time
     # before anything noticed that no taxon can pass it.
-    for value in [*args.min_prevalence, *args.icc_max]:
+    rare = [] if args.icc_rare_below is None else [args.icc_rare_below]
+    for value in [*args.min_prevalence, *args.icc_max, *rare]:
         if not 0 <= value <= 1:
             parser.error(
-                f"--min-prevalence and --icc-max are fractions from 0 to 1, "
-                f"got {value:g}"
+                f"--min-prevalence, --icc-max and --icc-rare-below are "
+                f"fractions from 0 to 1, got {value:g}"
             )
+    if any(v < 0 for v in args.variance_threshold):
+        parser.error("--variance-threshold values cannot be negative")
+    if args.base_prepared is None and args.variance_threshold:
+        parser.error("--variance-threshold needs --base-prepared")
+    if args.base_prepared is not None and not args.no_shadow:
+        parser.error(
+            "--base-prepared builds no shadow sets; pass --no-shadow "
+            "(sweep.shadow: false)"
+        )
 
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
@@ -2470,6 +2595,7 @@ def main() -> None:
         not args.no_shadow,
         out_root,
         list(args.min_prevalence),
+        list(args.variance_threshold),
     )
     LOGGER.info("%d combination(s): %s", len(combos), [c.id for c in combos])
 
@@ -2489,6 +2615,10 @@ def main() -> None:
         LOGGER.warning(warning)
     if not args.dry_run:
         missing = missing_inputs(derive_config(template, combos[0], icc_group))
+        if args.base_prepared and not (
+            Path(args.base_prepared) / "manifest.json"
+        ).exists():
+            missing.append(f"{args.base_prepared}/manifest.json")
         if missing:
             sys.exit("Input file(s) not found:\n  " + "\n  ".join(missing))
 

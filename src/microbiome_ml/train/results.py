@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 
+from microbiome_ml.transforms.labels import estimator_name
+
 logger = logging.getLogger(__name__)
 
 # (label, scheme) pair used to key "best result per label per CV scheme".
@@ -409,7 +411,7 @@ class CV_Result:
         scheme = result.scheme
         model_name: Optional[str] = None
         if result.model is not None:
-            model_name = result.model.__class__.__name__
+            model_name = estimator_name(result.model)
         elif isinstance(key, str) and "::" in key:
             try:
                 left, _ = key.rsplit("::", 1)
@@ -509,7 +511,7 @@ class CV_Result:
                     label_name,
                     scheme_name,
                     result.feature_set,
-                    model.__class__.__name__ if model is not None else None,
+                    estimator_name(model),
                     result.avg_validation_r2,
                     result.avg_validation_mse,
                     result.pooled_validation_r2,
@@ -831,9 +833,7 @@ class CV_Result:
             ndjson_path.parent.mkdir(parents=True, exist_ok=True)
         out_record = result._to_dict()
         model_obj = getattr(result, "model", None)
-        out_record["model"] = (
-            model_obj.__class__.__name__ if model_obj is not None else None
-        )
+        out_record["model"] = estimator_name(model_obj)
         with ndjson_path.open("w", encoding="utf-8") as f:
             f.write(json.dumps(out_record, default=str) + "\n")
 

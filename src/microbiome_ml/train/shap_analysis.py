@@ -214,6 +214,11 @@ class SHAPAnalyser:
         n_jobs: int = 1,
     ) -> None:
         self.model = model
+        # SHAP's explainers want a dense array; CV and the holdout hand
+        # over CSR for a mostly-zero table (train/matrix.py). Only the
+        # rows being explained are densified, here.
+        if hasattr(X, "toarray"):
+            X = X.toarray()
         self.X: np.ndarray = np.asarray(X, dtype=float)
         self.max_background = max_background
         self.n_jobs = n_jobs
@@ -268,9 +273,12 @@ class SHAPAnalyser:
             raise ImportError(_SHAP_INSTALL_MSG) from exc
 
         background = self._sample_background()
-        model_name = type(self.model).__name__
+        # A label-transform wrapper is explained through its fitted
+        # regressor, so the SHAP values are on the transformed scale.
+        model = getattr(self.model, "fitted_model", None) or self.model
+        model_name = type(model).__name__
 
-        if self._is_tree_model(self.model):
+        if self._is_tree_model(model):
             logger.info(
                 "TreeExplainer for %s (background=%d)",
                 model_name,

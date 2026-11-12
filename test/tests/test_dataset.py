@@ -153,6 +153,48 @@ class TestDatasetBatchOperations:
         assert "labels1" in sample_dataset_empty.labels.columns
         assert "labels2" in sample_dataset_empty.labels.columns
 
+    def test_labels_and_groupings_align_without_rescanning_profiles(
+        self, sample_dataset_eager, monkeypatch
+    ):
+        """Labels and groupings cannot change the sample intersection,
+        so adding them must not re-scan the profiles (on real data each
+        re-scan took ~15 minutes), yet they still end up aligned to it."""
+        ds = sample_dataset_eager
+        canonical = ds.get_sample_ids()
+        assert len(canonical) >= 2
+
+        calls = []
+        real = TaxonomicProfiles._get_sample_list
+
+        def counting(self):
+            calls.append(1)
+            return real(self)
+
+        monkeypatch.setattr(TaxonomicProfiles, "_get_sample_list", counting)
+
+        ds.add_labels(
+            {
+                # one sample outside the dataset, which must be dropped
+                "a": pl.DataFrame(
+                    {"sample": [canonical[0], "NOT_A_SAMPLE"], "v": [1.0, 2.0]}
+                ),
+                "b": pl.DataFrame({"sample": canonical[:2], "v": [3.0, 4.0]}),
+            }
+        )
+        ds.add_groupings(
+            pl.DataFrame({"sample": canonical, "g": ["x"] * len(canonical)}),
+            name="grp",
+        )
+
+        assert calls == []
+        assert ds.get_sample_ids() == canonical
+        assert ds.labels["sample"].to_list() == canonical
+        first = ds.labels.filter(pl.col("sample") == canonical[0])
+        assert first["a"].item() == 1.0 and first["b"].item() == 3.0
+        assert ds.labels["b"].null_count() == len(canonical) - 2
+        assert ds.groupings["sample"].to_list() == canonical
+        assert ds.groupings["grp"].to_list() == ["x"] * len(canonical)
+
     def test_add_labels_single_no_name(self, sample_dataset_empty, labels_csv):
         """Test single label addition without name."""
         sample_dataset_empty.add_labels(labels_csv)

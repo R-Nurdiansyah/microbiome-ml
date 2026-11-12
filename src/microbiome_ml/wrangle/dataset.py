@@ -16,6 +16,7 @@ from microbiome_ml.core.config import (
     AggregationMethod,
     WeightingStrategy,
 )
+from microbiome_ml.transforms.features import SUFFIX as TRANSFORM_SUFFIX
 from microbiome_ml.utils.taxonomy import TaxonomicRanks
 from microbiome_ml.wrangle.aggregation import FeatureAggregator
 from microbiome_ml.wrangle.features import (
@@ -58,12 +59,12 @@ def _as_rank(rank: Union[str, TaxonomicRanks]) -> TaxonomicRanks:
 # Suffixes a feature set name can carry after its rank, in this order.
 # They record how the table was built so several variants can live side
 # by side in one dataset: tax_genus, tax_genus_clr, tax_genus_pa_bio.
-FEATURE_SUFFIXES = ("clr", "pa", "bio", SHADOW_SUFFIX)
+FEATURE_SUFFIXES = ("clr", "pa", "log", "bio", SHADOW_SUFFIX)
 
-# One entry per canonical transform in wrangle/profiles.TRANSFORMS; a
-# transform added there without a suffix here raises a KeyError below
-# rather than silently naming two different tables the same thing.
-_TRANSFORM_SUFFIX = {"relabund": "", "clr": "_clr", "presence": "_pa"}
+# One suffix per feature transform (transforms/features.SUFFIX). A
+# transform added there without one raises a KeyError below rather than
+# silently naming two different tables the same thing.
+_TRANSFORM_SUFFIX = TRANSFORM_SUFFIX
 
 
 def feature_set_name(
@@ -971,6 +972,23 @@ class Dataset:
         self._sync_accessions()
         return self
 
+    def _align_to_samples(self, frame: pl.DataFrame) -> pl.DataFrame:
+        """Left-join a sample-keyed table onto the canonical samples.
+
+        Labels and groupings never narrow the sample set (only metadata,
+        profiles and feature sets take part in the intersection), so
+        adding one cannot change it. Aligning to the known samples gives
+        what `_sync_accessions` would, without re-scanning the profiles
+        to recompute the same intersection, which on a large profile
+        table took ~15 minutes per label. With no canonical set yet the
+        frame is kept as is; the next component's sync aligns it.
+        """
+        if not self._sample_ids:
+            return frame
+        return pl.DataFrame({"sample": self._sample_ids}).join(
+            frame, on="sample", how="left", coalesce=True
+        )
+
     def add_labels(
         self,
         labels: Union[
@@ -1032,7 +1050,7 @@ class Dataset:
                 new_df, on="sample", how="full", coalesce=True
             )
 
-        self._sync_accessions()
+        self.labels = self._align_to_samples(self.labels)
         # Log the length and put the label without sample
         logger.info(
             "Labels component added with %d samples and columns %s",
@@ -1100,7 +1118,7 @@ class Dataset:
                 new_df, on="sample", how="full", coalesce=True
             )
 
-        self._sync_accessions()
+        self.groupings = self._align_to_samples(self.groupings)
         # Log the length
         logger.info(
             "Groupings component added with %d samples and columns %s",

@@ -1,0 +1,59 @@
+# Label-transform sweep, on top of an existing pipeline config.
+#
+# Snakemake merges --configfile files left to right, nested keys included,
+# so this overlay only lists what changes. Copy it per dataset and set the
+# two paths:
+#
+#   pixi run snakemake -s workflow/Snakefile --profile aqua \
+#       --configfile .../pipeline_16S_soil_baseline.yaml \
+#                    .../label_sweep_16S_soil.yaml
+#
+# What it does:
+#   * No prepare: outputs.prepared_dir points at the dataset the baseline
+#     already built (same data, labels, groupings and tax_genus features).
+#     The prepare rule does not exist in this run, so it cannot touch it.
+#   * One split per holdout grouping, as usual, after data.label_limits.
+#   * One CV job per label x transform x scheme. `ph` is the label as it
+#     is, `ph@yeo_johnson` the same samples and split trained on that
+#     transform. The transform is fitted on each training fold only, and
+#     every score -- CV, final fit, holdout -- is back in label units
+#     (°C, pH, µmol/kg), so the rows compare directly.
+#   * collate and the sweep figures as before: each variant is its own
+#     row (ph, ph@zscore, ...), plain / geo_ / comb_ as the columns.
+#
+# Transforms (src/microbiome_ml/transforms/labels.py):
+#   none             the label as it is
+#   zscore, minmax   affine: for trees only noise (sklearn's forest still
+#                    grows slightly different trees); matters for the SVR
+#   log1p, sqrt      right-skewed and >= 0 (oxygen); log1p needs > -1
+#   yeo_johnson      fitted power transform, any sign
+#   box_cox          fitted power transform, > 0 only
+#   quantile_normal, quantile_uniform   rank-based
+#   inv_kelvin       1/kT, the Arrhenius scale, for temperature in °C
+
+outputs:
+  # A new directory: the variants must not mix with the baseline's runs.
+  base_dir: /path/to/ML_outputs/label_sweep/genus/16S_soil
+  # The baseline's prepared dataset for the SAME dataset.
+  prepared_dir: /path/to/ML_outputs/baseline/genus/16S_soil/prepared
+
+data:
+  # Values outside these (inclusive) are set missing before the split,
+  # so the holdout, the folds and every transform see the same samples.
+  # A key covers its geo_/comb_ versions; null leaves a side open.
+  label_limits:
+    temperature: [-30, 122]   # 122 °C is the upper limit of known life
+    ph: [0, 14]
+    oxy: [0, 600]             # dissolved O2, µmol/kg
+
+cv:
+  # auto (default): a mostly-zero feature table (genus relabund is ~99%
+  # zeros) is held as a sparse CSR matrix, ~65x smaller than dense;
+  # true/false force it. See src/microbiome_ml/train/matrix.py.
+  sparse: auto
+  # A list applies to every label. A mapping gives lists per label with
+  # `default` for the rest; `oxy` also covers geo_oxy and comb_oxy.
+  target_transform:
+    default: [none, zscore, yeo_johnson, quantile_normal]
+    temperature: [none, zscore, yeo_johnson, quantile_normal, inv_kelvin]
+    oxy: [none, zscore, yeo_johnson, quantile_normal, log1p]

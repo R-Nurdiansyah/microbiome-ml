@@ -32,11 +32,13 @@ microbiome_ml = { path = ".", editable = true }
 [feature.shap.dependencies]
 # Optional: SHAP-based feature attribution (used by SHAPAnalyser / Visualiser)
 shap = ">=0.44.0"
-snakemake-executor-plugin-cluster-generic = ">=1.0.9,<2"
 
 [feature.dev.dependencies]
 # Workflow engine for workflow/Snakefile (parallel holdout-grouping sweep)
 snakemake-minimal = ">=8.0"
+# Cluster submission (qsub/sbatch via a --profile). Next to snakemake so
+# every environment that has snakemake can use the cluster profile.
+snakemake-executor-plugin-cluster-generic = ">=1.0.9,<2"
 pytest = ">=7.0.0"
 pytest-cov = ">=4.0.0"
 pytest-mock = ">=3.10.0"

@@ -13,6 +13,7 @@
 # DAG, where <run> is holdout_<grouping> for a cross-product sweep and
 # holdout_<grouping>__<label> for a `pairs` sweep:
 #   prepare  (1)                  build dataset once  -> <base>/prepared/
+#                                 (or reuse outputs.prepared_dir, no rule)
 #   split    (per run)            holdout + CV folds  -> <base>/<run>/splits/
 #   cv       (per run x label x scheme, PARALLEL)
 #                                 -> <base>/<run>/runs/<label>/<scheme>/
@@ -192,6 +193,24 @@ _resolved = {
 RESOLVED.write_text(yaml.safe_dump(_resolved, sort_keys=False))
 RESOLVED_S = shlex.quote(str(RESOLVED))
 
+# outputs.prepared_dir: start from a dataset another run already prepared
+# (same data, labels, groupings and feature sets) instead of rebuilding
+# it, which on a large profile table is most of a day. The prepare rule
+# then does not exist, so this workflow can never overwrite that
+# directory. A label sweep (cv.target_transform, data.label_limits) needs
+# nothing new from prepare: both act on the labels after loading.
+_PREPARED_CFG = config["outputs"].get("prepared_dir")
+REUSE_PREPARED = bool(_PREPARED_CFG)
+PREPARED = Path(_PREPARED_CFG) if REUSE_PREPARED else BASE / "prepared"
+if not PREPARED.is_absolute():
+    PREPARED = Path.cwd() / PREPARED
+PREPARED_MANIFEST = str(PREPARED / "manifest.json")
+PREPARED_S = shlex.quote(str(PREPARED))
+if REUSE_PREPARED and not Path(PREPARED_MANIFEST).is_file():
+    raise WorkflowError(
+        f"outputs.prepared_dir has no manifest.json: {PREPARED_MANIFEST}"
+    )
+
 wildcard_constraints:
     run="holdout_[^/]+",
     label="[^/]+",
@@ -248,25 +267,27 @@ rule all:
         COLLATED,
 
 
-rule prepare:
-    output:
-        f"{BASE_S}/prepared/manifest.json",
-    threads: RES("prepare", "threads")
-    retries: RETRIES("prepare")
-    resources:
-        mem_mb=MEM("prepare"),
-        runtime=RUNTIME("prepare"),
-    log:
-        f"{BASE_S}/logs/prepare.log",
-    shell:
-        "{LOGHDR} "
-        "{STEPS} prepare --config {RESOLVED_S} "
-        "--out {BASE_S}/prepared >> {log} 2>&1"
+if not REUSE_PREPARED:
+
+    rule prepare:
+        output:
+            PREPARED_MANIFEST,
+        threads: RES("prepare", "threads")
+        retries: RETRIES("prepare")
+        resources:
+            mem_mb=MEM("prepare"),
+            runtime=RUNTIME("prepare"),
+        log:
+            f"{BASE_S}/logs/prepare.log",
+        shell:
+            "{LOGHDR} "
+            "{STEPS} prepare --config {RESOLVED_S} "
+            "--out {PREPARED_S} >> {log} 2>&1"
 
 
 checkpoint split:
     input:
-        rules.prepare.output,
+        PREPARED_MANIFEST,
     output:
         f"{BASE_S}/{{run}}/splits/schemes.json",
     params:
@@ -283,7 +304,7 @@ checkpoint split:
     shell:
         "{LOGHDR} "
         "{STEPS} split --config {RESOLVED_S} "
-        "--dataset {BASE_S}/prepared "
+        "--dataset {PREPARED_S} "
         "--grouping {params.token} --run-name {params.stamp} "
         "{params.label_sets} "
         "--out {BASE_S}/{wildcards.run}/splits >> {log} 2>&1"
@@ -291,7 +312,7 @@ checkpoint split:
 
 rule cv:
     input:
-        prepared=rules.prepare.output,
+        prepared=PREPARED_MANIFEST,
         schemes=f"{BASE_S}/{{run}}/splits/schemes.json",
     output:
         f"{BASE_S}/{{run}}/runs/{{label}}/{{scheme}}/status.json",
@@ -308,7 +329,7 @@ rule cv:
     shell:
         "{LOGHDR} "
         "{STEPS} cv --config {RESOLVED_S} "
-        "--dataset {BASE_S}/prepared "
+        "--dataset {PREPARED_S} "
         "--splits {BASE_S}/{wildcards.run}/splits "
         "--grouping {params.token} --run-name {params.stamp} "
         "--label {wildcards.label} --scheme {wildcards.scheme} "
