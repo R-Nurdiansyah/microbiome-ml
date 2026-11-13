@@ -99,6 +99,14 @@ def run_sweep(
     dataset = pipeline.build_dataset(cfg)
 
     specs = [steps.holdout_spec(g) for g in groupings]
+    if any(kind == "spatial" for kind, _ in specs):
+        # Without this, "spatial" would reach the column branch below with
+        # no column and quietly become a random holdout.
+        raise ValueError(
+            "The spatial holdout runs through the Snakemake workflow "
+            "(workflow/Snakefile, or scripts/sweep_transforms.py); "
+            "run_holdout_sweep.py does not build it"
+        )
 
     # Taxon holdouts need the feature set for that rank; check before any CV.
     for _kind, _value in specs:

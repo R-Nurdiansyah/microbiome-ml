@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 
 RANDOM = "random"  # directory/CLI name for "no holdout grouping"
 TAXON_PREFIX = "taxon_"  # dir-safe form of the "taxon:<rank>" token
+SPATIAL = "spatial"  # grid cells + buffer, sized by split.holdout.spatial
 
 
 def holdout_spec(name: str) -> Tuple[str, Optional[str]]:
@@ -20,11 +21,14 @@ def holdout_spec(name: str) -> Tuple[str, Optional[str]]:
     random | null | none  -> ("column", None)   stratified random
     taxon:family          -> ("taxon", "family") community membership
     taxon_family          -> ("taxon", "family") (dir-safe spelling)
+    spatial               -> ("spatial", None)   grid cells + buffer
     <anything else>       -> ("column", <name>) metadata grouping
     """
     text = name.strip()
     if text.lower() in {RANDOM, "null", "none", ""}:
         return ("column", None)
+    if text.lower() == SPATIAL:
+        return ("spatial", None)
     if text.startswith("taxon:"):
         return ("taxon", text.split(":", 1)[1])
     if text.startswith(TAXON_PREFIX):
@@ -37,6 +41,8 @@ def spec_dir_name(name: str) -> str:
     kind, value = holdout_spec(name)
     if kind == "taxon":
         return f"{TAXON_PREFIX}{value}"
+    if kind == "spatial":
+        return SPATIAL
     return RANDOM if value is None else value
 
 

@@ -1712,6 +1712,112 @@ class Dataset:
 
         return self
 
+    def create_spatial_holdout_split(
+        self,
+        label: Optional[str] = None,
+        test_size: float = 0.2,
+        n_bins: int = 5,
+        random_state: int = 42,
+        spatial: Optional[Any] = None,
+        force: bool = False,
+        output_dir: Optional[Union[str, Path]] = None,
+    ) -> "Dataset":
+        """Holdout split by grid cell, with a buffer, for one or all labels.
+
+        Whole grid cells go to test, label-stratified as in
+        :meth:`create_holdout_split`, and training samples within the
+        buffer distance of any test sample get ``split = "buffer"`` (in
+        neither set). Distances are haversine; cell size and buffer may be
+        "auto" (from the label's variogram). See
+        :mod:`microbiome_ml.wrangle.spatial`.
+
+        Args:
+            label: Specific label to split. If None, splits all labels.
+            test_size: Fraction of the labelled samples for the test set
+                (the buffer only takes from training).
+            n_bins: Number of bins for continuous targets
+            random_state: Random seed
+            spatial: The ``split.holdout.spatial`` mapping, or a
+                :class:`~microbiome_ml.wrangle.spatial.SpatialSettings`.
+            force: If True, overwrite existing splits
+            output_dir: If given, writes ``<label>/holdout.csv`` there,
+                plus ``spatial_report.tsv`` and ``spatial_variogram.tsv``.
+
+        Returns:
+            Self for chaining. The report and variogram are also kept on
+            ``self.spatial_report`` and ``self.spatial_variogram``.
+        """
+        from microbiome_ml.wrangle import spatial as sp
+
+        if self.labels is None:
+            raise ValueError("Labels must be added before creating splits")
+        if self.metadata is None:
+            raise ValueError(
+                "A spatial holdout needs metadata with sample coordinates"
+            )
+        settings = (
+            spatial
+            if isinstance(spatial, sp.SpatialSettings)
+            else sp.SpatialSettings.from_config(spatial)
+        )
+        all_label_cols = [c for c in self.labels.columns if c != "sample"]
+        if label is not None:
+            if label not in all_label_cols:
+                raise ValueError(f"Label '{label}' not found in labels")
+            label_list = [label]
+        else:
+            label_list = all_label_cols
+
+        metadata_df = self.metadata.metadata.collect()
+        coords = sp.coordinates(
+            metadata_df, settings.lat_column, settings.lon_column
+        )
+        reports: List[Dict[str, Any]] = []
+        variograms: List[pl.DataFrame] = []
+        for lbl in label_list:
+            if lbl in self.splits and not force:
+                logger.warning(
+                    f"Split for '{lbl}' already exists. Use force=True to overwrite."
+                )
+                continue
+            logger.info(
+                "Creating spatial holdout split for label: %s (whole grid "
+                "cells go to test; training samples near test are buffered)",
+                lbl,
+            )
+            if lbl not in self.splits:
+                self.splits[lbl] = SplitManager(lbl)
+            report, vario = sp.spatial_holdout(
+                self.splits[lbl],
+                self.labels.select(["sample", lbl]),
+                coords,
+                settings,
+                test_size=test_size,
+                n_bins=n_bins,
+                random_state=random_state,
+                metadata=metadata_df,
+            )
+            reports.append(report)
+            variograms.append(vario)
+
+        self.spatial_report = sp.report_frame(reports)
+        self.spatial_variogram = (
+            pl.concat(variograms)
+            if variograms
+            else pl.DataFrame(schema=sp.VARIOGRAM_SCHEMA)
+        )
+        if output_dir is not None:
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            self.save_holdout_splits(out, label=label)
+            self.spatial_report.write_csv(
+                out / "spatial_report.tsv", separator="\t"
+            )
+            self.spatial_variogram.write_csv(
+                out / "spatial_variogram.tsv", separator="\t"
+            )
+        return self
+
     def _rank_feature_set(self, rank: TaxonomicRanks) -> str:
         """Name of the feature set holding *rank* (e.g. 'tax_family')."""
         wanted = rank.name.lower()

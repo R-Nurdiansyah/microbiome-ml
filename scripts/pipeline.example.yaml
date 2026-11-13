@@ -260,6 +260,17 @@ split:
     # Needs the matching feature set (features.ranks must include the rank).
     # Only labelled samples are considered. null = use `grouping` instead.
     taxon_rank: null
+    # Holdout token `spatial` only (sweep.holdout_groupings): whole grid
+    # cells go to test, and training samples nearer than buffer_km to a
+    # test sample are left out (split = buffer). Haversine distances.
+    # auto = the label's variogram range; an auto buffer is shortened if
+    # it would remove more than max_buffer_loss of training.
+    spatial:
+      cell_km: auto
+      buffer_km: auto            # 0 = no buffer
+      max_buffer_loss: 0.25
+      auto_min_km: 10
+      auto_max_km: 500
     presence_threshold: 0.0   # a taxon counts as present above this value
     min_test_samples: 2       # refuse a taxon leaving fewer on either side
     random_state: 42

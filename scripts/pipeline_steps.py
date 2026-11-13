@@ -233,6 +233,29 @@ def step_split(args: argparse.Namespace) -> None:
             force=True,
             output_dir=out,
         )
+    elif kind == "spatial":
+        # Grid cells and a haversine buffer, sizes from
+        # split.holdout.spatial (auto by default); see wrangle/spatial.py.
+        dataset = dataset.create_spatial_holdout_split(
+            label=holdout_cfg.get("label"),
+            test_size=float(holdout_cfg.get("test_size", 0.2)),
+            n_bins=int(holdout_cfg.get("n_bins", 5)),
+            random_state=int(holdout_cfg.get("random_state", 42)),
+            spatial=holdout_cfg.get("spatial"),
+            force=True,
+            output_dir=out,
+        )
+        for row in dataset.spatial_report.iter_rows(named=True):
+            LOGGER.info(
+                "spatial holdout %s: cell %.0f km, buffer %.1f km, "
+                "%s train / %s buffer / %s test",
+                row["label"],
+                row["cell_km"],
+                row["buffer_km"],
+                row["n_train"],
+                row["n_buffer"],
+                row["n_test"],
+            )
     else:
         dataset = _ensure_grouping(dataset, value)
         dataset = dataset.create_holdout_split(

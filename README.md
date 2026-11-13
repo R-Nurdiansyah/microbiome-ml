@@ -334,6 +334,49 @@ A sweep token is one of:
 | `<column>` | group-aware on that metadata column (added from metadata if needed) |
 | `taxon:<rank>` | community membership at that rank (see *Holding out by community membership*) |
 | `taxon_<rank>` | the same token, underscored |
+| `spatial` | whole grid cells to test, plus a buffer (see *Holding out in space*) |
+
+### Holding out in space
+
+A grouped holdout keeps studies apart but not places. In the 18S_marine
+bioproject holdout, 24% of test samples had a training sample within 10 km
+and 59% within 50 km, so a model could score by recognising locations. The
+`spatial` token (`sweep.holdout_groupings: [spatial]`) splits in space
+instead:
+
+1. every sample gets a grid cell about `cell_km` across, equal in width
+   at every latitude (unlike a degree grid or Web Mercator metres);
+2. whole cells go to test, label-stratified like any grouped holdout;
+3. training samples closer than `buffer_km` to a test sample become
+   `split = buffer` in `holdout.csv`, in neither set. Test samples are
+   never removed, so only training shrinks.
+
+Distances are haversine, from sklearn's `BallTree` over unique sites, so it
+scales to hundreds of thousands of samples. Settings, all optional:
+
+```yaml
+split:
+  holdout:
+    spatial:
+      cell_km: auto          # km, or auto
+      buffer_km: auto        # km (0 = no buffer), or auto
+      max_buffer_loss: 0.25  # auto buffer removes at most this share of train
+      auto_min_km: 10
+      auto_max_km: 500
+      auto_fraction: 0.95
+```
+
+`auto` is the label's variogram range: the shortest distance at which two
+sites are no more alike than two random ones (semivariance reaching
+`auto_fraction` of the label variance), clipped to the bounds. An auto
+buffer uses the same distance unless that would remove more than
+`max_buffer_loss` of the training samples, and is then shortened to remove
+exactly that share. A number is used as given.
+
+Each run writes `splits/spatial_report.tsv` (per label: cell and buffer
+sizes and where they came from, samples buffered, and how close test
+samples were to training before and after the buffer) and
+`splits/spatial_variogram.tsv`.
 
 **Quote a `taxon:` token inside a YAML flow sequence** — `[random, taxon:family]`
 is a parse error, because YAML reads the colon as an indicator there:
