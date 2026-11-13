@@ -256,6 +256,52 @@ def plot_holdout_distributions(
     LOGGER.info("Wrote holdout distribution plots to %s", out_dir)
 
 
+def plot_holdout_maps(
+    splits_dir: Path,
+    vis_cfg: Dict[str, Any],
+    out_dir: Path,
+    spatial: bool = False,
+) -> None:
+    """A map of the train, test and buffer samples, one figure per label.
+
+    `visualise.holdout_map`: auto (the default) maps spatial holdouts
+    only, true maps every holdout, false none. Cell and buffer sizes come
+    from the run's spatial_report.tsv when there is one.
+    """
+    if not bool(vis_cfg.get("enabled", False)):
+        return
+    setting = vis_cfg.get("holdout_map", "auto")
+    if isinstance(setting, str) and setting.strip().lower() == "auto":
+        wanted = spatial
+    else:
+        wanted = bool(setting)
+    if not wanted:
+        return
+    holdouts = sorted(Path(splits_dir).glob("*/holdout.csv"))
+    sizes: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    report = Path(splits_dir) / "spatial_report.tsv"
+    if report.is_file():
+        for row in pl.read_csv(report, separator="\t").iter_rows(named=True):
+            sizes[str(row["label"])] = (row.get("cell_km"), row.get("buffer_km"))
+    vis = Visualiser(out_dir, formats=list(vis_cfg.get("formats", ["png"])))
+    for path in holdouts:
+        label = path.parent.name
+        cell_km, buffer_km = sizes.get(label, (None, None))
+        try:
+            vis.plot_holdout_map(
+                path,
+                label=label,
+                cell_km=cell_km,
+                buffer_km=buffer_km,
+                output=f"holdout_map_{label}",
+            )
+        except Exception as exc:  # one bad label must not stop the run
+            LOGGER.warning("Could not map holdout for '%s': %s", label, exc)
+        finally:
+            plt.close("all")
+    LOGGER.info("Wrote holdout maps to %s", out_dir)
+
+
 def _validate_grouping_references(
     cfg: Dict[str, Any], available: List[str]
 ) -> None:

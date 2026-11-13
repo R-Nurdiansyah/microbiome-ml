@@ -292,6 +292,14 @@ def step_split(args: argparse.Namespace) -> None:
         holdout_grouping=run_name,
         stack_by=value if kind == "column" else None,
     )
+    # Where the samples are, train / test / buffer (visualise.holdout_map;
+    # auto = spatial holdouts only).
+    pipeline.plot_holdout_maps(
+        out,
+        sec["visualise"],
+        out.parent / "split_visualisations",
+        spatial=kind == "spatial",
+    )
 
     # What the cv step should actually train, honouring cv.label / cv.scheme.
     want_labels = cv_cfg.get("label")

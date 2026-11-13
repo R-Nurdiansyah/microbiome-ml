@@ -83,6 +83,16 @@ _CATEGORICAL_HUES = (
 )
 _OTHER_HUE = "#bdbdbd"  # lighter than tab10 grey, so the two never merge
 
+# Holdout map: drawn in this order, so test sits on top. Buffer is grey,
+# as it is in neither set.
+_MAP_SIDES = ("train", "buffer", "test")
+_MAP_COLOURS = {"train": "#1f77b4", "buffer": "#9e9e9e", "test": "#d62728"}
+_MAP_NAMES = {
+    "train": "train",
+    "buffer": "buffer (in neither set)",
+    "test": "test",
+}
+
 
 def _fmt_r2(value: float) -> str:
     """An R2 a human can read at a glance.
@@ -1056,6 +1066,205 @@ class Visualiser:
             self._save_fig(fig, file_path, dpi=300)
         plt.show()
         return stats
+
+    def plot_holdout_map(
+        self,
+        holdout: Union[str, Path, pl.DataFrame],
+        label: Optional[str] = None,
+        cell_km: Optional[float] = None,
+        buffer_km: Optional[float] = None,
+        output: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Where a holdout's samples are: train, test and buffer on a map.
+
+        One point per site and side (many samples share a site), on
+        longitude/latitude axes. With a spatial holdout's ``spatial_cell``
+        column and *cell_km*, the test cells are shaded too. Coastlines
+        come from cartopy when it is installed and its Natural Earth data
+        loads; otherwise the map is drawn on plain axes with a grid.
+
+        Args:
+            holdout: ``holdout.csv`` path, or the DataFrame itself. Needs
+                ``split``, ``lat`` and ``lon`` (the split step writes the
+                metadata coordinates into it).
+            label: Named in the title (default: the column after split).
+            cell_km: Grid cell size, to shade the test cells.
+            buffer_km: Shown in the title.
+            output: Optional file stem, as for plot_holdout_distribution.
+            title: Overrides the default title.
+
+        Returns:
+            {label, n_train, n_test, n_buffer, n_sites}
+        """
+        if isinstance(holdout, (str, Path)):
+            holdout = pl.read_csv(holdout, infer_schema_length=10000)
+        missing = [
+            c for c in ("split", "lat", "lon") if c not in holdout.columns
+        ]
+        if missing:
+            raise ValueError(f"holdout has no {missing} column(s) to map")
+        if label is None:
+            rest = [c for c in holdout.columns if c not in ("sample", "split")]
+            label = rest[0] if rest else "holdout"
+
+        points = (
+            holdout.select(
+                pl.col("split").cast(pl.Utf8),
+                pl.col("lat").cast(pl.Float64, strict=False),
+                pl.col("lon").cast(pl.Float64, strict=False),
+            )
+            .drop_nulls()
+            .filter(
+                pl.col("lat").is_between(-90.0, 90.0)
+                & pl.col("lon").is_between(-180.0, 180.0)
+            )
+        )
+        counts = {
+            side: points.filter(pl.col("split") == side).height
+            for side in _MAP_SIDES
+        }
+        sites = points.unique(subset=["split", "lat", "lon"])
+        test_cells: List[str] = []
+        if cell_km and "spatial_cell" in holdout.columns:
+            test_cells = (
+                holdout.filter(pl.col("split") == "test")
+                .get_column("spatial_cell")
+                .cast(pl.Utf8)
+                .drop_nulls()
+                .unique()
+                .sort()
+                .to_list()
+            )
+
+        head = title or f"Holdout map: {label}"
+        details = []
+        if cell_km:
+            details.append(f"cells {cell_km:.0f} km")
+        if buffer_km is not None:
+            details.append(f"buffer {buffer_km:.0f} km")
+        if details:
+            head += "   ·   " + ", ".join(details)
+
+        # Cartopy first, for coastlines. It fetches Natural Earth on first
+        # use, which fails on a node without internet -- and only when the
+        # figure is drawn, so the save sits inside the attempt.
+        for use_cartopy in (True, False):
+            fig: Optional[plt.Figure] = None
+            try:
+                fig = self._draw_holdout_map(
+                    sites, counts, test_cells, cell_km, head, use_cartopy
+                )
+                if output:
+                    self._save_fig(fig, self._output_stem(output), dpi=300)
+                break
+            except Exception as exc:
+                if fig is not None:
+                    plt.close(fig)
+                if not use_cartopy:
+                    raise
+                logging.info("Holdout map without coastlines (%s)", exc)
+        plt.show()
+        return {
+            "label": label,
+            "n_train": counts["train"],
+            "n_test": counts["test"],
+            "n_buffer": counts["buffer"],
+            "n_sites": points.select("lat", "lon").unique().height,
+        }
+
+    def _output_stem(self, output: str) -> Path:
+        """*output* as a path without extension, under output_dir if bare."""
+        file_path = Path(output)
+        if (
+            file_path.parent in (Path(""), Path("."))
+            and not file_path.is_absolute()
+        ):
+            return self.output_dir / file_path.stem
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        return file_path.with_suffix("")
+
+    def _draw_holdout_map(
+        self,
+        sites: pl.DataFrame,
+        counts: Dict[str, int],
+        test_cells: List[str],
+        cell_km: Optional[float],
+        head: str,
+        use_cartopy: bool,
+    ) -> plt.Figure:
+        from matplotlib.collections import PatchCollection
+        from matplotlib.patches import Patch, Rectangle
+
+        from microbiome_ml.wrangle.spatial import cell_bounds
+
+        kw: Dict[str, Any] = {}
+        if use_cartopy:
+            import cartopy.crs as ccrs
+
+            fig = plt.figure(figsize=(13, 7))
+            ax: Any = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+            ax.set_global()
+            ax.coastlines(linewidth=0.4, color="#555555")
+            ax.gridlines(linewidth=0.3, color="#cccccc", draw_labels=True)
+            kw["transform"] = ccrs.PlateCarree()
+        else:
+            fig, ax = plt.subplots(figsize=(13, 7))
+            ax.set_xlim(-180, 180)
+            ax.set_ylim(-90, 90)
+            ax.set_aspect("equal")
+            ax.set_xticks(range(-180, 181, 30))
+            ax.set_yticks(range(-90, 91, 30))
+            ax.grid(linewidth=0.3, color="#cccccc")
+            ax.set_xlabel("longitude")
+            ax.set_ylabel("latitude")
+
+        if test_cells and cell_km:
+            boxes = []
+            for cell in test_cells:
+                lon0, lat0, lon1, lat1 = cell_bounds(cell, float(cell_km))
+                boxes.append(Rectangle((lon0, lat0), lon1 - lon0, lat1 - lat0))
+            ax.add_collection(
+                PatchCollection(
+                    boxes,
+                    facecolor=_MAP_COLOURS["test"],
+                    edgecolor=_MAP_COLOURS["test"],
+                    alpha=0.12,
+                    linewidth=0.5,
+                    **kw,
+                )
+            )
+
+        for side in _MAP_SIDES:
+            part = sites.filter(pl.col("split") == side)
+            if part.height == 0:
+                continue
+            ax.scatter(
+                part.get_column("lon").to_numpy(),
+                part.get_column("lat").to_numpy(),
+                s=16 if side == "test" else 10,
+                c=_MAP_COLOURS[side],
+                alpha=0.85,
+                edgecolors="none",
+                label=f"{_MAP_NAMES[side]}  (n={counts[side]})",
+                zorder=3,
+                **kw,
+            )
+        handles, _ = ax.get_legend_handles_labels()
+        if test_cells and cell_km:
+            # A PatchCollection has no legend entry of its own.
+            handles.append(
+                Patch(
+                    facecolor=_MAP_COLOURS["test"],
+                    edgecolor=_MAP_COLOURS["test"],
+                    alpha=0.12,
+                    label=f"test cells ({len(test_cells)})",
+                )
+            )
+        ax.legend(handles=handles, loc="lower left", fontsize=9, framealpha=0.9)
+        ax.set_title(head, fontsize=12)
+        fig.tight_layout()
+        return fig
 
     def plot_feature_importances(
         self,

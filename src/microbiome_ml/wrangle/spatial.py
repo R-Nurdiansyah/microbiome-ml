@@ -257,6 +257,22 @@ def cell_ids(lat: ArrayLike, lon: ArrayLike, cell_km: float) -> List[str]:
     return [f"{b}_{c}" for b, c in zip(band.tolist(), col.tolist())]
 
 
+def cell_bounds(
+    cell: str, cell_km: float
+) -> Tuple[float, float, float, float]:
+    """(lon_min, lat_min, lon_max, lat_max) of a cell from `cell_ids`."""
+    band_text, col_text = cell.split("_", 1)
+    band, col = int(band_text), int(col_text)
+    dlat = cell_km / KM_PER_DEGREE
+    lat0 = -90.0 + band * dlat
+    centre = float(np.clip(lat0 + dlat / 2, -90.0, 90.0))
+    around_km = 2 * np.pi * EARTH_RADIUS_KM * np.cos(np.radians(centre))
+    n_cols = max(1, int(np.floor(around_km / cell_km)))
+    width = 360.0 / n_cols
+    lon0 = -180.0 + col * width
+    return lon0, lat0, lon0 + width, min(90.0, lat0 + dlat)
+
+
 def _sites(lat: ArrayLike, lon: ArrayLike) -> Tuple[np.ndarray, np.ndarray]:
     """Unique (lat, lon) sites, and each point's index into them."""
     points: np.ndarray = np.column_stack(

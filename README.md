@@ -373,6 +373,15 @@ buffer uses the same distance unless that would remove more than
 `max_buffer_loss` of the training samples, and is then shortened to remove
 exactly that share. A number is used as given.
 
+A map of each label's train, test and buffer samples, with the test cells
+shaded, goes beside the distribution figures:
+`holdout_spatial/split_visualisations/holdout_map_<label>.png`. It is drawn
+for spatial holdouts by default (`visualise.holdout_map: auto`); `true`
+draws one for every holdout, `false` none. For a run that has already
+split, `python scripts/plot_holdout_map.py <run>/splits` draws them
+without rerunning anything. Coastlines need cartopy, which is not in the
+pixi environment; without it the map is plain longitude/latitude axes.
+
 Each run writes `splits/spatial_report.tsv` (per label: cell and buffer
 sizes and where they came from, samples buffered, and how close test
 samples were to training before and after the buffer) and

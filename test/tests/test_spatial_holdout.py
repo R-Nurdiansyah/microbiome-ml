@@ -284,3 +284,58 @@ def test_the_spatial_token():
     assert sweep_tokens.spec_dir_name("spatial") == "spatial"
     specs = sweep_tokens.run_specs(holdout_groupings=["bioproject", "spatial"])
     assert list(specs) == ["holdout_bioproject", "holdout_spatial"]
+
+
+# ---------------------------------------------------------------------------
+# the map
+# ---------------------------------------------------------------------------
+def test_cell_bounds_contain_their_points():
+    rng = np.random.default_rng(4)
+    lat, lon = rng.uniform(-89, 89, 500), rng.uniform(-180, 179.99, 500)
+    for km in (50.0, 300.0, 1000.0):
+        for x, y, cell in zip(lon, lat, sp.cell_ids(lat, lon, km)):
+            lon0, lat0, lon1, lat1 = sp.cell_bounds(cell, km)
+            assert lon0 <= x <= lon1 and lat0 <= y <= lat1
+
+
+def test_the_map_counts_every_side(tmp_path):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from microbiome_ml.visualise.visualisations import Visualiser
+
+    ds = _dataset().create_spatial_holdout_split(
+        spatial={"cell_km": 300, "buffer_km": 150}, output_dir=tmp_path
+    )
+    holdout = ds.splits["temp"].holdout
+    stats = Visualiser(tmp_path / "maps").plot_holdout_map(
+        tmp_path / "temp" / "holdout.csv",
+        cell_km=300,
+        buffer_km=150,
+        output="holdout_map_temp",
+    )
+    assert (tmp_path / "maps" / "holdout_map_temp.png").exists()
+    for side in ("train", "test", "buffer"):
+        n = holdout.filter(pl.col("split") == side).height
+        assert stats[f"n_{side}"] == n
+
+
+def test_maps_are_drawn_for_spatial_runs_unless_asked(tmp_path):
+    import run_cv_to_final_eval as pipeline
+
+    _dataset().create_spatial_holdout_split(
+        spatial={"cell_km": 300, "buffer_km": 150}, output_dir=tmp_path
+    )
+    vis = {"enabled": True, "formats": ["png"]}
+    pipeline.plot_holdout_maps(tmp_path, vis, tmp_path / "a", spatial=False)
+    assert not (tmp_path / "a" / "holdout_map_temp.png").exists()
+    pipeline.plot_holdout_maps(tmp_path, vis, tmp_path / "b", spatial=True)
+    assert (tmp_path / "b" / "holdout_map_temp.png").exists()
+    pipeline.plot_holdout_maps(
+        tmp_path, {**vis, "holdout_map": True}, tmp_path / "c"
+    )
+    assert (tmp_path / "c" / "holdout_map_temp.png").exists()
+    pipeline.plot_holdout_maps(
+        tmp_path, {**vis, "holdout_map": False}, tmp_path / "d", spatial=True
+    )
+    assert not (tmp_path / "d" / "holdout_map_temp.png").exists()

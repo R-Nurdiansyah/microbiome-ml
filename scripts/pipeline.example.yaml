@@ -487,6 +487,11 @@ visualise:
     # size difference stays visible); probability = both sides on one
     # scale so the shapes can be compared. A single string also works.
     stat: [count, probability]
+  # Stage 1 figure: a map of the train, test and buffer samples per label
+  # (holdout_map_<label>.png beside the distributions), test cells shaded
+  # for a spatial holdout. auto = spatial holdouts only; true = every
+  # holdout; false = none. Coastlines only if cartopy is installed.
+  holdout_map: auto
 
 # Optional SHAP attribution on each holdout TEST split. Requires the `shap`
 # package: run with `pixi run -e shap python scripts/run_cv_to_final_eval.py ...`
