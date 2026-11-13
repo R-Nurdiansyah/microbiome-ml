@@ -47,6 +47,7 @@ import argparse
 import json
 import logging
 import math
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -57,6 +58,9 @@ matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt  # noqa: E402
 import polars as pl  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from label_order import sort_labels  # noqa: E402
 
 from microbiome_ml.visualise.visualisations import (  # noqa: E402
     _CATEGORICAL_HUES,
@@ -526,9 +530,7 @@ def plot_sweep(
     vis = Visualiser(out=out_dir, formats=formats)
     written: List[Path] = []
 
-    wanted = labels or [
-        str(v) for v in best.get_column("label").unique().sort().to_list()
-    ]
+    wanted = labels or sort_labels(best.get_column("label").unique().to_list())
     for label in wanted:
         block = best.filter(pl.col("label") == label)
         if not block.height:
@@ -748,9 +750,9 @@ def plot_holdout(
     """
     vis = Visualiser(out=out_dir, formats=formats)
     written: List[Path] = []
-    wanted = labels or [
-        str(v) for v in holdout.get_column("label").unique().sort().to_list()
-    ]
+    wanted = labels or sort_labels(
+        holdout.get_column("label").unique().to_list()
+    )
     for label in wanted:
         fig = draw_holdout(label, holdout, models, scheme=scheme)
         if fig is None:
@@ -844,7 +846,7 @@ def plot_shadow_floor(
     """Share of real taxa above the shuffled-noise floor, per combination."""
     if not floor.height:
         return None
-    labels = floor.get_column("label").unique().sort().to_list()
+    labels = sort_labels(floor.get_column("label").unique().to_list())
     height = 0.5 * floor.get_column("combo").n_unique() + 1.6
     fig, axes = _panel_grid(len(labels), 2, 6.4, height)
     for ax, label in zip(axes, labels):
@@ -884,7 +886,7 @@ def plot_scoreboard(
     """One panel per label, one row per combination, three markers each."""
     if not frame.height:
         return None
-    labels = frame.get_column("label").unique().sort().to_list()
+    labels = sort_labels(frame.get_column("label").unique().to_list())
     n_combos = frame.get_column("combo").n_unique()
     fig, axes = _panel_grid(len(labels), 2, 7.2, 0.46 * n_combos + 1.5)
     series = [

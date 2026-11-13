@@ -12,7 +12,9 @@ recognising a location. This holdout separates them in space:
    cell is the same size near the pole as at the equator -- unlike a
    degree grid or Web Mercator (EPSG:3857) metres, which shrink with
    latitude.
-2. The usual label-stratified grouped split puts whole cells into test.
+2. Whole cells go to test, picked at random (seeded) until the test set
+   holds about `test_size` of the samples. The label is not looked at:
+   the point is that test is somewhere else, not that it looks like train.
 3. Training samples closer than `buffer_km` to any test sample are taken
    out of training (split = "buffer"), so no training sample sits next to
    a test sample across a cell edge. Test samples are never removed, so
@@ -41,21 +43,51 @@ sites are no more alike than two picked at random. Clipped to
 The range comes from the label, not from model residuals, so it is an
 upper bound on what a model can exploit: conservative, by design. It uses
 every labelled sample, test included, to set the size of the split -- no
-model sees it, and the split is already stratified on the label.
+model sees it.
+
+CLUSTERS INSTEAD OF CELLS (token `spatial_cluster`). Grid lines cut
+through dense patches of sites, and the buffer then deletes every training
+site near the cut. Clusters put the boundaries in the gaps instead, and
+delete nothing:
+
+1. Sites closer than `gap_km` are joined, and joined sites form a cluster
+   (single linkage, what DBSCAN gives with min_samples=1). Any two
+   clusters are then more than `gap_km` apart. Exact: a minimum spanning
+   tree of the sites with every edge longer than the gap cut, built once
+   in O(n) memory.
+2. Whole clusters go to test, picked at random (seeded, the label not
+   looked at) until test holds about `test_size` of the samples. A
+   cluster with more than `max_cluster_share` of the samples (a dense
+   region chained into one, or one heavily sampled station) is never
+   picked: it stays in training whole, since cutting it would put close
+   neighbours on both sides.
+3. No buffer. A training sample near a test sample would be in the same
+   cluster, so it is in test too; every training sample is more than
+   `gap_km` from every test sample, and no sample is deleted.
+
+  gap_km: auto -> the largest of 25, 50, 100, 200 and 400 km at which no
+                  more than `max_oversize_share` of the samples sit in
+                  clusters too big to go to test.
+
+Every step is deterministic: same data, config and seed, same split.
 
 Config (all optional), under split.holdout:
 
     spatial:
-      cell_km: auto          # km, or auto
-      buffer_km: auto        # km (0 = no buffer), or auto
+      cell_km: auto          # grid: km, or auto
+      buffer_km: auto        # grid: km (0 = no buffer), or auto
       max_buffer_loss: 0.25  # auto buffer removes at most this share of train
       auto_min_km: 10
       auto_max_km: 500
       auto_fraction: 0.95
+      gap_km: auto           # cluster: km, or auto
+      max_cluster_share: 0.05
+      max_oversize_share: 0.5
       lat_column: lat
       lon_column: lon
 
-Selected with the holdout token `spatial` (sweep.holdout_groupings).
+Selected with the holdout tokens `spatial` (grid) and `spatial_cluster`
+(sweep.holdout_groupings).
 """
 
 from __future__ import annotations
@@ -78,7 +110,13 @@ HALF_CIRCUMFERENCE_KM = np.pi * EARTH_RADIUS_KM
 AUTO = "auto"
 SPLIT_BUFFER = "buffer"
 CELL_COLUMN = "spatial_cell"
+CLUSTER_COLUMN = "spatial_cluster"
 NEAREST_COLUMN = "nearest_test_km"
+METHODS = ("grid", "cluster")
+_GROUP_COLUMN = {"grid": CELL_COLUMN, "cluster": CLUSTER_COLUMN}
+
+# gap_km: auto picks the largest of these.
+_GAP_CANDIDATES_KM = (25.0, 50.0, 100.0, 200.0, 400.0)
 
 # Variogram bins: log-spaced from 100 m to half the globe. A bin needs
 # this many pairs to be reported.
@@ -130,6 +168,9 @@ class SpatialSettings:
     auto_min_km: float = 10.0
     auto_max_km: float = 500.0
     auto_fraction: float = 0.95
+    gap_km: Optional[float] = None
+    max_cluster_share: float = 0.05
+    max_oversize_share: float = 0.5
     lat_column: str = "lat"
     lon_column: str = "lon"
     # Variogram sampling: every site is a candidate, these bound the work.
@@ -154,6 +195,9 @@ class SpatialSettings:
             auto_min_km=float(cfg.get("auto_min_km", 10.0)),
             auto_max_km=float(cfg.get("auto_max_km", 500.0)),
             auto_fraction=float(cfg.get("auto_fraction", 0.95)),
+            gap_km=_distance(cfg.get("gap_km", AUTO), "gap_km", False),
+            max_cluster_share=float(cfg.get("max_cluster_share", 0.05)),
+            max_oversize_share=float(cfg.get("max_oversize_share", 0.5)),
             lat_column=str(cfg.get("lat_column", "lat")),
             lon_column=str(cfg.get("lon_column", "lon")),
             variogram_sites=int(cfg.get("variogram_sites", 5000)),
@@ -177,6 +221,13 @@ class SpatialSettings:
                 "split.holdout.spatial.auto_fraction must be > 0, got "
                 f"{settings.auto_fraction}"
             )
+        for name in ("max_cluster_share", "max_oversize_share"):
+            value = getattr(settings, name)
+            if not 0 < value <= 1:
+                raise ValueError(
+                    f"split.holdout.spatial.{name} is a fraction above 0 "
+                    f"and at most 1, got {value}"
+                )
         return settings
 
 
@@ -317,6 +368,193 @@ def nearest_km(
     dist, _ = _tree(ref_sites).query(np.radians(q_sites), k=1)
     out = _floats(dist[:, 0][inverse] * EARTH_RADIUS_KM)
     return out
+
+
+# ---------------------------------------------------------------------------
+# clusters
+# ---------------------------------------------------------------------------
+def _spanning_tree(site_xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Minimum spanning tree of the sites: (parent of each site, edge km).
+
+    Prim's algorithm on unit vectors: the nearest site is the one with the
+    largest dot product, and great-circle distance only grows with that,
+    so this is the haversine tree. O(n) memory and n vectorised steps --
+    seconds for tens of thousands of sites, no distance matrix. Cutting
+    every edge longer than a gap leaves exactly the single-linkage
+    clusters at that gap, for any gap, from the one tree. Ties go to the
+    lowest site index, so the tree is always the same. Site 0 is the
+    root (parent -1, edge 0).
+    """
+    lat = np.radians(site_xy[:, 0])
+    lon = np.radians(site_xy[:, 1])
+    xyz: np.ndarray = np.column_stack(
+        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)]
+    )
+    n = len(xyz)
+    parent: np.ndarray = np.full(n, -1, dtype=np.intp)
+    edge_cos: np.ndarray = np.ones(n, dtype=np.float64)
+    if n == 1:
+        return parent, np.zeros(1, dtype=np.float64)
+    remaining: np.ndarray = np.arange(1, n, dtype=np.intp)
+    best: np.ndarray = xyz[remaining] @ xyz[0]
+    via: np.ndarray = np.zeros(n - 1, dtype=np.intp)
+    while remaining.size:
+        k = int(np.argmax(best))
+        site = int(remaining[k])
+        parent[site] = via[k]
+        edge_cos[site] = best[k]
+        remaining = np.delete(remaining, k)
+        best = np.delete(best, k)
+        via = np.delete(via, k)
+        if remaining.size:
+            cos_new: np.ndarray = xyz[remaining] @ xyz[site]
+            closer: np.ndarray = cos_new > best
+            best[closer] = cos_new[closer]
+            via[closer] = site
+    edge_km: np.ndarray = EARTH_RADIUS_KM * np.arccos(
+        np.clip(edge_cos, -1.0, 1.0)
+    )
+    edge_km[0] = 0.0
+    return parent, edge_km
+
+
+def _components(
+    parent: np.ndarray, edge_km: np.ndarray, gap_km: float
+) -> np.ndarray:
+    """Single-linkage clusters at gap_km: the tree with long edges cut."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    n = parent.size
+    keep: np.ndarray = (parent >= 0) & (edge_km <= gap_km)
+    child: np.ndarray = np.flatnonzero(keep)
+    graph = coo_matrix(
+        (np.ones(child.size), (child, parent[keep])), shape=(n, n)
+    )
+    _, labels = connected_components(graph, directed=False)
+    out: np.ndarray = np.asarray(labels, dtype=np.intp)
+    return out
+
+
+def auto_gap_km(
+    parent: np.ndarray,
+    edge_km: np.ndarray,
+    weights: np.ndarray,
+    max_cluster_share: float,
+    max_oversize_share: float,
+    candidates: Tuple[float, ...] = _GAP_CANDIDATES_KM,
+) -> float:
+    """Largest candidate gap keeping oversize clusters to a share of samples.
+
+    A cluster is oversize when it holds more than `max_cluster_share` of
+    the samples (it has to be cut to be held out). The gap is the largest
+    candidate at which oversize clusters hold no more than
+    `max_oversize_share` of the samples, else the smallest candidate.
+    """
+    total = float(weights.sum())
+    best = float(min(candidates))
+    for gap in sorted(candidates):
+        sizes: np.ndarray = np.bincount(
+            _components(parent, edge_km, gap), weights=weights
+        )
+        oversize = float(sizes[sizes > max_cluster_share * total].sum())
+        if oversize <= max_oversize_share * total:
+            best = float(gap)
+    return best
+
+
+def cluster_ids(
+    lat: ArrayLike,
+    lon: ArrayLike,
+    gap_km: Optional[float] = None,
+    *,
+    max_cluster_share: float = 0.05,
+    max_oversize_share: float = 0.5,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """Cluster of each point (single linkage at the gap), and how it went.
+
+    The info dict holds gap_km, gap_source, n_clusters, n_too_big (clusters
+    with more than `max_cluster_share` of the samples, which never go to
+    test), too_big_share (the samples they hold) and largest_cluster_share.
+    """
+    lat_a, lon_a = _floats(lat), _floats(lon)
+    info: Dict[str, Any] = {
+        "gap_km": gap_km,
+        "gap_source": "config" if gap_km is not None else "auto",
+        "n_clusters": 0,
+        "n_too_big": 0,
+        "too_big_share": None,
+        "largest_cluster_share": None,
+    }
+    if lat_a.size == 0:
+        return [], info
+    site_xy, inverse = _sites(lat_a, lon_a)
+    weights: np.ndarray = np.bincount(
+        inverse, minlength=len(site_xy)
+    ).astype(np.float64)
+    parent, edge_km = _spanning_tree(site_xy)
+    gap = (
+        float(gap_km)
+        if gap_km is not None
+        else auto_gap_km(
+            parent, edge_km, weights, max_cluster_share, max_oversize_share
+        )
+    )
+    comp: np.ndarray = _components(parent, edge_km, gap)
+    total = float(weights.sum())
+    sizes: np.ndarray = np.bincount(comp, weights=weights)
+    too_big: np.ndarray = sizes > max_cluster_share * total
+    info["gap_km"] = gap
+    info["n_clusters"] = int(sizes.size)
+    info["n_too_big"] = int(np.count_nonzero(too_big))
+    info["too_big_share"] = float(sizes[too_big].sum()) / total
+    info["largest_cluster_share"] = float(sizes.max()) / total
+    names = [str(c) for c in comp.tolist()]
+    return [names[i] for i in inverse.tolist()], info
+
+
+def pick_test_groups(
+    sizes: Mapping[str, int],
+    test_size: float,
+    seed: int,
+    max_size: Optional[float] = None,
+) -> List[str]:
+    """Whole groups for test, at random, until about `test_size` of samples.
+
+    Groups are visited in a seeded random order and taken while the test
+    set stays within the target; then the one group that brings it closest
+    to the target is added if that helps. Groups above `max_size` samples
+    are never taken. The label plays no part. Same sizes and seed, same
+    groups.
+    """
+    names = sorted(sizes)
+    total = sum(sizes.values())
+    target = int(round(test_size * total))
+    order = np.random.default_rng(seed).permutation(len(names)).tolist()
+    eligible = [
+        names[i]
+        for i in order
+        if max_size is None or sizes[names[i]] <= max_size
+    ]
+    chosen: List[str] = []
+    n = 0
+    for name in eligible:
+        if n >= target:
+            break
+        if n + sizes[name] <= target:
+            chosen.append(name)
+            n += sizes[name]
+    if n < target:
+        taken = set(chosen)
+        best: Optional[str] = None
+        best_gap = target - n
+        for name in eligible:
+            gap = abs(target - (n + sizes[name]))
+            if name not in taken and gap < best_gap:
+                best, best_gap = name, gap
+        if best is not None:
+            chosen.append(best)
+    return sorted(chosen)
 
 
 # ---------------------------------------------------------------------------
@@ -473,15 +711,22 @@ def spatial_holdout(
     n_bins: int = 5,
     random_state: int = 42,
     metadata: Optional[pl.DataFrame] = None,
+    method: str = "grid",
 ) -> Tuple[Dict[str, Any], pl.DataFrame]:
     """Build *split_manager*'s holdout in space; returns (report, variogram).
 
     *data* is {sample, <label>}; *coords* is {sample, lat, lon} (see
     `coordinates`). Labelled samples without coordinates are left out of
-    the holdout, like samples without a label. The holdout keeps its
-    usual columns plus `spatial_cell` and, for training and buffer rows,
+    the holdout, like samples without a label. *method* is "grid" (cells,
+    then a buffer) or "cluster" (no buffer needed). Test groups are picked
+    without looking at the label, so *n_bins* is not used. The holdout
+    keeps its usual columns plus the group (`spatial_cell` or
+    `spatial_cluster`) and, for training and buffer rows,
     `nearest_test_km`.
     """
+    if method not in METHODS:
+        raise ValueError(f"spatial method must be one of {METHODS}, got {method!r}")
+    group_col = _GROUP_COLUMN[method]
     label = split_manager.label
     labelled = data.select("sample", label).drop_nulls(subset=[label])
     joined = labelled.join(coords, on="sample", how="inner")
@@ -499,7 +744,11 @@ def spatial_holdout(
     vario = pl.DataFrame(schema=VARIOGRAM_SCHEMA)
     sill = float("nan")
     range_km: Optional[float] = None
-    if settings.cell_km is None or settings.buffer_km is None:
+    # The variogram sizes the grid's cells and buffer; clusters size both
+    # from the gap instead, so they do not need it.
+    if method == "grid" and (
+        settings.cell_km is None or settings.buffer_km is None
+    ):
         if joined.height and joined.schema[label].is_numeric():
             table, sill = variogram(
                 lat,
@@ -534,25 +783,64 @@ def spatial_holdout(
                     label,
                     range_km,
                 )
-    cell_km = settings.cell_km if settings.cell_km is not None else range_km
-    assert cell_km is not None
+    cell_km: Optional[float] = None
+    cluster_info: Dict[str, Any] = {}
+    if method == "grid":
+        cell_km = settings.cell_km if settings.cell_km is not None else range_km
+        assert cell_km is not None
+        groups = cell_ids(lat, lon, cell_km)
+        target = range_km if range_km is not None else settings.auto_max_km
+    else:
+        groups, cluster_info = cluster_ids(
+            lat,
+            lon,
+            settings.gap_km,
+            max_cluster_share=settings.max_cluster_share,
+            max_oversize_share=settings.max_oversize_share,
+        )
+        target = float(
+            cluster_info["gap_km"]
+            if cluster_info["gap_km"] is not None
+            else min(_GAP_CANDIDATES_KM)
+        )
 
     frame = joined.select("sample", label).with_columns(
-        pl.Series(CELL_COLUMN, cell_ids(lat, lon, cell_km), dtype=pl.Utf8)
+        pl.Series(group_col, groups, dtype=pl.Utf8)
     )
-    split_manager.create_holdout(
+    group_sizes: Dict[str, int] = {}
+    for name in groups:
+        group_sizes[name] = group_sizes.get(name, 0) + 1
+    test_groups = pick_test_groups(
+        group_sizes,
+        test_size,
+        random_state,
+        max_size=(
+            settings.max_cluster_share * frame.height
+            if method == "cluster"
+            else None
+        ),
+    )
+    split_manager.holdout = split_manager._enrich_holdout(
+        holdout_df=frame.select(
+            "sample",
+            pl.when(
+                pl.col(group_col).is_in(pl.Series(test_groups, dtype=pl.Utf8))
+            )
+            .then(pl.lit("test"))
+            .otherwise(pl.lit("train"))
+            .cast(pl.Utf8)
+            .alias("split"),
+        ),
         data=frame,
-        grouping=CELL_COLUMN,
-        test_size=test_size,
-        n_bins=n_bins,
-        random_state=random_state,
+        target_col=label,
         metadata=metadata,
+        split_col_name="split",
     )
     holdout: pl.DataFrame = split_manager.holdout
 
     placed = (
         holdout.select("sample", "split")
-        .join(frame.select("sample", CELL_COLUMN), on="sample", how="left")
+        .join(frame.select("sample", group_col), on="sample", how="left")
         .join(joined.select("sample", "lat", "lon"), on="sample", how="left")
     )
     test = placed.filter(pl.col("split") == "test")
@@ -561,10 +849,13 @@ def spatial_holdout(
     r_lat, r_lon = train["lat"].to_numpy(), train["lon"].to_numpy()
 
     near = nearest_km(r_lat, r_lon, t_lat, t_lon)
-    target = range_km if range_km is not None else settings.auto_max_km
-    buffer_km, buffer_source = choose_buffer(
-        near, settings.buffer_km, target, settings.max_buffer_loss
-    )
+    if method == "cluster":
+        # Clusters are more than the gap apart: nothing to buffer.
+        buffer_km, buffer_source = 0.0, "none: clusters are gap_km apart"
+    else:
+        buffer_km, buffer_source = choose_buffer(
+            near, settings.buffer_km, target, settings.max_buffer_loss
+        )
     in_buffer: np.ndarray = np.asarray(near < buffer_km, dtype=bool)
     before = nearest_km(t_lat, t_lon, r_lat, r_lon)
     after = nearest_km(t_lat, t_lon, r_lat[~in_buffer], r_lon[~in_buffer])
@@ -576,13 +867,13 @@ def spatial_holdout(
                 pl.Series(
                     "_split", np.where(in_buffer, SPLIT_BUFFER, "train")
                 ).cast(pl.Utf8),
-                CELL_COLUMN,
+                group_col,
                 pl.Series(NEAREST_COLUMN, near, dtype=pl.Float64),
             ),
             test.select(
                 "sample",
                 pl.lit("test", dtype=pl.Utf8).alias("_split"),
-                CELL_COLUMN,
+                group_col,
                 pl.lit(None, dtype=pl.Float64).alias(NEAREST_COLUMN),
             ),
         ]
@@ -590,27 +881,37 @@ def spatial_holdout(
     rest = [
         c
         for c in holdout.columns
-        if c not in ("sample", "split", label, CELL_COLUMN, NEAREST_COLUMN)
+        if c not in ("sample", "split", label, group_col, NEAREST_COLUMN)
     ]
     split_manager.holdout = (
         holdout.join(extra, on="sample", how="left")
         .with_columns(pl.col("_split").alias("split"))
-        .select(["sample", "split", label, CELL_COLUMN, NEAREST_COLUMN, *rest])
+        .select(["sample", "split", label, group_col, NEAREST_COLUMN, *rest])
     )
 
     n_buffer = int(np.count_nonzero(in_buffer))
     n_train = int(train.height - n_buffer)
     report: Dict[str, Any] = {
         "label": label,
+        "method": method,
         "n_labelled": labelled.height,
         "n_no_coordinates": n_without,
         "n_sites": int(len(_sites(lat, lon)[0])) if joined.height else 0,
         "sill": sill,
         "range_km": range_km,
-        "cell_km": float(cell_km),
-        "cell_source": "config" if settings.cell_km is not None else "auto",
-        "n_cells": frame.get_column(CELL_COLUMN).n_unique(),
-        "n_test_cells": test.get_column(CELL_COLUMN).n_unique(),
+        "cell_km": None if cell_km is None else float(cell_km),
+        "cell_source": (
+            None
+            if method != "grid"
+            else "config" if settings.cell_km is not None else "auto"
+        ),
+        "gap_km": cluster_info.get("gap_km"),
+        "gap_source": cluster_info.get("gap_source"),
+        "n_too_big": cluster_info.get("n_too_big"),
+        "too_big_share": cluster_info.get("too_big_share"),
+        "largest_cluster_share": cluster_info.get("largest_cluster_share"),
+        "n_groups": frame.get_column(group_col).n_unique(),
+        "n_test_groups": test.get_column(group_col).n_unique(),
         "buffer_km": buffer_km,
         "buffer_source": buffer_source,
         "n_test": test.height,
@@ -626,14 +927,19 @@ def spatial_holdout(
         "test_nearest_train_km_min": _quantile(after, 0.0),
         "test_nearest_train_km_median": _quantile(after, 0.5),
     }
+    sizing = (
+        f"cells {cell_km:.0f} km ({report['cell_source']})"
+        if method == "grid"
+        else f"clusters, gap {target:.0f} km ({report['gap_source']}), "
+        f"{report['n_too_big']} too big for test"
+    )
     logger.info(
-        "Spatial holdout for '%s': cells %.0f km (%s), %d of %d cells to "
-        "test; buffer %.1f km (%s) removed %d of %d training samples (%.1f%%)",
+        "Spatial holdout for '%s': %s, %d of %d groups to test; buffer "
+        "%.1f km (%s) removed %d of %d training samples (%.1f%%)",
         label,
-        report["cell_km"],
-        report["cell_source"],
-        report["n_test_cells"],
-        report["n_cells"],
+        sizing,
+        report["n_test_groups"],
+        report["n_groups"],
         buffer_km,
         buffer_source,
         n_buffer,
@@ -645,6 +951,7 @@ def spatial_holdout(
 
 REPORT_SCHEMA = {
     "label": pl.Utf8,
+    "method": pl.Utf8,
     "n_labelled": pl.Int64,
     "n_no_coordinates": pl.Int64,
     "n_sites": pl.Int64,
@@ -652,8 +959,13 @@ REPORT_SCHEMA = {
     "range_km": pl.Float64,
     "cell_km": pl.Float64,
     "cell_source": pl.Utf8,
-    "n_cells": pl.Int64,
-    "n_test_cells": pl.Int64,
+    "gap_km": pl.Float64,
+    "gap_source": pl.Utf8,
+    "n_too_big": pl.Int64,
+    "too_big_share": pl.Float64,
+    "largest_cluster_share": pl.Float64,
+    "n_groups": pl.Int64,
+    "n_test_groups": pl.Int64,
     "buffer_km": pl.Float64,
     "buffer_source": pl.Utf8,
     "n_test": pl.Int64,

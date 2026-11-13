@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Set
 import matplotlib.pyplot as plt
 import plot_transform_sweep as pts
 import polars as pl
+from label_order import sort_labels
 from matplotlib.lines import Line2D
 
 LOGGER = logging.getLogger("plot-grid-search")
@@ -168,7 +169,7 @@ def plot_report(
     """One panel per label; a row per scheme x model, settings in the label."""
     if not table.height:
         return None
-    labels = table.get_column("label").unique().sort().to_list()
+    labels = sort_labels(table.get_column("label").unique().to_list())
     n_rows = int(table.group_by("label").len().get_column("len").max() or 1)
     fig, axes = plt.subplots(
         1,
@@ -374,7 +375,7 @@ def plot_overview(
     """One panel per label: CV beside holdout for each dataset x scheme."""
     if not table.height:
         return None
-    labels = table.get_column("label").unique().sort().to_list()
+    labels = sort_labels(table.get_column("label").unique().to_list())
     n_rows = int(table.group_by("label").len().get_column("len").max() or 1)
     fig, axes = pts._panel_grid(len(labels), 2, 6.4, 0.34 * n_rows + 1.3)
     for ax, label in zip(axes, labels):

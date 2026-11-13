@@ -339,3 +339,156 @@ def test_maps_are_drawn_for_spatial_runs_unless_asked(tmp_path):
         tmp_path, {**vis, "holdout_map": False}, tmp_path / "d", spatial=True
     )
     assert not (tmp_path / "d" / "holdout_map_temp.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# clusters (spatial_cluster)
+# ---------------------------------------------------------------------------
+ISLANDS = [(0, 0), (0, 20), (20, 0), (-30, 100), (45, -120), (60, 179.95)]
+
+
+def _islands(per_site=4, sites=50, seed=0):
+    """Tight islands of sites (~10 km across) over 1000 km apart."""
+    rng = np.random.default_rng(seed)
+    lat, lon, island = [], [], []
+    for k, (a, b) in enumerate(ISLANDS):
+        la = a + rng.normal(0, 0.05, sites)
+        lo = b + rng.normal(0, 0.05, sites)
+        lat += list(np.repeat(la, per_site))
+        lon += list(np.repeat(lo, per_site))
+        island += [k] * sites * per_site
+    lon_a = (np.asarray(lon) + 180.0) % 360.0 - 180.0
+    return np.asarray(lat), lon_a, np.asarray(island)
+
+
+def test_islands_become_one_cluster_each():
+    lat, lon, island = _islands()
+    ids, info = sp.cluster_ids(lat, lon, 100.0, max_cluster_share=0.5)
+    ids_a = np.asarray(ids)
+    assert info["n_clusters"] == len(ISLANDS) and info["n_too_big"] == 0
+    for k in range(len(ISLANDS)):
+        assert len(set(ids_a[island == k])) == 1
+    # the last island straddles the dateline and is still one cluster
+    assert lon[island == 5].min() < -179 and lon[island == 5].max() > 179
+
+
+def test_clusters_are_the_same_every_time():
+    lat, lon, _ = _islands()
+    rng = np.random.default_rng(1)
+    lat = np.concatenate([lat, rng.uniform(40, 50, 800)])
+    lon = np.concatenate([lon, rng.uniform(0, 10, 800)])
+    first = sp.cluster_ids(lat, lon, None, max_cluster_share=0.05)
+    second = sp.cluster_ids(lat, lon, None, max_cluster_share=0.05)
+    assert first == second
+
+
+def test_a_dense_region_stays_whole_and_out_of_test():
+    """Nothing is cut: a dense region is one cluster, too big for test."""
+    rng = np.random.default_rng(2)
+    lat, lon = rng.uniform(40, 50, 2000), rng.uniform(0, 10, 2000)
+    ids, info = sp.cluster_ids(lat, lon, 100.0, max_cluster_share=0.05)
+    assert info["n_clusters"] == 1 and len(set(ids)) == 1
+    assert info["n_too_big"] == 1 and info["too_big_share"] == 1.0
+
+
+def test_a_heavy_station_keeps_its_neighbours():
+    """The Plymouth case: one site with most of the samples and a site
+    234 m away. They are one cluster, so neither ends up buffered."""
+    lat = [50.25] * 230 + [50.252] * 3 + [10.0] * 40 + [-20.0] * 40
+    lon = [-4.2167] * 230 + [-4.2167] * 3 + [100.0] * 40 + [60.0] * 40
+    ids, info = sp.cluster_ids(lat, lon, 50.0, max_cluster_share=0.3)
+    assert ids[0] == ids[230]  # the station and its neighbour
+    assert info["n_too_big"] == 1
+
+
+def test_test_groups_ignore_the_label_and_hit_the_size():
+    sizes = {f"g{i}": s for i, s in enumerate([30, 5, 12, 8, 50, 3, 20, 9])}
+    picked = sp.pick_test_groups(sizes, 0.2, seed=42, max_size=40)
+    assert picked == sp.pick_test_groups(sizes, 0.2, seed=42, max_size=40)
+    assert "g4" not in picked  # 50 > max_size
+    n = sum(sizes[g] for g in picked)
+    assert abs(n - 0.2 * sum(sizes.values())) <= 3
+    seeds = {
+        tuple(sp.pick_test_groups(sizes, 0.2, seed=s, max_size=40))
+        for s in range(10)
+    }
+    assert len(seeds) > 1  # another seed, another holdout
+    assert sp.pick_test_groups({"a": 100}, 0.2, seed=1, max_size=50) == []
+
+
+def test_auto_gap_is_the_largest_that_keeps_clusters_holdable():
+    """Ten islands, in pairs 80 km apart, pairs far apart. Each island is
+    10% of the samples and the share limit 15%: joining a pair (any gap
+    of 100 km or more) makes every cluster oversize, so 50 km it is."""
+    rng = np.random.default_rng(3)
+    lat, lon = [], []
+    for pair in range(5):
+        for side in (0.0, 80.0 / sp.KM_PER_DEGREE):
+            lat += list(rng.normal(0, 0.02, 40))
+            lon += list(rng.normal(pair * 30.0 + side, 0.02, 40))
+    _, info = sp.cluster_ids(lat, lon, None, max_cluster_share=0.15)
+    assert info["gap_source"] == "auto"
+    assert info["gap_km"] == 50.0
+    assert info["n_clusters"] == 10 and info["n_too_big"] == 0
+
+
+def test_cluster_holdout_costs_nothing_between_islands():
+    lat, lon, _ = _islands()
+    n = lat.size
+    samples = [f"s{i}" for i in range(n)]
+    data = pl.DataFrame({"sample": samples, "temp": 30 - 0.3 * np.abs(lat)})
+    coords = pl.DataFrame({"sample": samples, "lat": lat, "lon": lon})
+    sm = SplitManager("temp")
+    settings = sp.SpatialSettings(gap_km=100.0, max_cluster_share=0.5)
+    report, vario = sp.spatial_holdout(
+        sm, data, coords, settings, method="cluster"
+    )
+    h = sm.holdout.join(coords, on="sample")
+    test = h.filter(pl.col("split") == "test")
+    train = h.filter(pl.col("split") == "train")
+    assert test.height and train.height
+    assert report["n_buffer"] == 0  # clusters are more than the gap apart
+    assert set(sm.holdout["split"]) == {"train", "test"}  # nothing deleted
+    assert report["method"] == "cluster" and report["cell_km"] is None
+    assert report["gap_km"] == 100.0 and report["buffer_km"] == 0.0
+    assert not set(test["spatial_cluster"]) & set(train["spatial_cluster"])
+    d = _brute_nearest(train["lat"], train["lon"], test["lat"], test["lon"])
+    assert d.min() >= 100.0
+    assert vario.height == 0  # clusters need no variogram
+
+
+def test_dataset_and_token_for_clusters(tmp_path):
+    ds = _dataset().create_spatial_holdout_split(
+        spatial={"gap_km": 100, "max_cluster_share": 0.2},
+        method="cluster",
+        output_dir=tmp_path,
+    )
+    holdout = pl.read_csv(tmp_path / "temp" / "holdout.csv")
+    assert holdout.columns[3] == "spatial_cluster"
+    assert ds.spatial_report["method"].to_list() == ["cluster"]
+    assert sweep_tokens.holdout_spec("spatial_cluster") == ("spatial", "cluster")
+    assert sweep_tokens.holdout_spec("spatial:cluster") == ("spatial", "cluster")
+    assert sweep_tokens.spec_dir_name("spatial_cluster") == "spatial_cluster"
+    specs = sweep_tokens.run_specs(
+        holdout_groupings=["spatial", "spatial_cluster"]
+    )
+    assert list(specs) == ["holdout_spatial", "holdout_spatial_cluster"]
+    with pytest.raises(ValueError, match="method"):
+        sp.spatial_holdout(
+            SplitManager("temp"),
+            pl.DataFrame({"sample": ["a"], "temp": [1.0]}),
+            pl.DataFrame({"sample": ["a"], "lat": [0.0], "lon": [0.0]}),
+            sp.SpatialSettings(),
+            method="hexagons",
+        )
+
+
+def test_cluster_settings_are_checked():
+    s = sp.SpatialSettings.from_config({"gap_km": "auto"})
+    assert s.gap_km is None and s.max_cluster_share == 0.05
+    with pytest.raises(ValueError, match="gap_km"):
+        sp.SpatialSettings.from_config({"gap_km": 0})
+    with pytest.raises(ValueError, match="max_cluster_share"):
+        sp.SpatialSettings.from_config({"max_cluster_share": 0})
+    with pytest.raises(ValueError, match="Unknown"):
+        sp.SpatialSettings.from_config({"cluster_neighbours": 0})

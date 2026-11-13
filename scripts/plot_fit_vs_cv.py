@@ -26,6 +26,7 @@ Writes fit_vs_cv_{topN|all}.png (default: SWEEP_DIR/sweep_visualisations).
 """
 import argparse
 import ast
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -36,6 +37,9 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.transforms import blended_transform_factory  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from label_order import label_key  # noqa: E402
 
 VARIANTS = ("", "geo_", "comb_")
 MODEL_ABBR = {"RandomForestRegressor": "RF", "XGBRegressor": "XGB", "ScaledSVR": "SVR"}
@@ -90,7 +94,8 @@ def layout(panels):
         v, base = variant_of(panel[1])
         by_base.setdefault(base, {u: [] for u in present})[v].append(panel)
     grid = []
-    for cols in by_base.values():
+    # Rows always temperature, ph, oxy (label_order.py).
+    for _base, cols in sorted(by_base.items(), key=lambda kv: label_key(kv[0])):
         cols = [list(cols[v]) for v in present]
         while any(cols):
             lead_i = next(i for i, c in enumerate(cols) if c)

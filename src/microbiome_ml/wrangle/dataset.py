@@ -1721,10 +1721,12 @@ class Dataset:
         spatial: Optional[Any] = None,
         force: bool = False,
         output_dir: Optional[Union[str, Path]] = None,
+        method: str = "grid",
     ) -> "Dataset":
-        """Holdout split by grid cell, with a buffer, for one or all labels.
+        """Holdout split in space, with a buffer, for one or all labels.
 
-        Whole grid cells go to test, label-stratified as in
+        Whole grid cells (method="grid") or site clusters
+        (method="cluster") go to test, label-stratified as in
         :meth:`create_holdout_split`, and training samples within the
         buffer distance of any test sample get ``split = "buffer"`` (in
         neither set). Distances are haversine; cell size and buffer may be
@@ -1742,6 +1744,8 @@ class Dataset:
             force: If True, overwrite existing splits
             output_dir: If given, writes ``<label>/holdout.csv`` there,
                 plus ``spatial_report.tsv`` and ``spatial_variogram.tsv``.
+            method: "grid" (cells) or "cluster" (sites joined within a
+                gap, oversize clusters cut at the median).
 
         Returns:
             Self for chaining. The report and variogram are also kept on
@@ -1796,6 +1800,7 @@ class Dataset:
                 n_bins=n_bins,
                 random_state=random_state,
                 metadata=metadata_df,
+                method=method,
             )
             reports.append(report)
             variograms.append(vario)

@@ -83,10 +83,23 @@ _CATEGORICAL_HUES = (
 )
 _OTHER_HUE = "#bdbdbd"  # lighter than tab10 grey, so the two never merge
 
-# Holdout map: drawn in this order, so test sits on top. Buffer is grey,
-# as it is in neither set.
-_MAP_SIDES = ("train", "buffer", "test")
-_MAP_COLOURS = {"train": "#1f77b4", "buffer": "#9e9e9e", "test": "#d62728"}
+# Holdout map: drawn in this order. Blue and orange for the two sets, grey
+# for the buffer (in neither); buffer samples sit right beside test ones,
+# so the buffer goes last and part transparent rather than under test.
+_MAP_SIDES = ("train", "test", "buffer")
+_MAP_COLOURS = {"train": "#1f77b4", "test": "#ff7f0e", "buffer": "#6e6e6e"}
+_MAP_ALPHA = {"train": 0.75, "test": 0.85, "buffer": 0.7}
+# Dot area grows with the square root of the samples at a site, on one
+# fixed scale for every map: 1 sample ~3 pt^2, 100 samples ~30 pt^2.
+_MAP_SIZE = 3.0
+_MAP_SIZE_KEY = (1, 10, 100)
+
+
+def _map_dot_size(n_samples: np.ndarray) -> np.ndarray:
+    out: np.ndarray = _MAP_SIZE * np.sqrt(np.asarray(n_samples, dtype=float))
+    return out
+
+
 _MAP_NAMES = {
     "train": "train",
     "buffer": "buffer (in neither set)",
@@ -1075,6 +1088,7 @@ class Visualiser:
         buffer_km: Optional[float] = None,
         output: Optional[str] = None,
         title: Optional[str] = None,
+        gap_km: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Where a holdout's samples are: train, test and buffer on a map.
 
@@ -1091,6 +1105,7 @@ class Visualiser:
             label: Named in the title (default: the column after split).
             cell_km: Grid cell size, to shade the test cells.
             buffer_km: Shown in the title.
+            gap_km: A cluster holdout's gap, shown in the title.
             output: Optional file stem, as for plot_holdout_distribution.
             title: Overrides the default title.
 
@@ -1124,7 +1139,14 @@ class Visualiser:
             side: points.filter(pl.col("split") == side).height
             for side in _MAP_SIDES
         }
-        sites = points.unique(subset=["split", "lat", "lon"])
+        # One dot per site and side, sized by how many samples it holds:
+        # a time-series station with 200 samples is one coordinate.
+        sites = (
+            points.with_columns(pl.lit(1).alias("_one"))
+            .group_by(["split", "lat", "lon"])
+            .agg(pl.col("_one").sum().alias("n"))
+            .sort(["split", "lat", "lon"])
+        )
         test_cells: List[str] = []
         if cell_km and "spatial_cell" in holdout.columns:
             test_cells = (
@@ -1141,6 +1163,8 @@ class Visualiser:
         details = []
         if cell_km:
             details.append(f"cells {cell_km:.0f} km")
+        if gap_km:
+            details.append(f"clusters, gap {gap_km:.0f} km")
         if buffer_km is not None:
             details.append(f"buffer {buffer_km:.0f} km")
         if details:
@@ -1194,6 +1218,7 @@ class Visualiser:
         use_cartopy: bool,
     ) -> plt.Figure:
         from matplotlib.collections import PatchCollection
+        from matplotlib.lines import Line2D
         from matplotlib.patches import Patch, Rectangle
 
         from microbiome_ml.wrangle.spatial import cell_bounds
@@ -1205,7 +1230,8 @@ class Visualiser:
             fig = plt.figure(figsize=(13, 7))
             ax: Any = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
             ax.set_global()
-            ax.coastlines(linewidth=0.4, color="#555555")
+            # Light coastlines, so the grey buffer dots stand out on them.
+            ax.coastlines(linewidth=0.4, color="#b0b0b0")
             ax.gridlines(linewidth=0.3, color="#cccccc", draw_labels=True)
             kw["transform"] = ccrs.PlateCarree()
         else:
@@ -1235,6 +1261,7 @@ class Visualiser:
                 )
             )
 
+        handles: List[Any] = []
         for side in _MAP_SIDES:
             part = sites.filter(pl.col("split") == side)
             if part.height == 0:
@@ -1242,15 +1269,40 @@ class Visualiser:
             ax.scatter(
                 part.get_column("lon").to_numpy(),
                 part.get_column("lat").to_numpy(),
-                s=16 if side == "test" else 10,
+                s=_map_dot_size(part.get_column("n").to_numpy()),
                 c=_MAP_COLOURS[side],
-                alpha=0.85,
+                alpha=_MAP_ALPHA[side],
                 edgecolors="none",
-                label=f"{_MAP_NAMES[side]}  (n={counts[side]})",
                 zorder=3,
                 **kw,
             )
-        handles, _ = ax.get_legend_handles_labels()
+            handles.append(
+                Line2D(
+                    [],
+                    [],
+                    linestyle="",
+                    marker="o",
+                    markersize=6,
+                    markerfacecolor=_MAP_COLOURS[side],
+                    markeredgecolor="none",
+                    alpha=_MAP_ALPHA[side],
+                    label=f"{_MAP_NAMES[side]}  (n={counts[side]})",
+                )
+            )
+        # The size key: the same scale on every map.
+        for n in _MAP_SIZE_KEY:
+            handles.append(
+                Line2D(
+                    [],
+                    [],
+                    linestyle="",
+                    marker="o",
+                    markersize=float(np.sqrt(_map_dot_size(np.array([n]))[0])),
+                    markerfacecolor="none",
+                    markeredgecolor="#444444",
+                    label=f"{n} sample{'s' if n > 1 else ''} at a site",
+                )
+            )
         if test_cells and cell_km:
             # A PatchCollection has no legend entry of its own.
             handles.append(

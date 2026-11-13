@@ -23,6 +23,9 @@ xgboost = ">=1.7.0"
 matplotlib = ">=3.5.3"
 seaborn = ">=0.12.2"
 cmasher = ">=1.9.2"
+# coastlines on the holdout maps (Visualiser.plot_holdout_map); without it
+# the maps are plain longitude/latitude axes
+cartopy = ">=0.22"
 
 [pypi-dependencies]
 # Install this project into the environment (editable) so that

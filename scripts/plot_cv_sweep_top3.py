@@ -22,6 +22,7 @@ label; columns are its plain, geo_ and comb_ versions, whichever exist.
 `collate` in pipeline_steps.py runs this with --top 3 and --top all.
 """
 import argparse
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -31,6 +32,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.colors import to_rgb  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from label_order import label_key  # noqa: E402
 
 # name -> how to draw it.
 #   higher: True if a larger value is better (sets the ranking direction)
@@ -150,8 +154,10 @@ for panel in panels:
     v, base = variant_of(panel[1])
     by_base.setdefault(base, {u: [] for u in present})[v].append(panel)
 
+# Rows always temperature, ph, oxy (label_order.py), whatever order the
+# sweep wrote them in, so two figures compare row for row.
 grid = []
-for cols in by_base.values():
+for _base, cols in sorted(by_base.items(), key=lambda kv: label_key(kv[0])):
     cols = [list(cols[v]) for v in present]
     while any(cols):
         lead_i = next(i for i, c in enumerate(cols) if c)

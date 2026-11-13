@@ -335,6 +335,7 @@ A sweep token is one of:
 | `taxon:<rank>` | community membership at that rank (see *Holding out by community membership*) |
 | `taxon_<rank>` | the same token, underscored |
 | `spatial` | whole grid cells to test, plus a buffer (see *Holding out in space*) |
+| `spatial_cluster` | whole site clusters to test, plus a buffer (the same section) |
 
 ### Holding out in space
 
@@ -346,7 +347,9 @@ instead:
 
 1. every sample gets a grid cell about `cell_km` across, equal in width
    at every latitude (unlike a degree grid or Web Mercator metres);
-2. whole cells go to test, label-stratified like any grouped holdout;
+2. whole cells go to test, picked at random (seeded) until test holds
+   about `test_size` of the samples -- the label is not looked at, since
+   the point is that test is elsewhere, not that it looks like train;
 3. training samples closer than `buffer_km` to a test sample become
    `split = buffer` in `holdout.csv`, in neither set. Test samples are
    never removed, so only training shrinks.
@@ -373,8 +376,42 @@ buffer uses the same distance unless that would remove more than
 `max_buffer_loss` of the training samples, and is then shortened to remove
 exactly that share. A number is used as given.
 
-A map of each label's train, test and buffer samples, with the test cells
-shaded, goes beside the distribution figures:
+**Clusters instead of cells** (`spatial_cluster`), deleting nothing. Grid
+lines cut through dense patches of sites, and the buffer then deletes
+every training site near the cut. Clusters put the boundaries in the
+gaps: sites closer than `gap_km` join one cluster (single linkage,
+exactly -- a minimum spanning tree of the sites with the longer edges
+cut), so clusters are more than `gap_km` apart. Whole clusters go to test,
+picked at random until test holds about `test_size`; a training sample
+near a test sample would have joined its cluster, so there is nothing to
+buffer and no sample is deleted. A cluster with more than
+`max_cluster_share` of the samples (a dense region chained into one, or a
+heavily sampled station) is never picked and stays in training whole:
+cutting it would put close neighbours on both sides. Every step is
+deterministic: the same data, config and seed give the same split.
+
+```yaml
+split:
+  holdout:
+    spatial:
+      gap_km: auto              # km, or auto: largest of 25/50/100/200/400
+      max_cluster_share: 0.05   # bigger clusters never go to test
+      max_oversize_share: 0.5   # auto gap: at most this share too big
+```
+
+On the real coordinates, test came to 20.0% with nothing deleted:
+ITS_marine gap 400 km (13 test clusters), 18S_marine 200 km (144),
+ITS_soil 100 km (167). The price is that the few clusters too big for test
+-- 32 to 44% of the samples, in 2 to 4 dense regions -- are always in
+training, so test has no samples from them; `too_big_share` in the report
+says how much. Both tokens can run in one sweep (`holdout_groupings:
+[spatial, spatial_cluster]`); the report's `method` column says which is
+which.
+
+A map of each label's train (blue), test (orange) and buffer (grey)
+samples, with a grid run's test cells shaded, goes beside the distribution
+figures. One dot per site, its area growing with the samples there on the
+same scale in every map, so a heavily sampled station stands out:
 `holdout_spatial/split_visualisations/holdout_map_<label>.png`. It is drawn
 for spatial holdouts by default (`visualise.holdout_map: auto`); `true`
 draws one for every holdout, `false` none. For a run that has already

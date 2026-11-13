@@ -278,21 +278,22 @@ def plot_holdout_maps(
     if not wanted:
         return
     holdouts = sorted(Path(splits_dir).glob("*/holdout.csv"))
-    sizes: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    sizes: Dict[str, Dict[str, Any]] = {}
     report = Path(splits_dir) / "spatial_report.tsv"
     if report.is_file():
         for row in pl.read_csv(report, separator="\t").iter_rows(named=True):
-            sizes[str(row["label"])] = (row.get("cell_km"), row.get("buffer_km"))
+            sizes[str(row["label"])] = row
     vis = Visualiser(out_dir, formats=list(vis_cfg.get("formats", ["png"])))
     for path in holdouts:
         label = path.parent.name
-        cell_km, buffer_km = sizes.get(label, (None, None))
+        row = sizes.get(label, {})
         try:
             vis.plot_holdout_map(
                 path,
                 label=label,
-                cell_km=cell_km,
-                buffer_km=buffer_km,
+                cell_km=row.get("cell_km"),
+                buffer_km=row.get("buffer_km"),
+                gap_km=row.get("gap_km"),
                 output=f"holdout_map_{label}",
             )
         except Exception as exc:  # one bad label must not stop the run

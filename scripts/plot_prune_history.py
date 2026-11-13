@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,6 +44,9 @@ matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt  # noqa: E402
 import polars as pl  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from label_order import sort_labels  # noqa: E402
 
 from microbiome_ml.visualise.visualisations import (  # noqa: E402
     _CATEGORICAL_HUES,
@@ -90,7 +94,24 @@ def load_history(paths: List[Path]) -> pl.DataFrame:
             f"prune history is missing column(s) {missing}; expected the "
             "table written by scripts/prune_iterate_cv.py"
         )
-    return history.sort([*PANEL_KEYS, *SERIES_KEYS, "iteration"])
+    # Labels in figure order (temperature, ph, oxy; label_order.py), then
+    # the rest of the keys as before.
+    rank = {
+        lab: i
+        for i, lab in enumerate(
+            sort_labels(history.get_column("label").cast(pl.Utf8).unique())
+        )
+    }
+    return (
+        history.with_columns(
+            pl.col("label")
+            .cast(pl.Utf8)
+            .replace_strict(rank, return_dtype=pl.Int64)
+            .alias("_label_rank")
+        )
+        .sort(["_label_rank", *PANEL_KEYS, *SERIES_KEYS, "iteration"])
+        .drop("_label_rank")
+    )
 
 
 def _short_model(name: Any) -> str:

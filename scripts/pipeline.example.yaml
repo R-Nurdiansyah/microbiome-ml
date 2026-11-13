@@ -271,6 +271,16 @@ split:
       max_buffer_loss: 0.25
       auto_min_km: 10
       auto_max_km: 500
+      # Token `spatial_cluster` instead: sites closer than gap_km form one
+      # cluster (clusters are then more than gap_km apart) and whole
+      # clusters go to test, so no buffer is needed and nothing is
+      # deleted. A cluster with more than max_cluster_share of the samples
+      # never goes to test. auto gap = the largest of 25/50/100/200/400 km
+      # leaving at most max_oversize_share of the samples in such
+      # clusters. Neither method looks at the label when picking test.
+      gap_km: auto
+      max_cluster_share: 0.05
+      max_oversize_share: 0.5
     presence_threshold: 0.0   # a taxon counts as present above this value
     min_test_samples: 2       # refuse a taxon leaving fewer on either side
     random_state: 42
